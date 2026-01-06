@@ -21,20 +21,42 @@ class StockDataFetcher:
         self.session = get_secure_session()
         self.base_url = BACKEND_API_URL
         self._backend_available = None  # Cache backend availability check
+        self._last_backend_check = 0  # Timestamp of last check
+        self._backend_check_interval = 30  # Recheck every 30 seconds
     
     def _check_backend_available(self) -> bool:
         """Check if backend server is available"""
-        if self._backend_available is not None:
-            return self._backend_available
+        import time
+        current_time = time.time()
         
-        try:
-            health_url = f"{self.base_url.replace('/api', '')}/api/health"
-            response = self.session.get(health_url, timeout=2)
-            self._backend_available = response.status_code == 200
-        except:
-            self._backend_available = False
+        # Recheck periodically (every 30 seconds) to detect when backend becomes available
+        if (self._backend_available is None or 
+            current_time - self._last_backend_check > self._backend_check_interval):
+            try:
+                health_url = f"{self.base_url.replace('/api', '')}/api/health"
+                response = self.session.get(health_url, timeout=2)
+                is_available = response.status_code == 200
+                was_available = self._backend_available
+                self._backend_available = is_available
+                self._last_backend_check = current_time
+                
+                # Log when backend becomes available
+                if is_available and (was_available is False or was_available is None):
+                    logger.info("✅ Backend server is now available")
+                elif not is_available and was_available is True:
+                    logger.warning("⚠️ Backend server became unavailable")
+                
+                return is_available
+            except Exception as e:
+                was_available = self._backend_available
+                self._backend_available = False
+                self._last_backend_check = current_time
+                if was_available is True:
+                    logger.warning(f"⚠️ Backend server check failed: {e}")
+                return False
         
-        return self._backend_available
+        # Return cached value if check interval hasn't passed
+        return self._backend_available is True
     
     def _fetch_direct_yfinance(self, symbol: str) -> dict:
         """Fetch stock data directly using yfinance (fallback method)"""

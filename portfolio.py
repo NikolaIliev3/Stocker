@@ -71,7 +71,7 @@ class Portfolio:
     def calculate_potential_trade(self, symbol: str, budget: float, 
                                  entry_price: float, target_price: float,
                                  stop_loss: float, action: str) -> Dict:
-        """Calculate potential win/loss for a trade"""
+        """Calculate potential win/loss for a trade (supports fractional shares)"""
         if budget <= 0 or entry_price <= 0:
             return {
                 "error": "Invalid budget or entry price",
@@ -80,14 +80,8 @@ class Portfolio:
                 "shares": 0
             }
         
-        shares = int(budget / entry_price)
-        if shares == 0:
-            return {
-                "error": "Budget too small to purchase any shares",
-                "potential_win": 0,
-                "potential_loss": 0,
-                "shares": 0
-            }
+        # Calculate fractional shares (supports partial stock purchases)
+        shares = budget / entry_price
         
         if action == "BUY":
             potential_win = (target_price - entry_price) * shares

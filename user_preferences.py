@@ -56,7 +56,15 @@ class UserPreferences:
             'auto_learner_scan_interval_hours': 6,  # Default scan interval
             'auto_learner_predictions_per_scan': 5,  # Default predictions per scan
             'auto_learner_min_confidence': 60,  # Default minimum confidence
-            'backtest_strategies': ['trading', 'mixed', 'investing']  # Default: all strategies
+            'backtest_strategies': ['trading', 'mixed', 'investing'],  # Default: all strategies
+            # Notification preferences
+            'show_batched_verification_notifications': True,  # Show batched verification notifications (default)
+            'show_individual_verification_notifications': False,  # Show individual popup per prediction (can be spammy)
+            'show_buy_signal_notifications': True,  # Show BUY signal notifications
+            'show_momentum_change_notifications': True,  # Show momentum/trend change notifications
+            'show_backtest_complete_notifications': True,  # Show backtest completion notifications
+            'show_training_complete_notifications': True,  # Show ML training completion notifications
+            'show_auto_training_notifications': True  # Show auto-training completion notifications
         }
     
     def save(self):

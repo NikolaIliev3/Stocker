@@ -482,6 +482,18 @@ def _fetch_alternative_data(symbol: str):
         return None
 
 
+@app.after_request
+def add_security_headers(response):
+    """Add security headers to all responses"""
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Content-Security-Policy'] = "default-src 'self'"
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    return response
+
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -502,10 +514,10 @@ def get_stock_data(symbol: str):
         # Check cache first (unless force refresh is requested)
         cache_key = f"stock_{symbol.upper()}"
         if not force_refresh:
-        cached_data = get_cached(cache_key)
-        if cached_data:
+            cached_data = get_cached(cache_key)
+            if cached_data:
                 logger.debug(f"Cache hit for {symbol}")  # Changed to debug to reduce log spam
-            return jsonify(cached_data)
+                return jsonify(cached_data)
         else:
             logger.debug(f"Force refresh requested for {symbol}, bypassing cache")
         
@@ -606,7 +618,7 @@ def get_stock_data(symbol: str):
                 if alt_data:
                     # Don't cache if force_refresh was requested
                     if not force_refresh:
-                    set_cache(cache_key, alt_data)
+                        set_cache(cache_key, alt_data)
                     logger.debug(f"Alternative data fetch succeeded for {symbol}")
                     return jsonify(alt_data)
                 else:
@@ -637,7 +649,7 @@ def get_stock_data(symbol: str):
                     if alt_data:
                         # Don't cache if force_refresh was requested
                         if not force_refresh:
-                        set_cache(cache_key, alt_data)
+                            set_cache(cache_key, alt_data)
                         logger.debug(f"Alternative data fetch succeeded for {symbol}")
                         return jsonify(alt_data)
                     else:
@@ -710,7 +722,7 @@ def get_stock_data(symbol: str):
         
         # Cache the result (unless force refresh was requested)
         if not force_refresh:
-        set_cache(cache_key, data)
+            set_cache(cache_key, data)
         else:
             logger.debug(f"Skipping cache for {symbol} (force refresh requested)")
         

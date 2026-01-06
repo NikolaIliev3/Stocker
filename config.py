@@ -42,5 +42,39 @@ MACD_SLOW = 26
 MACD_SIGNAL = 9
 
 # Portfolio Configuration
-INITIAL_BALANCE = 10000.0  # Default starting balance
+INITIAL_BALANCE = 10000.0
+
+# API Security Configuration
+API_REQUEST_TIMEOUT = 30  # seconds
+API_MAX_RETRIES = 3
+API_RATE_LIMIT = 60  # requests per minute
+API_MAX_CONNECTIONS = 10
+
+# Input Validation
+MAX_SYMBOL_LENGTH = 10
+MAX_REQUEST_SIZE = 1024 * 1024  # 1MB
+MAX_STRING_LENGTH = 10000
+
+# Data Retention (days)
+AUDIT_LOG_RETENTION_DAYS = 90
+RESEARCH_CACHE_RETENTION_DAYS = 30
+API_KEY_ROTATION_DAYS = 90
+
+# Secure Logging
+REDACT_SENSITIVE_IN_LOGS = True
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+
+# Anomaly Detection
+ENABLE_ANOMALY_DETECTION = True
+ANOMALY_ALERT_THRESHOLD = 10  # alerts before blocking
+
+# Seeker AI Security Configuration
+SEEKER_AI_ENABLED = True
+SEEKER_AI_RATE_LIMIT = 60  # Calls per minute
+SEEKER_AI_CACHE_HOURS = 1
+SEEKER_AI_AUDIT_LOGGING = True
+
+# API Key Storage
+API_KEYS_ENCRYPTED = True
+API_KEYS_FILE_PERMISSIONS = 0o600  # Read/write owner only  # Default starting balance
 

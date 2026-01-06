@@ -46,6 +46,9 @@ class ContinuousBacktester:
         # Track last retraining time to prevent too-frequent retraining
         self.last_retrain_time = {}
         
+        # Track which strategies were tested in the last run (for report filtering)
+        self.last_tested_strategies = []
+        
         # Popular stocks to test
         self.test_symbols = [
             'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'NFLX',
@@ -110,10 +113,17 @@ class ContinuousBacktester:
         logger.info(f"   • Running first backtest now...")
         
         # Run first test immediately (in background thread)
-        # Use saved preferences for strategies
+        # Use saved preferences for strategies, but exclude 'investing' from automatic backtests
         saved_strategies = None
         if hasattr(self.app, 'preferences'):
             saved_strategies = self.app.preferences.get_backtest_strategies()
+            # Filter out 'investing' strategy - it should only be tested manually
+            if saved_strategies:
+                saved_strategies = [s for s in saved_strategies if s != 'investing']
+                if not saved_strategies:
+                    # If only investing was selected, default to trading and mixed
+                    saved_strategies = ['trading', 'mixed']
+                logger.info(f"   • Automatic backtest strategies: {', '.join(saved_strategies)} (investing excluded from automatic tests)")
         thread = threading.Thread(target=self._run_backtest, args=(saved_strategies,))
         thread.daemon = True
         thread.start()
@@ -134,10 +144,16 @@ class ContinuousBacktester:
         
         logger.info(f"🔄 Running scheduled backtest (every {self.test_interval_hours} hours)...")
         
-        # Run test in background with saved preferences
+        # Run test in background with saved preferences, but exclude 'investing' from automatic backtests
         saved_strategies = None
         if hasattr(self.app, 'preferences'):
             saved_strategies = self.app.preferences.get_backtest_strategies()
+            # Filter out 'investing' strategy - it should only be tested manually
+            if saved_strategies:
+                saved_strategies = [s for s in saved_strategies if s != 'investing']
+                if not saved_strategies:
+                    # If only investing was selected, default to trading and mixed
+                    saved_strategies = ['trading', 'mixed']
         thread = threading.Thread(target=self._run_backtest, args=(saved_strategies,))
         thread.daemon = True
         thread.start()
@@ -187,6 +203,9 @@ class ContinuousBacktester:
             
             # Track total tests across all strategies
             total_tests_before = sum(r['total'] for r in self.results['strategy_results'].values())
+            
+            # Track which strategies were actually tested (had at least one valid test)
+            tested_strategies = []
             
             # Test each selected strategy
             for strategy in selected_strategies:
@@ -269,6 +288,9 @@ class ContinuousBacktester:
                         if strategy_results['total'] > 0 else 0
                     )
                     
+                    # Mark this strategy as tested
+                    tested_strategies.append(strategy)
+                    
                     logger.info(
                         f"✅ {strategy} backtest: {correct}/{tests_run} correct "
                         f"({correct/tests_run*100:.1f}%)"
@@ -311,12 +333,24 @@ class ContinuousBacktester:
                 overall_accuracy = (total_correct_after / total_tests_after * 100) if total_tests_after > 0 else 0
                 logger.info(f"✅ Continuous backtest complete: {new_tests} new tests run")
                 logger.info(f"   • Overall accuracy: {overall_accuracy:.1f}% ({total_correct_after}/{total_tests_after} correct)")
-                for strategy in ['trading', 'mixed', 'investing']:
+                # Only show strategies that were actually tested in this run
+                strategy_details = []
+                for strategy in tested_strategies:
                     s = self.results['strategy_results'][strategy]
                     if s['total'] > 0:
                         logger.info(f"   • {strategy.title()}: {s['accuracy']:.1f}% ({s['correct']}/{s['total']})")
+                        strategy_details.append(f"{strategy.title()}: {s['accuracy']:.1f}% ({s['correct']}/{s['total']})")
+                
+                # Show notification popup
+                self.app.root.after(0, self._show_backtest_complete_notification, 
+                                   new_tests, overall_accuracy, strategy_details)
             else:
                 logger.warning("⚠️ Continuous backtest complete: No valid test points found. Check date ranges and data availability.")
+                # Show notification for no results
+                self.app.root.after(0, self._show_backtest_complete_notification, 0, 0, [])
+            
+            # Store tested strategies for this run (for report filtering)
+            self.last_tested_strategies = tested_strategies
             
             # Learn from backtest results if we have enough data
             if new_tests > 0:
@@ -447,16 +481,29 @@ class ContinuousBacktester:
             predicted_target = recommendation.get('target_price', test_price)
             
             # Determine if prediction was correct
+            # NOTE: Algorithm uses INVERTED logic:
+            # - BUY = bearish signals (expecting price to go DOWN, then buy at discount)
+            # - SELL = bullish signals (expecting price to go UP, then sell to take profits)
             was_correct = None
             if predicted_action == 'BUY':
-                # BUY is correct if price went up
-                was_correct = actual_change_pct > 0
-            elif predicted_action == 'SELL':
-                # SELL is correct if price went down
+                # BUY (bearish signals) is correct if price went DOWN (so you can buy at discount)
                 was_correct = actual_change_pct < 0
+            elif predicted_action == 'SELL':
+                # SELL (bullish signals) is correct if price went UP (so you can sell at profit)
+                was_correct = actual_change_pct > 0
             elif predicted_action == 'HOLD':
-                # HOLD is correct if price didn't move much
-                was_correct = abs(actual_change_pct) < 5
+                # HOLD is correct if price didn't move much (strategy-specific thresholds)
+                if strategy == "trading":
+                    was_correct = abs(actual_change_pct) < 3
+                elif strategy == "mixed":
+                    was_correct = abs(actual_change_pct) < 5
+                else:  # investing
+                    # For investing (1.5 year lookforward), allow up to 20% movement for HOLD
+                    # Over 1.5 years, stocks typically move 15-25%, so 20% is reasonable
+                    was_correct = abs(actual_change_pct) < 20
+            elif predicted_action == 'AVOID':
+                # AVOID (legacy, now mapped to BUY in inverted logic) is correct if price went DOWN
+                was_correct = actual_change_pct < 0
             else:
                 return None  # Unknown action
             
@@ -490,6 +537,42 @@ class ContinuousBacktester:
                 self.app.root.after(0, self.app._update_ml_status)
         except:
             pass
+    
+    def _show_backtest_complete_notification(self, new_tests: int, overall_accuracy: float, strategy_details: List[str]):
+        """Show notification popup when backtesting completes"""
+        try:
+            from tkinter import messagebox
+            
+            # Check notification preferences
+            if self.app and hasattr(self.app, 'preferences'):
+                show_notifications = self.app.preferences.get('show_backtest_complete_notifications', True)
+                if not show_notifications:
+                    logger.debug("Backtest complete notifications disabled by user preference")
+                    return
+            
+            if new_tests > 0:
+                message = f"✅ Backtesting Complete!\n\n"
+                message += f"Tests Run: {new_tests}\n"
+                message += f"Overall Accuracy: {overall_accuracy:.1f}%\n\n"
+                
+                if strategy_details:
+                    message += "Strategy Results:\n"
+                    for detail in strategy_details:
+                        message += f"  • {detail}\n"
+                
+                messagebox.showinfo("Backtesting Complete", message)
+            else:
+                messagebox.showwarning(
+                    "Backtesting Complete",
+                    "⚠️ No valid test points found.\n\n"
+                    "This might be due to:\n"
+                    "• Insufficient historical data\n"
+                    "• Date range issues\n"
+                    "• Data availability problems\n\n"
+                    "Check the logs for more details."
+                )
+        except Exception as e:
+            logger.debug(f"Error showing backtest notification: {e}")
     
     def get_statistics(self) -> Dict:
         """Get backtest statistics"""
@@ -631,7 +714,9 @@ class ContinuousBacktester:
                     if failure_rate > 60:
                         logger.info(
                             f"🔧 Action pattern detected ({strategy}): "
-                            f"{most_failed[0]} failing {failure_rate:.0f}% of time"
+                            f"{most_failed[0]} predictions failing {failure_rate:.0f}% of time "
+                            f"({most_failed[1]}/{len(failures)} failures). "
+                            f"This may indicate the model needs adjustment for this action type."
                         )
             
             # Note: Full weight adjustment requires indicator data which we don't store
@@ -667,26 +752,29 @@ class ContinuousBacktester:
                     # Calculate price change
                     price_change_pct = ((future_price - test_price) / test_price) * 100
                     
-                    # Determine label based on actual outcome
+                    # Determine label based on actual outcome (INVERTED LOGIC)
+                    # With inverted logic:
+                    # - Price going DOWN → BUY (bearish signals, buy at discount)
+                    # - Price going UP → SELL (bullish signals, sell at profit)
                     if strategy == "trading":
-                        if price_change_pct >= 3:
-                            label = "BUY"
-                        elif price_change_pct <= -3:
-                            label = "SELL"
+                        if price_change_pct <= -3:
+                            label = "BUY"  # Price went down, bearish → BUY
+                        elif price_change_pct >= 3:
+                            label = "SELL"  # Price went up, bullish → SELL
                         else:
                             label = "HOLD"
                     elif strategy == "investing":
-                        if price_change_pct >= 10:
-                            label = "BUY"
-                        elif price_change_pct <= -10:
-                            label = "AVOID"
+                        if price_change_pct <= -10:
+                            label = "BUY"  # Price went down significantly, bearish → BUY
+                        elif price_change_pct >= 10:
+                            label = "SELL"  # Price went up significantly, bullish → SELL (was AVOID)
                         else:
                             label = "HOLD"
                     else:  # mixed
-                        if price_change_pct >= 5:
-                            label = "BUY"
-                        elif price_change_pct <= -5:
-                            label = "AVOID"
+                        if price_change_pct <= -5:
+                            label = "BUY"  # Price went down, bearish → BUY
+                        elif price_change_pct >= 5:
+                            label = "SELL"  # Price went up, bullish → SELL (was AVOID)
                         else:
                             label = "HOLD"
                     
@@ -750,30 +838,67 @@ class ContinuousBacktester:
                     logger.debug(f"Error converting backtest result to training sample: {e}")
                     continue
             
-            # If we have enough samples, use them for training
+            # If we have samples, try to combine with verified predictions to meet minimum requirement
             if len(training_samples) >= 50:
                 logger.info(
                     f"📚 Converting {len(training_samples)} backtest results to training data for {strategy}"
                 )
                 
-                # Use training pipeline to retrain with backtest data
-                # This combines with existing training data
-                from ml_training import StockPredictionML
-                ml_model = StockPredictionML(self.data_dir, strategy)
-                
-                if ml_model.is_trained():
-                    # Retrain with backtest data
-                    result = ml_model.train(training_samples)
+                # Try to combine with verified predictions if we don't have enough samples
+                combined_samples = training_samples.copy()
+                if len(training_samples) < 100:
+                    logger.debug(f"Only {len(training_samples)} backtest samples, attempting to combine with verified predictions...")
                     
-                    if 'error' not in result:
-                        test_acc = result.get('test_accuracy', 0) * 100
-                        train_acc = result.get('train_accuracy', 0) * 100
-                        logger.info(
-                            f"✅ Model retrained on backtest data ({strategy}): "
-                            f"Train: {train_acc:.1f}%, Test: {test_acc:.1f}%"
-                        )
+                    # Get verified predictions for this strategy
+                    if hasattr(self.app, 'predictions_tracker'):
+                        try:
+                            from training_pipeline import MLTrainingPipeline
+                            pipeline = MLTrainingPipeline(self.app.data_fetcher, self.data_dir)
+                            verified_samples = pipeline._convert_verified_to_training_samples(
+                                self.app.predictions_tracker.get_verified_predictions(),
+                                strategy
+                            )
+                            
+                            if verified_samples:
+                                # Combine samples (prefer backtest results, but add verified if needed)
+                                needed = 100 - len(training_samples)
+                                verified_to_add = verified_samples[-needed:] if len(verified_samples) > needed else verified_samples
+                                combined_samples.extend(verified_to_add)
+                                logger.info(
+                                    f"   • Combined with {len(verified_to_add)} verified predictions "
+                                    f"({len(combined_samples)} total samples)"
+                                )
+                        except Exception as e:
+                            logger.debug(f"Could not combine with verified predictions: {e}")
+                
+                # Only attempt training if we have enough samples
+                if len(combined_samples) >= 100:
+                    # Use training pipeline to retrain with combined data
+                    from ml_training import StockPredictionML
+                    ml_model = StockPredictionML(self.data_dir, strategy)
+                    
+                    if ml_model.is_trained():
+                        # Retrain with combined data
+                        result = ml_model.train(combined_samples)
+                        
+                        if 'error' not in result:
+                            test_acc = result.get('test_accuracy', 0) * 100
+                            train_acc = result.get('train_accuracy', 0) * 100
+                            logger.info(
+                                f"✅ Model retrained on combined data ({strategy}): "
+                                f"Train: {train_acc:.1f}%, Test: {test_acc:.1f}% "
+                                f"({len(training_samples)} backtest + {len(combined_samples) - len(training_samples)} verified)"
+                            )
+                        else:
+                            logger.warning(f"⚠️ Retraining failed: {result.get('error')}")
                     else:
-                        logger.warning(f"⚠️ Retraining failed: {result.get('error')}")
+                        logger.debug(f"Model not trained yet for {strategy}, skipping retrain")
+                else:
+                    logger.debug(
+                        f"⚠️ Insufficient samples for retraining ({strategy}): "
+                        f"{len(combined_samples)} samples (need 100). "
+                        f"Will retry when more backtest results or verified predictions are available."
+                    )
             
         except Exception as e:
             logger.error(f"Error using backtest results as training data: {e}", exc_info=True)

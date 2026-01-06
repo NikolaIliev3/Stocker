@@ -242,26 +242,29 @@ class TrainingDataGenerator:
                 future_price = float(hist.iloc[future_idx]['Close'])
                 price_change_pct = ((future_price - current_price) / current_price) * 100
                 
-                # Label based on strategy
+                # Label based on strategy (INVERTED LOGIC)
+                # With inverted logic:
+                # - Price going DOWN → BUY (bearish signals, buy at discount)
+                # - Price going UP → SELL (bullish signals, sell at profit)
                 if strategy == "trading":
-                    if price_change_pct >= 3:
-                        label = "BUY"
-                    elif price_change_pct <= -3:
-                        label = "SELL"
+                    if price_change_pct <= -3:
+                        label = "BUY"  # Price went down, bearish → BUY
+                    elif price_change_pct >= 3:
+                        label = "SELL"  # Price went up, bullish → SELL
                     else:
                         label = "HOLD"
                 elif strategy == "investing":
-                    if price_change_pct >= 10:
-                        label = "BUY"
-                    elif price_change_pct <= -10:
-                        label = "AVOID"
+                    if price_change_pct <= -10:
+                        label = "BUY"  # Price went down significantly, bearish → BUY
+                    elif price_change_pct >= 10:
+                        label = "SELL"  # Price went up significantly, bullish → SELL (was AVOID, now SELL)
                     else:
                         label = "HOLD"
                 else:  # mixed
-                    if price_change_pct >= 5:
-                        label = "BUY"
-                    elif price_change_pct <= -5:
-                        label = "AVOID"
+                    if price_change_pct <= -5:
+                        label = "BUY"  # Price went down, bearish → BUY
+                    elif price_change_pct >= 5:
+                        label = "SELL"  # Price went up, bullish → SELL (was AVOID, now SELL)
                     else:
                         label = "HOLD"
                 
@@ -269,31 +272,52 @@ class TrainingDataGenerator:
                 indicators = {}
                 try:
                     # Calculate technical indicators using the analyzer
-                    from trading_analyzer import TradingAnalyzer
-                    temp_analyzer = TradingAnalyzer(data_fetcher=self.data_fetcher)
+                    # Reuse analyzer instance to avoid recreating it for each sample (saves API calls)
+                    if not hasattr(self, '_cached_analyzer'):
+                        from trading_analyzer import TradingAnalyzer
+                        self._cached_analyzer = TradingAnalyzer(data_fetcher=None)  # No data_fetcher to avoid SPY API calls during training
                     
-                    # Initialize enhanced features variables
+                    temp_analyzer = self._cached_analyzer
+                    
+                    # Initialize enhanced features variables (skip market regime/relative strength for training to avoid API calls)
                     market_regime = None
                     timeframe_analysis = None
                     relative_strength = None
                     support_resistance = None
                     
-                    # Analyze to get indicators and enhanced analysis data
-                    # Make sure history_data has the right format
+                    # Convert history_data to DataFrame for direct indicator calculation
                     if history_data and history_data.get('data') and len(history_data['data']) >= 20:
-                        temp_analysis = temp_analyzer.analyze(stock_data, history_data)
+                        # Create DataFrame from history_data
+                        hist_df = pd.DataFrame(history_data['data'])
+                        if 'date' in hist_df.columns:
+                            hist_df['date'] = pd.to_datetime(hist_df['date'])
+                            hist_df.set_index('date', inplace=True)
                         
-                        if 'error' not in temp_analysis:
-                            indicators = temp_analysis.get('indicators', {})
-                            # Get enhanced analysis data
-                            market_regime = temp_analysis.get('market_regime', None)
-                            timeframe_analysis = temp_analysis.get('timeframe_analysis', None)
-                            relative_strength = temp_analysis.get('relative_strength', None)
-                            support_resistance = temp_analysis.get('support_resistance', None)
-                        else:
-                            # Analyzer failed, but we can still extract features with defaults
+                        # Ensure columns are lowercase (analyzer expects lowercase)
+                        column_mapping = {}
+                        for col in hist_df.columns:
+                            col_lower = col.lower()
+                            if col_lower in ['close', 'open', 'high', 'low', 'volume']:
+                                column_mapping[col] = col_lower
+                        if column_mapping:
+                            hist_df.rename(columns=column_mapping, inplace=True)
+                        
+                        # Ensure we have required columns
+                        required_cols = ['close', 'open', 'high', 'low', 'volume']
+                        missing_cols = [col for col in required_cols if col not in hist_df.columns]
+                        if missing_cols:
                             if error_count < 3:
-                                logger.debug(f"Analyzer returned error for {symbol} at {current_date}, using default indicators: {temp_analysis.get('error')}")
+                                logger.debug(f"Missing columns for {symbol} at {current_date}: {missing_cols}")
+                        else:
+                            # Calculate indicators directly without full analysis (avoids SPY API calls)
+                            try:
+                                indicators = temp_analyzer._calculate_indicators(hist_df)
+                                price_action = temp_analyzer._analyze_price_action(hist_df)
+                                timeframe_analysis = temp_analyzer.timeframe_analyzer.analyze_timeframes(hist_df)
+                                support_resistance = temp_analyzer._identify_levels(hist_df)
+                            except Exception as calc_error:
+                                if error_count < 3:
+                                    logger.debug(f"Indicator calculation failed for {symbol} at {current_date}: {calc_error}")
                     else:
                         if error_count < 3:
                             logger.debug(f"Insufficient history data for {symbol} at {current_date}: {len(history_data.get('data', []))} days, using defaults")
@@ -380,9 +404,10 @@ class TrainingDataGenerator:
 class MLTrainingPipeline:
     """Manages ML training pipeline"""
     
-    def __init__(self, data_fetcher: StockDataFetcher, data_dir: Path):
+    def __init__(self, data_fetcher: StockDataFetcher, data_dir: Path, app=None):
         self.data_fetcher = data_fetcher
         self.data_dir = data_dir
+        self.app = app  # Optional app reference for notifications
         self.feature_extractor = FeatureExtractor()
         self.data_generator = TrainingDataGenerator(data_fetcher, self.feature_extractor)
     
@@ -438,7 +463,42 @@ class MLTrainingPipeline:
         results['total_samples'] = len(all_samples)
         results['symbols_used'] = symbols
         
+        # Show notification if training was successful
+        if 'error' not in results and self.app and hasattr(self.app, 'root'):
+            self.app.root.after(0, self._show_training_complete_notification, strategy, results)
+        
         return results
+    
+    def _show_training_complete_notification(self, strategy: str, results: Dict):
+        """Show notification popup when ML training completes"""
+        try:
+            from tkinter import messagebox
+            
+            # Check notification preferences
+            if self.app and hasattr(self.app, 'preferences'):
+                show_notifications = self.app.preferences.get('show_training_complete_notifications', True)
+                if not show_notifications:
+                    logger.debug("Training complete notifications disabled by user preference")
+                    return
+            
+            train_acc = results.get('train_accuracy', 0) * 100
+            test_acc = results.get('test_accuracy', 0) * 100
+            samples = results.get('total_samples', 0)
+            
+            message = f"✅ ML Training Complete!\n\n"
+            message += f"Strategy: {strategy.title()}\n"
+            message += f"Training Samples: {samples:,}\n"
+            message += f"Training Accuracy: {train_acc:.1f}%\n"
+            message += f"Test Accuracy: {test_acc:.1f}%\n"
+            
+            if results.get('cv_mean'):
+                cv_mean = results.get('cv_mean', 0) * 100
+                cv_std = results.get('cv_std', 0) * 100
+                message += f"Cross-Validation: {cv_mean:.1f}% (±{cv_std:.1f}%)\n"
+            
+            messagebox.showinfo("ML Training Complete", message)
+        except Exception as e:
+            logger.debug(f"Error showing training notification: {e}")
     
     def _convert_verified_to_training_samples(self, verified_predictions: List[Dict],
                                             strategy: str) -> List[Dict]:
@@ -680,6 +740,7 @@ class AutoTrainingManager:
         self.min_predictions_for_training = 50
         self.training_interval_days = 7  # Weekly
         self.is_training = False
+        self._show_notifications = True  # Enable notifications by default
     
     def check_and_train(self):
         """Check if training should happen automatically"""
@@ -726,9 +787,19 @@ class AutoTrainingManager:
                 )
                 
                 if result.get('ml_retrained'):
-                    logger.info(f"✅ Auto-training: ML model retrained (accuracy: {result.get('ml_test_accuracy', 0):.1f}%)")
+                    test_acc = result.get('ml_test_accuracy', 0) * 100
+                    logger.info(f"✅ Auto-training: ML model retrained (accuracy: {test_acc:.1f}%)")
+                    # Show notification
+                    if self._show_notifications:
+                        self.app.root.after(0, self._show_auto_training_notification, 
+                                           strategy, True, test_acc, None)
                 else:
-                    logger.info(f"✅ Auto-training: Weights updated (ML retraining: {result.get('ml_error', 'skipped')})")
+                    ml_error = result.get('ml_error', 'skipped')
+                    logger.info(f"✅ Auto-training: Weights updated (ML retraining: {ml_error})")
+                    # Show notification
+                    if self._show_notifications:
+                        self.app.root.after(0, self._show_auto_training_notification, 
+                                           strategy, False, 0, ml_error)
                 
                 # Update last training time
                 self.last_training_time[strategy] = datetime.now()
@@ -738,6 +809,36 @@ class AutoTrainingManager:
                 logger.error(f"Error in auto-training: {e}", exc_info=True)
             finally:
                 self.is_training = False
+    
+    def _show_auto_training_notification(self, strategy: str, ml_retrained: bool, 
+                                        test_accuracy: float, error: Optional[str]):
+        """Show notification popup when auto-training completes"""
+        try:
+            from tkinter import messagebox
+            
+            # Check notification preferences
+            if self.app and hasattr(self.app, 'preferences'):
+                show_notifications = self.app.preferences.get('show_auto_training_notifications', True)
+                if not show_notifications:
+                    logger.debug("Auto-training complete notifications disabled by user preference")
+                    return
+            
+            message = f"✅ Auto-Training Complete!\n\n"
+            message += f"Strategy: {strategy.title()}\n\n"
+            
+            if ml_retrained:
+                message += f"ML Model Retrained\n"
+                message += f"Test Accuracy: {test_accuracy:.1f}%\n"
+                message += f"\nThe model has been improved with new data! 🚀"
+            else:
+                message += f"Weights Updated\n"
+                if error:
+                    message += f"ML Retraining: {error}\n"
+                message += f"\nRule-based weights have been adjusted."
+            
+            messagebox.showinfo("Auto-Training Complete", message)
+        except Exception as e:
+            logger.debug(f"Error showing auto-training notification: {e}")
         
         # Run in background thread
         thread = threading.Thread(target=train_in_background)

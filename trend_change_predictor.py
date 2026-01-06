@@ -83,6 +83,11 @@ class TrendChangePredictor:
             if support_resistance_prediction:
                 predictions.append(support_resistance_prediction)
             
+            # Add continuation predictions for strong trends
+            continuation_prediction = self._predict_trend_continuation(df, indicators, current_trend)
+            if continuation_prediction:
+                predictions.append(continuation_prediction)
+            
             # Add symbol to all predictions
             for pred in predictions:
                 pred['symbol'] = symbol
@@ -106,15 +111,19 @@ class TrendChangePredictor:
                 return None
             
             # Check for oversold/overbought conditions that typically lead to reversals
-            if current_trend == 'downtrend' and current_rsi < 30:
-                # Oversold in downtrend - potential bullish reversal
-                # Estimate based on historical RSI recovery patterns
+            # More lenient thresholds: RSI < 35 (approaching oversold) or > 65 (approaching overbought)
+            if current_trend == 'downtrend' and current_rsi < 35:
+                # Oversold or approaching oversold in downtrend - potential bullish reversal
                 oversold_periods = self._find_oversold_periods(rsi_values)
                 avg_recovery_days = self._calculate_avg_recovery_time(oversold_periods, df)
                 
                 if avg_recovery_days and avg_recovery_days > 0:
                     estimated_date = datetime.now() + timedelta(days=int(avg_recovery_days))
-                    confidence = min(85, 50 + (30 - current_rsi) * 2)  # Lower RSI = higher confidence
+                    # Adjust confidence based on how oversold (lower RSI = higher confidence)
+                    if current_rsi < 30:
+                        confidence = min(85, 50 + (30 - current_rsi) * 2)  # Very oversold
+                    else:
+                        confidence = min(70, 40 + (35 - current_rsi) * 2)  # Approaching oversold
                     
                     return {
                         'current_trend': current_trend,
@@ -122,18 +131,22 @@ class TrendChangePredictor:
                         'estimated_days': int(avg_recovery_days),
                         'estimated_date': estimated_date.isoformat(),
                         'confidence': confidence,
-                        'reasoning': f"RSI oversold ({current_rsi:.1f}) in downtrend - historical patterns suggest bullish reversal in ~{int(avg_recovery_days)} days",
-                        'key_indicators': {'rsi': current_rsi, 'rsi_status': 'oversold'}
+                        'reasoning': f"RSI {'oversold' if current_rsi < 30 else 'approaching oversold'} ({current_rsi:.1f}) in downtrend - historical patterns suggest bullish reversal in ~{int(avg_recovery_days)} days",
+                        'key_indicators': {'rsi': current_rsi, 'rsi_status': 'oversold' if current_rsi < 30 else 'approaching_oversold'}
                     }
             
-            elif current_trend == 'uptrend' and current_rsi > 70:
-                # Overbought in uptrend - potential bearish reversal
+            elif current_trend == 'uptrend' and current_rsi > 65:
+                # Overbought or approaching overbought in uptrend - potential bearish reversal
                 overbought_periods = self._find_overbought_periods(rsi_values)
                 avg_reversal_days = self._calculate_avg_reversal_time(overbought_periods, df)
                 
                 if avg_reversal_days and avg_reversal_days > 0:
                     estimated_date = datetime.now() + timedelta(days=int(avg_reversal_days))
-                    confidence = min(85, 50 + (current_rsi - 70) * 2)  # Higher RSI = higher confidence
+                    # Adjust confidence based on how overbought (higher RSI = higher confidence)
+                    if current_rsi > 70:
+                        confidence = min(85, 50 + (current_rsi - 70) * 2)  # Very overbought
+                    else:
+                        confidence = min(70, 40 + (current_rsi - 65) * 2)  # Approaching overbought
                     
                     return {
                         'current_trend': current_trend,
@@ -141,8 +154,8 @@ class TrendChangePredictor:
                         'estimated_days': int(avg_reversal_days),
                         'estimated_date': estimated_date.isoformat(),
                         'confidence': confidence,
-                        'reasoning': f"RSI overbought ({current_rsi:.1f}) in uptrend - historical patterns suggest bearish reversal in ~{int(avg_reversal_days)} days",
-                        'key_indicators': {'rsi': current_rsi, 'rsi_status': 'overbought'}
+                        'reasoning': f"RSI {'overbought' if current_rsi > 70 else 'approaching overbought'} ({current_rsi:.1f}) in uptrend - historical patterns suggest bearish reversal in ~{int(avg_reversal_days)} days",
+                        'key_indicators': {'rsi': current_rsi, 'rsi_status': 'overbought' if current_rsi > 70 else 'approaching_overbought'}
                     }
             
             return None
@@ -169,9 +182,14 @@ class TrendChangePredictor:
                 return None
             
             # Check if MACD is approaching signal line (potential crossover)
-            if current_trend == 'downtrend' and macd_diff < 0 and abs(macd_diff) < 0.1:
+            # More lenient: check if MACD is converging (diff getting smaller) or already close
+            macd_diff_abs = abs(macd_diff)
+            macd_trend = macd_line.iloc[-1] - macd_line.iloc[-5] if len(macd_line) >= 5 else 0
+            signal_trend = signal_line.iloc[-1] - signal_line.iloc[-5] if len(signal_line) >= 5 else 0
+            is_converging = (macd_diff < 0 and macd_trend > signal_trend) or (macd_diff > 0 and macd_trend < signal_trend)
+            
+            if current_trend == 'downtrend' and macd_diff < 0 and (macd_diff_abs < 0.5 or is_converging):
                 # MACD approaching signal from below - potential bullish crossover
-                # Estimate based on convergence rate
                 convergence_rate = self._calculate_macd_convergence_rate(macd_line, signal_line)
                 
                 if convergence_rate and convergence_rate > 0:
@@ -181,7 +199,11 @@ class TrendChangePredictor:
                     estimated_days = int(base_days * multiplier)
                     estimated_days = max(3, min(30, estimated_days))  # Keep in range
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
-                    confidence = min(75, 40 + abs(macd_diff) * 100)  # Closer to crossover = higher confidence
+                    # Higher confidence if closer to crossover
+                    if macd_diff_abs < 0.1:
+                        confidence = min(75, 40 + (0.1 - macd_diff_abs) * 350)
+                    else:
+                        confidence = min(65, 35 + (0.5 - macd_diff_abs) * 60)
                     
                     return {
                         'current_trend': current_trend,
@@ -189,11 +211,11 @@ class TrendChangePredictor:
                         'estimated_days': estimated_days,
                         'estimated_date': estimated_date.isoformat(),
                         'confidence': confidence,
-                        'reasoning': f"MACD converging with signal line (diff: {macd_diff:.3f}) - potential bullish crossover in ~{estimated_days} days",
+                        'reasoning': f"MACD {'converging with' if is_converging else 'near'} signal line (diff: {macd_diff:.3f}) - potential bullish crossover in ~{estimated_days} days",
                         'key_indicators': {'macd': macd, 'macd_signal': macd_signal, 'macd_diff': macd_diff}
                     }
             
-            elif current_trend == 'uptrend' and macd_diff > 0 and abs(macd_diff) < 0.1:
+            elif current_trend == 'uptrend' and macd_diff > 0 and (macd_diff_abs < 0.5 or is_converging):
                 # MACD approaching signal from above - potential bearish crossover
                 convergence_rate = self._calculate_macd_convergence_rate(macd_line, signal_line)
                 
@@ -204,7 +226,11 @@ class TrendChangePredictor:
                     estimated_days = int(base_days * multiplier)
                     estimated_days = max(3, min(30, estimated_days))  # Keep in range
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
-                    confidence = min(75, 40 + abs(macd_diff) * 100)
+                    # Higher confidence if closer to crossover
+                    if macd_diff_abs < 0.1:
+                        confidence = min(75, 40 + (0.1 - macd_diff_abs) * 350)
+                    else:
+                        confidence = min(65, 35 + (0.5 - macd_diff_abs) * 60)
                     
                     return {
                         'current_trend': current_trend,
@@ -212,7 +238,7 @@ class TrendChangePredictor:
                         'estimated_days': estimated_days,
                         'estimated_date': estimated_date.isoformat(),
                         'confidence': confidence,
-                        'reasoning': f"MACD converging with signal line (diff: {macd_diff:.3f}) - potential bearish crossover in ~{estimated_days} days",
+                        'reasoning': f"MACD {'converging with' if is_converging else 'near'} signal line (diff: {macd_diff:.3f}) - potential bearish crossover in ~{estimated_days} days",
                         'key_indicators': {'macd': macd, 'macd_signal': macd_signal, 'macd_diff': macd_diff}
                     }
             
@@ -247,8 +273,14 @@ class TrendChangePredictor:
             ema_diff = ema_20 - ema_50
             ema_diff_pct = (ema_diff / ema_50) * 100 if ema_50 > 0 else 0
             
+            # Check if EMAs are converging (trending towards each other)
+            ema_20_trend = ema_20_vals.iloc[-1] - ema_20_vals.iloc[-5] if len(ema_20_vals) >= 5 else 0
+            ema_50_trend = ema_50_vals.iloc[-1] - ema_50_vals.iloc[-5] if len(ema_50_vals) >= 5 else 0
+            is_ema_converging = (ema_diff < 0 and ema_20_trend > ema_50_trend) or (ema_diff > 0 and ema_20_trend < ema_50_trend)
+            
             # Golden Cross potential (EMA 20 crossing above EMA 50)
-            if current_trend == 'downtrend' and ema_diff < 0 and abs(ema_diff_pct) < 2:
+            # More lenient: check if converging or within 5% of each other
+            if current_trend == 'downtrend' and ema_diff < 0 and (abs(ema_diff_pct) < 5 or is_ema_converging):
                 # Estimate based on convergence rate
                 convergence_rate = self._calculate_ema_convergence_rate(ema_20_vals, ema_50_vals)
                 
@@ -259,7 +291,11 @@ class TrendChangePredictor:
                     estimated_days = int(base_days * multiplier)
                     estimated_days = max(5, min(40, estimated_days))  # Keep in range
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
-                    confidence = min(80, 50 + abs(ema_diff_pct) * 10)
+                    # Higher confidence if closer together
+                    if abs(ema_diff_pct) < 2:
+                        confidence = min(80, 50 + (2 - abs(ema_diff_pct)) * 15)
+                    else:
+                        confidence = min(65, 40 + (5 - abs(ema_diff_pct)) * 5)
                     
                     return {
                         'current_trend': current_trend,
@@ -267,12 +303,12 @@ class TrendChangePredictor:
                         'estimated_days': estimated_days,
                         'estimated_date': estimated_date.isoformat(),
                         'confidence': confidence,
-                        'reasoning': f"EMA 20 approaching EMA 50 (Golden Cross potential) - estimated ~{estimated_days} days",
+                        'reasoning': f"EMA 20 {'approaching' if abs(ema_diff_pct) < 2 else 'converging towards'} EMA 50 (Golden Cross potential, {abs(ema_diff_pct):.1f}% apart) - estimated ~{estimated_days} days",
                         'key_indicators': {'ema_20': ema_20, 'ema_50': ema_50, 'ema_diff_pct': ema_diff_pct}
                     }
             
             # Death Cross potential (EMA 20 crossing below EMA 50)
-            elif current_trend == 'uptrend' and ema_diff > 0 and abs(ema_diff_pct) < 2:
+            elif current_trend == 'uptrend' and ema_diff > 0 and (abs(ema_diff_pct) < 5 or is_ema_converging):
                 convergence_rate = self._calculate_ema_convergence_rate(ema_20_vals, ema_50_vals)
                 
                 if convergence_rate and convergence_rate > 0:
@@ -282,7 +318,11 @@ class TrendChangePredictor:
                     estimated_days = int(base_days * multiplier)
                     estimated_days = max(5, min(40, estimated_days))  # Keep in range
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
-                    confidence = min(80, 50 + abs(ema_diff_pct) * 10)
+                    # Higher confidence if closer together
+                    if abs(ema_diff_pct) < 2:
+                        confidence = min(80, 50 + (2 - abs(ema_diff_pct)) * 15)
+                    else:
+                        confidence = min(65, 40 + (5 - abs(ema_diff_pct)) * 5)
                     
                     return {
                         'current_trend': current_trend,
@@ -290,7 +330,7 @@ class TrendChangePredictor:
                         'estimated_days': estimated_days,
                         'estimated_date': estimated_date.isoformat(),
                         'confidence': confidence,
-                        'reasoning': f"EMA 20 approaching EMA 50 (Death Cross potential) - estimated ~{estimated_days} days",
+                        'reasoning': f"EMA 20 {'approaching' if abs(ema_diff_pct) < 2 else 'converging towards'} EMA 50 (Death Cross potential, {abs(ema_diff_pct):.1f}% apart) - estimated ~{estimated_days} days",
                         'key_indicators': {'ema_20': ema_20, 'ema_50': ema_50, 'ema_diff_pct': ema_diff_pct}
                     }
             
@@ -370,37 +410,42 @@ class TrendChangePredictor:
             distance_to_support = ((current_price - support) / support) * 100
             distance_to_resistance = ((resistance - current_price) / current_price) * 100
             
+            # More lenient: check if price is approaching support/resistance (within 5%)
             # If very close to support in downtrend, potential bounce
-            if current_trend == 'downtrend' and distance_to_support < 2:
-                base_days = 3  # Quick bounce if support holds
+            if current_trend == 'downtrend' and distance_to_support < 5:
+                base_days = 3 if distance_to_support < 2 else 7  # Quick bounce if very close, slower if approaching
                 adjustment = self.learned_adjustments.get('support_resistance_days_adjustment', 0)
                 estimated_days = max(1, base_days + adjustment)
                 estimated_date = datetime.now() + timedelta(days=estimated_days)
+                # Higher confidence if closer to support
+                confidence = 70 if distance_to_support < 2 else max(55, 70 - (distance_to_support - 2) * 5)
                 
                 return {
                     'current_trend': current_trend,
                     'predicted_change': 'bullish_reversal',
                     'estimated_days': estimated_days,
                     'estimated_date': estimated_date.isoformat(),
-                    'confidence': 70,
-                    'reasoning': f"Price near support level ({distance_to_support:.1f}% away) - potential bounce in ~{estimated_days} days",
+                    'confidence': confidence,
+                    'reasoning': f"Price {'near' if distance_to_support < 2 else 'approaching'} support level ({distance_to_support:.1f}% away) - potential bounce in ~{estimated_days} days",
                     'key_indicators': {'distance_to_support': distance_to_support}
                 }
             
             # If very close to resistance in uptrend, potential rejection
-            elif current_trend == 'uptrend' and distance_to_resistance < 2:
-                base_days = 3
+            elif current_trend == 'uptrend' and distance_to_resistance < 5:
+                base_days = 3 if distance_to_resistance < 2 else 7  # Quick rejection if very close, slower if approaching
                 adjustment = self.learned_adjustments.get('support_resistance_days_adjustment', 0)
                 estimated_days = max(1, base_days + adjustment)
                 estimated_date = datetime.now() + timedelta(days=estimated_days)
+                # Higher confidence if closer to resistance
+                confidence = 70 if distance_to_resistance < 2 else max(55, 70 - (distance_to_resistance - 2) * 5)
                 
                 return {
                     'current_trend': current_trend,
                     'predicted_change': 'bearish_reversal',
                     'estimated_days': estimated_days,
                     'estimated_date': estimated_date.isoformat(),
-                    'confidence': 70,
-                    'reasoning': f"Price near resistance level ({distance_to_resistance:.1f}% away) - potential rejection in ~{estimated_days} days",
+                    'confidence': confidence,
+                    'reasoning': f"Price {'near' if distance_to_resistance < 2 else 'approaching'} resistance level ({distance_to_resistance:.1f}% away) - potential rejection in ~{estimated_days} days",
                     'key_indicators': {'distance_to_resistance': distance_to_resistance}
                 }
             
@@ -408,6 +453,67 @@ class TrendChangePredictor:
             
         except Exception as e:
             logger.error(f"Error in support/resistance prediction: {e}")
+            return None
+    
+    def _predict_trend_continuation(self, df: pd.DataFrame, indicators: dict, 
+                                   current_trend: str) -> Optional[Dict]:
+        """Predict trend continuation for strong trends"""
+        try:
+            rsi = indicators.get('rsi', 50)
+            macd_diff = indicators.get('macd_diff', 0)
+            ema_20 = indicators.get('ema_20', 0)
+            ema_50 = indicators.get('ema_50', 0)
+            
+            # Strong uptrend continuation
+            if current_trend == 'uptrend':
+                # Check for strong bullish momentum
+                if (rsi > 50 and rsi < 70 and  # Healthy RSI (not overbought)
+                    macd_diff > 0 and  # MACD bullish
+                    ema_20 > ema_50):  # Price above EMAs
+                    
+                    # Estimate continuation based on momentum strength
+                    momentum_strength = (rsi - 50) / 20  # 0-1 scale
+                    estimated_days = max(5, min(20, int(10 + momentum_strength * 10)))
+                    estimated_date = datetime.now() + timedelta(days=estimated_days)
+                    confidence = min(70, 50 + (rsi - 50) * 0.4)
+                    
+                    return {
+                        'current_trend': current_trend,
+                        'predicted_change': 'continuation',
+                        'estimated_days': estimated_days,
+                        'estimated_date': estimated_date.isoformat(),
+                        'confidence': confidence,
+                        'reasoning': f"Strong uptrend continuation expected - RSI {rsi:.1f}, MACD bullish, price above EMAs - estimated ~{estimated_days} days",
+                        'key_indicators': {'rsi': rsi, 'macd_diff': macd_diff, 'trend_strength': 'strong'}
+                    }
+            
+            # Strong downtrend continuation
+            elif current_trend == 'downtrend':
+                # Check for strong bearish momentum
+                if (rsi < 50 and rsi > 30 and  # Healthy RSI (not oversold)
+                    macd_diff < 0 and  # MACD bearish
+                    ema_20 < ema_50):  # Price below EMAs
+                    
+                    # Estimate continuation based on momentum strength
+                    momentum_strength = (50 - rsi) / 20  # 0-1 scale
+                    estimated_days = max(5, min(20, int(10 + momentum_strength * 10)))
+                    estimated_date = datetime.now() + timedelta(days=estimated_days)
+                    confidence = min(70, 50 + (50 - rsi) * 0.4)
+                    
+                    return {
+                        'current_trend': current_trend,
+                        'predicted_change': 'continuation',
+                        'estimated_days': estimated_days,
+                        'estimated_date': estimated_date.isoformat(),
+                        'confidence': confidence,
+                        'reasoning': f"Strong downtrend continuation expected - RSI {rsi:.1f}, MACD bearish, price below EMAs - estimated ~{estimated_days} days",
+                        'key_indicators': {'rsi': rsi, 'macd_diff': macd_diff, 'trend_strength': 'strong'}
+                    }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error in trend continuation prediction: {e}")
             return None
     
     # Helper methods
@@ -445,6 +551,212 @@ class TrendChangePredictor:
         
         return overbought_periods
     
+    def _load_learned_adjustments(self) -> Dict:
+        """Load learned adjustments from verified predictions"""
+        if not self.learning_data_file or not self.learning_data_file.exists():
+            return {
+                'rsi_recovery_multiplier': 1.0,
+                'rsi_reversal_multiplier': 1.0,
+                'macd_convergence_multiplier': 1.0,
+                'ema_convergence_multiplier': 1.0,
+                'divergence_days_adjustment': 0,
+                'support_resistance_days_adjustment': 0,
+                'price_prediction_adjustment': 1.0,  # Adjustment factor for price predictions
+                'verified_count': 0
+            }
+        
+        try:
+            with open(self.learning_data_file, 'r') as f:
+                data = json.load(f)
+                # Ensure price_prediction_adjustment exists
+                if 'price_prediction_adjustment' not in data:
+                    data['price_prediction_adjustment'] = 1.0
+                return data
+        except Exception as e:
+            logger.error(f"Error loading learned adjustments: {e}")
+            return {
+                'rsi_recovery_multiplier': 1.0,
+                'rsi_reversal_multiplier': 1.0,
+                'macd_convergence_multiplier': 1.0,
+                'ema_convergence_multiplier': 1.0,
+                'divergence_days_adjustment': 0,
+                'support_resistance_days_adjustment': 0,
+                'price_prediction_adjustment': 1.0,  # Adjustment factor for price predictions
+                'verified_count': 0
+            }
+    
+    def _save_learned_adjustments(self):
+        """Save learned adjustments to file"""
+        if not self.learning_data_file:
+            return
+        
+        try:
+            self.learning_data_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.learning_data_file, 'w') as f:
+                json.dump(self.learned_adjustments, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving learned adjustments: {e}")
+    
+    def learn_from_verified_predictions(self, verified_predictions: List[Dict]):
+        """Learn from verified predictions to improve future estimates (days and price accuracy)"""
+        if not verified_predictions:
+            return
+        
+        # Group by prediction type
+        rsi_predictions = []
+        macd_predictions = []
+        ema_predictions = []
+        divergence_predictions = []
+        support_resistance_predictions = []
+        
+        for pred in verified_predictions:
+            if not pred.get('verified') or pred.get('was_correct') is None:
+                continue
+            
+            reasoning = pred.get('reasoning', '')
+            estimated_days = pred.get('estimated_days', 0)
+            
+            # Calculate actual days (if available)
+            try:
+                estimated_date = datetime.fromisoformat(pred.get('estimated_date', ''))
+                verification_date = datetime.fromisoformat(pred.get('verification_date', ''))
+                actual_days = (verification_date - estimated_date).days
+            except:
+                actual_days = None
+            
+            # Get price accuracy data
+            actual_low_price = pred.get('actual_low_price')
+            actual_high_price = pred.get('actual_high_price')
+            current_price_at_verification = pred.get('current_price_at_verification')
+            
+            # Get predicted price from key indicators or calculate from reasoning
+            predicted_low_price = None
+            predicted_high_price = None
+            
+            # Try to extract predicted price from key_indicators or calculate from current price
+            key_indicators = pred.get('key_indicators', {})
+            predicted_change = pred.get('predicted_change', '')
+            
+            # Calculate predicted price drop/rise based on prediction type
+            if current_price_at_verification and predicted_change:
+                if predicted_change == 'bearish_reversal':
+                    # Predicted price drop - estimate based on confidence
+                    confidence = pred.get('confidence', 50)
+                    drop_pct = min(15, max(5, confidence / 5))  # 5-15% drop
+                    predicted_low_price = current_price_at_verification * (1 - drop_pct / 100)
+                elif predicted_change == 'bullish_reversal':
+                    # Price drops before bounce - estimate drop
+                    confidence = pred.get('confidence', 50)
+                    drop_pct = min(10, max(3, confidence / 7))  # 3-10% drop
+                    predicted_low_price = current_price_at_verification * (1 - drop_pct / 100)
+            
+            # Categorize by prediction type (include price accuracy data)
+            pred_data = {
+                'estimated_days': estimated_days,
+                'actual_days': actual_days,
+                'was_correct': pred.get('was_correct', False),
+                'predicted_low_price': predicted_low_price,
+                'actual_low_price': actual_low_price,
+                'predicted_high_price': predicted_high_price,
+                'actual_high_price': actual_high_price,
+                'current_price': current_price_at_verification
+            }
+            
+            if 'RSI' in reasoning:
+                rsi_predictions.append(pred_data)
+            elif 'MACD' in reasoning:
+                macd_predictions.append(pred_data)
+            elif 'EMA' in reasoning:
+                ema_predictions.append(pred_data)
+            elif 'divergence' in reasoning.lower():
+                divergence_predictions.append(pred_data)
+            elif 'support' in reasoning.lower() or 'resistance' in reasoning.lower():
+                support_resistance_predictions.append(pred_data)
+        
+        # Calculate adjustments based on accuracy
+        # If predictions were consistently too fast/slow, adjust multipliers
+        
+        # RSI adjustments
+        if rsi_predictions:
+            correct_rsi = [p for p in rsi_predictions if p['was_correct']]
+            if correct_rsi and len(correct_rsi) >= 3:
+                avg_estimated = np.mean([p['estimated_days'] for p in correct_rsi])
+                avg_actual = np.mean([p['actual_days'] for p in correct_rsi if p['actual_days'] is not None])
+                if avg_actual and avg_estimated > 0:
+                    ratio = avg_actual / avg_estimated
+                    # Smooth adjustment (weighted average with existing multiplier)
+                    self.learned_adjustments['rsi_recovery_multiplier'] = (
+                        0.7 * self.learned_adjustments['rsi_recovery_multiplier'] + 0.3 * ratio
+                    )
+        
+        # MACD adjustments
+        if macd_predictions:
+            correct_macd = [p for p in macd_predictions if p['was_correct']]
+            if correct_macd and len(correct_macd) >= 3:
+                avg_estimated = np.mean([p['estimated_days'] for p in correct_macd])
+                avg_actual = np.mean([p['actual_days'] for p in correct_macd if p['actual_days'] is not None])
+                if avg_actual and avg_estimated > 0:
+                    ratio = avg_actual / avg_estimated
+                    self.learned_adjustments['macd_convergence_multiplier'] = (
+                        0.7 * self.learned_adjustments['macd_convergence_multiplier'] + 0.3 * ratio
+                    )
+        
+        # EMA adjustments
+        if ema_predictions:
+            correct_ema = [p for p in ema_predictions if p['was_correct']]
+            if correct_ema and len(correct_ema) >= 3:
+                avg_estimated = np.mean([p['estimated_days'] for p in correct_ema])
+                avg_actual = np.mean([p['actual_days'] for p in correct_ema if p['actual_days'] is not None])
+                if avg_actual and avg_estimated > 0:
+                    ratio = avg_actual / avg_estimated
+                    self.learned_adjustments['ema_convergence_multiplier'] = (
+                        0.7 * self.learned_adjustments['ema_convergence_multiplier'] + 0.3 * ratio
+                    )
+        
+        # Learn from price accuracy (adjust price prediction percentages)
+        # Calculate average price accuracy for all prediction types
+        all_price_predictions = rsi_predictions + macd_predictions + ema_predictions + divergence_predictions + support_resistance_predictions
+        correct_price_predictions = [p for p in all_price_predictions if p['was_correct'] and p.get('predicted_low_price') and p.get('actual_low_price')]
+        
+        if correct_price_predictions and len(correct_price_predictions) >= 3:
+            # Calculate average price prediction accuracy
+            price_errors = []
+            for p in correct_price_predictions:
+                predicted = p['predicted_low_price']
+                actual = p['actual_low_price']
+                if predicted > 0 and actual > 0:
+                    error_pct = abs((predicted - actual) / actual) * 100
+                    price_errors.append(error_pct)
+            
+            if price_errors:
+                avg_price_error = np.mean(price_errors)
+                # If average error is high, adjust price prediction percentages
+                # Store adjustment factor (lower = more conservative predictions)
+                if 'price_prediction_adjustment' not in self.learned_adjustments:
+                    self.learned_adjustments['price_prediction_adjustment'] = 1.0
+                
+                # If error is > 20%, make predictions more conservative
+                if avg_price_error > 20:
+                    adjustment_factor = 0.9  # Reduce predicted drops by 10%
+                elif avg_price_error < 10:
+                    adjustment_factor = 1.05  # Increase predicted drops by 5% (more aggressive)
+                else:
+                    adjustment_factor = 1.0  # No adjustment needed
+                
+                # Smooth adjustment
+                self.learned_adjustments['price_prediction_adjustment'] = (
+                    0.8 * self.learned_adjustments['price_prediction_adjustment'] + 0.2 * adjustment_factor
+                )
+                
+                logger.info(f"📊 Price prediction accuracy: {avg_price_error:.1f}% average error. Adjustment factor: {self.learned_adjustments['price_prediction_adjustment']:.3f}")
+        
+        # Update verified count
+        self.learned_adjustments['verified_count'] += len(verified_predictions)
+        
+        # Save learned adjustments
+        self._save_learned_adjustments()
+        logger.info(f"🧠 Learned from {len(verified_predictions)} verified trend change predictions (days + price accuracy)")
+    
     def _calculate_avg_recovery_time(self, periods: List[int], df: pd.DataFrame) -> Optional[float]:
         """Calculate average recovery time from oversold periods"""
         if not periods:
@@ -452,7 +764,12 @@ class TrendChangePredictor:
         
         # Use historical patterns - typically 5-15 days for RSI recovery
         avg_period = np.mean(periods) if periods else 10
-        return min(30, max(3, avg_period))
+        base_estimate = min(30, max(3, avg_period))
+        
+        # Apply learned adjustment
+        multiplier = self.learned_adjustments.get('rsi_recovery_multiplier', 1.0)
+        adjusted = base_estimate * multiplier
+        return min(30, max(3, adjusted))
     
     def _calculate_avg_reversal_time(self, periods: List[int], df: pd.DataFrame) -> Optional[float]:
         """Calculate average reversal time from overbought periods"""
@@ -460,7 +777,12 @@ class TrendChangePredictor:
             return None
         
         avg_period = np.mean(periods) if periods else 10
-        return min(30, max(3, avg_period))
+        base_estimate = min(30, max(3, avg_period))
+        
+        # Apply learned adjustment
+        multiplier = self.learned_adjustments.get('rsi_reversal_multiplier', 1.0)
+        adjusted = base_estimate * multiplier
+        return min(30, max(3, adjusted))
     
     def _calculate_macd_convergence_rate(self, macd_line: pd.Series, 
                                          signal_line: pd.Series) -> Optional[float]:

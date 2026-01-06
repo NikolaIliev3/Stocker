@@ -47,10 +47,30 @@ Thumbs.db
 
 # Logs
 *.log
+*_audit.log
+api_audit.log
 
 # Temporary files
 *.tmp
 *.bak
+
+# API Keys and Secrets
+.env
+.env.local
+*.key
+*.pem
+*.p12
+*.pfx
+*.encrypted
+.api_keys*
+.encryption_key
+secrets/
+credentials/
+*_rotation.json
+*_backup.key
+
+# Research cache (may contain API responses)
+research_cache/
 
 # Compiled
 *.exe

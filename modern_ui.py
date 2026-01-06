@@ -44,11 +44,14 @@ class ModernButton(tk.Button):
             fg = kwargs.pop('fg', '#FFFFFF')
             hover_bg = kwargs.pop('hover_bg', '#4F46E5')
         
+        # Get font from kwargs or use default
+        font = kwargs.pop('font', ('Segoe UI', 10, 'bold'))
+        
         # Store original command
         self._command = command
         
         super().__init__(parent, text=text, command=self._animated_command,
-                        bg=bg, fg=fg, font=('Segoe UI', 10, 'bold'),
+                        bg=bg, fg=fg, font=font,
                         relief=tk.FLAT, bd=0, cursor='hand2',
                         padx=20, pady=12, **kwargs)
         
@@ -59,34 +62,58 @@ class ModernButton(tk.Button):
         self.bind('<Enter>', self._on_enter)
         self.bind('<Leave>', self._on_leave)
     
+    def _widget_exists(self):
+        """Check if widget still exists"""
+        try:
+            return self.winfo_exists()
+        except tk.TclError:
+            return False
+    
     def _animated_command(self):
         """Execute command with smooth animation"""
+        if not self._widget_exists():
+            return
         # Scale down animation
         self._scale_animation(0.95)
         # Execute command
         if self._command:
             self._command()
-        # Scale back
-        self.after(100, lambda: self._scale_animation(1.0))
+        # Scale back (only if widget still exists)
+        if self._widget_exists():
+            self.after(100, lambda: self._scale_animation(1.0) if self._widget_exists() else None)
     
     def _scale_animation(self, scale: float):
         """Smooth scale animation"""
-        new_padx = int(self.original_padx * scale)
-        new_pady = int(self.original_pady * scale)
-        self.config(padx=new_padx, pady=new_pady)
+        if not self._widget_exists():
+            return
+        try:
+            new_padx = int(self.original_padx * scale)
+            new_pady = int(self.original_pady * scale)
+            self.config(padx=new_padx, pady=new_pady)
+        except tk.TclError:
+            pass  # Widget was destroyed, ignore
     
     def _on_enter(self, event):
         """Smooth hover animation"""
+        if not self._widget_exists():
+            return
         self._fade_color(self.original_bg, self.hover_bg, steps=5)
     
     def _on_leave(self, event):
         """Smooth leave animation"""
+        if not self._widget_exists():
+            return
         self._fade_color(self.hover_bg, self.original_bg, steps=5)
     
     def _fade_color(self, from_color: str, to_color: str, steps: int = 5):
         """Smooth color transition"""
-        # Simplified - just change color directly
-        self.config(bg=to_color)
+        if not self._widget_exists():
+            return
+        try:
+            # Simplified - just change color directly
+            self.config(bg=to_color)
+        except tk.TclError:
+            pass  # Widget was destroyed, ignore
 
 
 class GradientLabel(tk.Label):

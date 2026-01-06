@@ -85,7 +85,8 @@ class SecureSession(requests.Session):
             if not is_localhost:
                 raise SecurityError("HTTP requests to external servers are not allowed. Use HTTPS only.")
             else:
-                logger.info(f"Allowing HTTP connection to localhost: {hostname}")
+                # Only log at debug level to reduce spam during training
+                logger.debug(f"Allowing HTTP connection to localhost: {hostname}")
         
         # Add certificate verification (skip for localhost HTTP)
         if 'verify' not in kwargs:

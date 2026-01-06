@@ -138,14 +138,14 @@ class MarketScanner:
                             analysis = self.investing_analyzer.analyze(stock_data, financials_data, history_data)
                 else:
                     # Use basic analyzers (no training available yet)
-                if strategy == 'trading':
-                    analysis = self.trading_analyzer.analyze(stock_data, history_data)
-                elif strategy == 'mixed':
-                    financials_data = self.data_fetcher.fetch_financials(symbol)
-                    analysis = self.mixed_analyzer.analyze(stock_data, financials_data, history_data)
-                else:  # investing
-                    financials_data = self.data_fetcher.fetch_financials(symbol)
-                    analysis = self.investing_analyzer.analyze(stock_data, financials_data, history_data)
+                    if strategy == 'trading':
+                        analysis = self.trading_analyzer.analyze(stock_data, history_data)
+                    elif strategy == 'mixed':
+                        financials_data = self.data_fetcher.fetch_financials(symbol)
+                        analysis = self.mixed_analyzer.analyze(stock_data, financials_data, history_data)
+                    else:  # investing
+                        financials_data = self.data_fetcher.fetch_financials(symbol)
+                        analysis = self.investing_analyzer.analyze(stock_data, financials_data, history_data)
                 
                 if 'error' in analysis:
                     continue

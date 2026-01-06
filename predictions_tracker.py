@@ -120,10 +120,20 @@ class PredictionsTracker:
         elif action in ["HOLD", "AVOID"]:
             # For HOLD/AVOID, we check if price moved in expected direction
             price_change = ((current_price - entry_price) / entry_price) * 100
-            if action == "HOLD" and abs(price_change) < 5:  # Price stayed relatively stable
-                was_correct = True
-            elif action == "AVOID" and price_change < -5:  # Price went down (good to avoid)
-                was_correct = True
+            strategy = prediction.get('strategy', 'trading')
+            
+            if action == "HOLD":
+                # Strategy-specific thresholds for HOLD (same as backtest evaluation)
+                if strategy == "trading":
+                    was_correct = abs(price_change) < 3
+                elif strategy == "mixed":
+                    was_correct = abs(price_change) < 5
+                else:  # investing
+                    # For investing (1.5 year timeframe), allow up to 20% movement
+                    was_correct = abs(price_change) < 20
+            elif action == "AVOID":
+                # AVOID (legacy) is correct if price went down
+                was_correct = price_change < -5
             else:
                 was_correct = False
         

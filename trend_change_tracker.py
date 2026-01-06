@@ -84,8 +84,9 @@ class TrendChangeTracker:
         return None
     
     def verify_prediction(self, prediction_id: int, actual_change: str, 
-                        was_correct: bool) -> Optional[Dict]:
-        """Verify a trend change prediction"""
+                        was_correct: bool, actual_low_price: float = None,
+                        actual_high_price: float = None, current_price: float = None) -> Optional[Dict]:
+        """Verify a trend change prediction with price accuracy tracking"""
         prediction = self.get_prediction_by_id(prediction_id)
         if not prediction or prediction.get('status') != 'active':
             return None
@@ -95,6 +96,28 @@ class TrendChangeTracker:
         prediction['was_correct'] = was_correct
         prediction['actual_change'] = actual_change
         prediction['verification_date'] = datetime.now().isoformat()
+        
+        # Store price accuracy data for learning
+        if actual_low_price is not None:
+            prediction['actual_low_price'] = actual_low_price
+        if actual_high_price is not None:
+            prediction['actual_high_price'] = actual_high_price
+        if current_price is not None:
+            prediction['current_price_at_verification'] = current_price
+        
+        # Calculate days accuracy
+        try:
+            estimated_date = datetime.fromisoformat(prediction.get('estimated_date', ''))
+            verification_date = datetime.now()
+            actual_days = (verification_date - estimated_date).days
+            estimated_days = prediction.get('estimated_days', 0)
+            prediction['days_accuracy'] = {
+                'estimated': estimated_days,
+                'actual': actual_days,
+                'difference': actual_days - estimated_days
+            }
+        except:
+            pass
         
         self.save()
         return prediction

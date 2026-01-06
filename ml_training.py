@@ -344,9 +344,34 @@ class StockPredictionML:
                     self.label_encoder = self.storage.load_model(label_encoder_file)
                     logger.debug(f"Loaded label encoder for {self.strategy}")
                 else:
-                    logger.warning(f"Label encoder not found for {self.strategy}. Model may not work correctly.")
-                    # Create a new unfitted encoder (will fail if used, but better than crashing on load)
+                    # Label encoder file missing - try to recover from metadata or use defaults
+                    logger.debug(f"Label encoder file not found for {self.strategy}. Attempting recovery.")
                     self.label_encoder = LabelEncoder()
+                    
+                    # Try to get class order from metadata first (if available)
+                    classes_to_use = None
+                    if self.metadata_file.exists():
+                        try:
+                            with open(self.metadata_file, 'r') as f:
+                                metadata = json.load(f)
+                                classes_to_use = metadata.get('label_classes')
+                                if classes_to_use:
+                                    logger.debug(f"Found class order in metadata: {classes_to_use}")
+                        except Exception as e:
+                            logger.debug(f"Could not read metadata for class recovery: {e}")
+                    
+                    # If no metadata, use default expected classes
+                    if not classes_to_use:
+                        classes_to_use = ['BUY', 'HOLD', 'SELL']  # Standard expected classes
+                        logger.debug(f"Using default class order: {classes_to_use}")
+                    
+                    try:
+                        self.label_encoder.fit(classes_to_use)
+                        logger.debug(f"Created label encoder with classes: {list(self.label_encoder.classes_)}")
+                        logger.debug(f"Note: If class order differs from original training, predictions may be incorrect. Consider retraining.")
+                    except Exception as e:
+                        logger.debug(f"Could not create label encoder: {e}. Model will need retraining.")
+                        # Leave encoder unfitted - is_trained() will return False and predict() will handle gracefully
                 
                 # Load metadata
                 if self.metadata_file.exists():
@@ -626,7 +651,8 @@ class StockPredictionML:
             'selected_features': self.selected_features.tolist() if self.selected_features is not None else None,
             'feature_selection_threshold': self.feature_selection_threshold,
             'total_features': len(self.feature_extractor.get_feature_names()),
-            'selected_features_count': len(self.selected_features) if self.selected_features is not None else None
+            'selected_features_count': len(self.selected_features) if self.selected_features is not None else None,
+            'label_classes': self.label_encoder.classes_.tolist() if hasattr(self.label_encoder, 'classes_') else None
         }
         
         with open(self.metadata_file, 'w') as f:
