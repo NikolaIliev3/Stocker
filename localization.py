@@ -104,6 +104,16 @@ class Localization:
             'performing_fundamental_analysis': 'Performing fundamental analysis...',
             'verifying_predictions': 'Verifying predictions...',
             'loading': 'Loading',
+            'close': 'Close',
+            'exit': 'Exit',
+            'hold_no_trade': 'HOLD Recommendation - No Trade Opportunity',
+            'hold_explanation': 'HOLD means the stock is not recommended for trading at this time. Showing hypothetical scenario below.',
+            'hypothetical_scenario': 'Hypothetical Scenario (if you were to trade):',
+            'no_predictions_verified': 'No new predictions were verified.',
+            'info': 'Info',
+            'confirm_delete': 'Confirm Delete',
+            'delete_prediction': 'Delete prediction',
+            'prediction_deleted': 'Prediction deleted',
         },
         'bg': {
             'app_title': 'СТОКЕР',
@@ -191,6 +201,16 @@ class Localization:
             'performing_fundamental_analysis': 'Извършване на фундаментален анализ...',
             'verifying_predictions': 'Потвърждаване на прогнози...',
             'loading': 'Зареждане',
+            'close': 'Затвори',
+            'exit': 'Изход',
+            'hold_no_trade': 'HOLD Препоръка - Няма Търговска Възможност',
+            'hold_explanation': 'HOLD означава, че акцията не се препоръчва за търговия в момента. Показва се хипотетичен сценарий по-долу.',
+            'hypothetical_scenario': 'Хипотетичен Сценарий (ако бихте търгували):',
+            'no_predictions_verified': 'Няма нови потвърдени прогнози.',
+            'info': 'Информация',
+            'confirm_delete': 'Потвърди Изтриване',
+            'delete_prediction': 'Изтрий прогноза',
+            'prediction_deleted': 'Прогнозата е изтрита',
         }
     }
     
@@ -206,10 +226,47 @@ class Localization:
             translation = translation.format(**kwargs)
         return translation
     
+    def convert_to_usd(self, amount: float, from_currency: str = None) -> float:
+        """Convert amount from specified currency to USD (base currency)"""
+        if from_currency is None:
+            from_currency = self.currency
+        
+        # If already USD, no conversion needed
+        if from_currency == 'USD':
+            return amount
+        
+        # Get the rate for the source currency
+        # Rates are relative to USD, so to convert FROM currency TO USD, we divide
+        rate = self.CURRENCY_RATES.get(from_currency, 1.0)
+        if rate == 0:
+            return amount
+        
+        # Convert to USD: divide by the rate (e.g., 100 EUR / 0.92 = 108.70 USD)
+        return amount / rate
+    
+    def convert_from_usd(self, amount_usd: float, to_currency: str = None) -> float:
+        """Convert amount from USD (base currency) to specified currency"""
+        if to_currency is None:
+            to_currency = self.currency
+        
+        # If already USD, no conversion needed
+        if to_currency == 'USD':
+            return amount_usd
+        
+        # Get the rate for the target currency
+        # Rates are relative to USD, so to convert FROM USD TO currency, we multiply
+        rate = self.CURRENCY_RATES.get(to_currency, 1.0)
+        return amount_usd * rate
+    
     def format_currency(self, amount: float) -> str:
-        """Format amount in current currency"""
-        # Convert to selected currency
-        converted = amount * self.CURRENCY_RATES.get(self.currency, 1.0)
+        """Format amount in current currency (assumes amount is in USD)"""
+        # Convert from USD to selected currency
+        converted = self.convert_from_usd(amount)
+        
+        # Log conversion for debugging
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"🔍 CURRENCY DEBUG: Converting {amount} USD to {self.currency} = {converted}")
         
         # Format based on currency
         if self.currency == 'EUR':

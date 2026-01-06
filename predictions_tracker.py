@@ -48,8 +48,25 @@ class PredictionsTracker:
     
     def add_prediction(self, symbol: str, strategy: str, action: str, 
                       entry_price: float, target_price: float, 
-                      stop_loss: float, confidence: float, reasoning: str) -> Dict:
-        """Add a new prediction"""
+                      stop_loss: float, confidence: float, reasoning: str,
+                      estimated_days: int = None) -> Dict:
+        """Add a new prediction with estimated target date
+        
+        Args:
+            estimated_days: Estimated number of days until target should be reached.
+                          If None, calculated based on strategy.
+        """
+        # Calculate estimated target date based on strategy if not provided
+        if estimated_days is None:
+            if strategy == "trading":
+                estimated_days = 10  # Short-term: ~10 days
+            elif strategy == "mixed":
+                estimated_days = 21  # Medium-term: ~3 weeks
+            else:  # investing
+                estimated_days = 547  # Long-term: ~1.5 years (547 days)
+        
+        estimated_target_date = (datetime.now() + timedelta(days=estimated_days)).isoformat()
+        
         prediction = {
             "id": len(self.predictions) + 1,
             "timestamp": datetime.now().isoformat(),
@@ -66,7 +83,9 @@ class PredictionsTracker:
             "was_correct": None,
             "actual_price_at_target": None,
             "verification_date": None,
-            "days_to_target": None
+            "days_to_target": None,
+            "estimated_target_date": estimated_target_date,
+            "estimated_days": estimated_days
         }
         
         self.predictions.append(prediction)
@@ -123,32 +142,71 @@ class PredictionsTracker:
         self.save()
         return prediction
     
-    def verify_all_active_predictions(self, data_fetcher) -> Dict:
-        """Verify all active predictions by fetching current prices"""
+    def verify_all_active_predictions(self, data_fetcher, check_all: bool = False) -> Dict:
+        """Verify all active predictions by fetching current prices
+        
+        Args:
+            data_fetcher: Data fetcher instance
+            check_all: If True, verify all active predictions. If False, only verify
+                      predictions that have reached their estimated target date.
+        """
         verified_count = 0
         correct_count = 0
+        newly_verified = []  # Track newly verified predictions
+        now = datetime.now()
         
         for prediction in self.predictions:
             if prediction['status'] == 'active':
-                try:
-                    # Fetch current price
-                    stock_data = data_fetcher.fetch_stock_data(prediction['symbol'])
-                    current_price = stock_data.get('price', 0)
-                    
-                    if current_price > 0:
-                        result = self.verify_prediction(prediction['id'], current_price)
-                        if result:
-                            verified_count += 1
-                            if result['was_correct']:
-                                correct_count += 1
-                except Exception as e:
-                    logger.warning(f"Could not verify prediction {prediction['id']} for {prediction['symbol']}: {e}")
-                    continue
+                # Check if target date has been reached (or check_all is True)
+                should_verify = check_all
+                
+                if not should_verify:
+                    # Check if estimated target date has been reached
+                    estimated_date_str = prediction.get('estimated_target_date')
+                    if estimated_date_str:
+                        try:
+                            estimated_date = datetime.fromisoformat(estimated_date_str)
+                            should_verify = now >= estimated_date
+                        except:
+                            # If date parsing fails, verify anyway (backward compatibility)
+                            should_verify = True
+                    else:
+                        # No estimated date - verify if prediction is old enough
+                        # Default to verifying if older than strategy-appropriate timeframe
+                        pred_date = datetime.fromisoformat(prediction['timestamp'])
+                        days_old = (now - pred_date).days
+                        strategy = prediction.get('strategy', 'trading')
+                        
+                        if strategy == "trading" and days_old >= 10:
+                            should_verify = True
+                        elif strategy == "mixed" and days_old >= 21:
+                            should_verify = True
+                        elif strategy == "investing" and days_old >= 365:
+                            should_verify = True
+                
+                if should_verify:
+                    try:
+                        # Fetch current price
+                        stock_data = data_fetcher.fetch_stock_data(prediction['symbol'])
+                        current_price = stock_data.get('price', 0)
+                        
+                        if current_price > 0:
+                            result = self.verify_prediction(prediction['id'], current_price)
+                            if result:
+                                verified_count += 1
+                                if result['was_correct']:
+                                    correct_count += 1
+                                # Add to newly verified list
+                                newly_verified.append(result)
+                    except Exception as e:
+                        logger.warning(f"Could not verify prediction {prediction['id']} for {prediction['symbol']}: {e}")
+                        continue
         
         return {
             "verified": verified_count,
             "correct": correct_count,
-            "accuracy": (correct_count / verified_count * 100) if verified_count > 0 else 0
+            "accuracy": (correct_count / verified_count * 100) if verified_count > 0 else 0,
+            "newly_verified": newly_verified  # Include list of newly verified predictions
         }
     
     def get_prediction_by_id(self, prediction_id: int) -> Optional[Dict]:
@@ -158,6 +216,54 @@ class PredictionsTracker:
                 return pred
         return None
     
+    def update_prediction_action(self, prediction_id: int, new_action: str, 
+                                new_entry_price: float, new_target_price: float,
+                                new_stop_loss: float, new_confidence: float,
+                                new_reasoning: str) -> bool:
+        """Update a prediction's action and prices
+        
+        Args:
+            prediction_id: ID of the prediction to update
+            new_action: New action (BUY/SELL/HOLD)
+            new_entry_price: New entry price
+            new_target_price: New target price
+            new_stop_loss: New stop loss
+            new_confidence: New confidence level
+            new_reasoning: Updated reasoning
+            
+        Returns:
+            True if updated, False if not found
+        """
+        prediction = self.get_prediction_by_id(prediction_id)
+        if not prediction:
+            logger.warning(f"Prediction #{prediction_id} not found for update")
+            return False
+        
+        # Update prediction fields
+        prediction['action'] = new_action
+        prediction['entry_price'] = new_entry_price
+        prediction['target_price'] = new_target_price
+        prediction['stop_loss'] = new_stop_loss
+        prediction['confidence'] = new_confidence
+        prediction['reasoning'] = new_reasoning
+        prediction['timestamp'] = datetime.now().isoformat()
+        
+        # Recalculate estimated target date based on strategy
+        strategy = prediction.get('strategy', 'trading')
+        if strategy == "trading":
+            estimated_days = 10
+        elif strategy == "mixed":
+            estimated_days = 21
+        else:  # investing
+            estimated_days = 547
+        
+        prediction['estimated_days'] = estimated_days
+        prediction['estimated_target_date'] = (datetime.now() + timedelta(days=estimated_days)).isoformat()
+        
+        self.save()
+        logger.info(f"Updated prediction #{prediction_id}: action changed to {new_action}")
+        return True
+    
     def get_active_predictions(self) -> List[Dict]:
         """Get all active predictions"""
         return [p for p in self.predictions if p['status'] == 'active']
@@ -165,6 +271,27 @@ class PredictionsTracker:
     def get_verified_predictions(self) -> List[Dict]:
         """Get all verified predictions"""
         return [p for p in self.predictions if p['status'] == 'verified']
+    
+    def delete_prediction(self, prediction_id: int) -> bool:
+        """Delete a prediction by ID
+        
+        Args:
+            prediction_id: ID of the prediction to delete
+            
+        Returns:
+            True if deleted, False if not found
+        """
+        for i, pred in enumerate(self.predictions):
+            if pred['id'] == prediction_id:
+                del self.predictions[i]
+                # Reassign IDs to maintain sequential order
+                for j, p in enumerate(self.predictions):
+                    p['id'] = j + 1
+                self.save()
+                logger.info(f"Deleted prediction #{prediction_id}")
+                return True
+        logger.warning(f"Prediction #{prediction_id} not found for deletion")
+        return False
     
     def get_statistics(self) -> Dict:
         """Get prediction statistics"""

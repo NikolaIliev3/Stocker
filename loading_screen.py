@@ -60,11 +60,14 @@ class LoadingScreen:
         self.fade_alpha = 0.0
         self.fade_direction = 1
         
-        # Create overlay
+        # Create overlay (non-blocking, minimizable window)
         self.overlay = tk.Toplevel(self.parent)
-        self.overlay.overrideredirect(True)
-        self.overlay.attributes('-topmost', True)
-        self.overlay.grab_set()
+        self.overlay.title("Loading...")
+        self.overlay.attributes('-topmost', False)  # Don't force on top
+        # Don't use grab_set() - allows other windows to be used
+        # Don't use overrideredirect - allows normal window controls (minimize, close)
+        # Make it minimizable and allow normal window operations
+        self.overlay.protocol("WM_DELETE_WINDOW", self._on_minimize)  # Handle minimize/close
         
         # Get parent dimensions
         self.parent.update_idletasks()
@@ -73,8 +76,15 @@ class LoadingScreen:
         x = self.parent.winfo_x()
         y = self.parent.winfo_y()
         
-        # Make it full screen
-        self.overlay.geometry(f"{width}x{height}+{x}+{y}")
+        # Make it a smaller, minimizable window instead of full screen
+        # Position it in the center, but allow it to be moved/minimized
+        window_width = 500
+        window_height = 400
+        center_x = x + (width - window_width) // 2
+        center_y = y + (height - window_height) // 2
+        self.overlay.geometry(f"{window_width}x{window_height}+{center_x}+{center_y}")
+        self.overlay.minsize(400, 300)  # Allow resizing but set minimum size
+        self.overlay.resizable(True, True)  # Allow resizing
         
         # Create semi-transparent backdrop
         bg_color = self.theme['bg']
@@ -136,6 +146,11 @@ class LoadingScreen:
         if self.cancel_callback:
             self.cancel_callback()
         self.hide()
+    
+    def _on_minimize(self):
+        """Handle window minimize/close - just minimize instead of closing"""
+        if self.overlay:
+            self.overlay.iconify()  # Minimize instead of closing
     
     def _update_time_estimate(self):
         """Update time estimation display"""

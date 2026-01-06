@@ -19,6 +19,18 @@ CORS(app)  # Enable CORS for desktop app
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Suppress yfinance's misleading error messages (e.g., "possibly delisted" false positives)
+yfinance_logger = logging.getLogger('yfinance')
+yfinance_logger.setLevel(logging.WARNING)  # Only show warnings and errors, suppress INFO/DEBUG
+# Further suppress the "possibly delisted" messages by filtering
+class YFinanceFilter(logging.Filter):
+    def filter(self, record):
+        # Suppress "possibly delisted" messages - they're often false positives
+        if 'possibly delisted' in str(record.getMessage()).lower():
+            return False
+        return True
+yfinance_logger.addFilter(YFinanceFilter())
+
 # Fix SSL certificate issues at startup
 import ssl
 import certifi
@@ -329,6 +341,10 @@ def _fetch_alternative_data(symbol: str):
         if not timestamps or not quote:
             return None
         
+        # Log meta data for debugging price extraction
+        logger.debug(f"Meta data for {symbol}: regularMarketPrice={meta.get('regularMarketPrice')}, "
+                    f"previousClose={meta.get('previousClose')}, chartPreviousClose={meta.get('chartPreviousClose')}")
+        
         # Extract price data
         closes = quote.get('close', [])
         opens = quote.get('open', [])
@@ -339,30 +355,113 @@ def _fetch_alternative_data(symbol: str):
         if not closes:
             return None
         
+        # Try to get real-time current price from meta first (most accurate)
+        current_price = None
+        current_idx = None
+        
+        # Meta contains various price fields - prioritize real-time price
+        if meta:
+            # Priority 1: regularMarketPrice (real-time during market hours, most accurate)
+            if 'regularMarketPrice' in meta and meta['regularMarketPrice'] is not None:
+                current_price = float(meta['regularMarketPrice'])
+                logger.info(f"✅ Using REAL-TIME price from meta (regularMarketPrice): {current_price} for {symbol}")
+            # Priority 2: Check if there's a current price in the last timestamp
+            elif len(timestamps) > 0 and len(closes) > 0:
+                # Get the last timestamp and check if it's today
+                last_ts = timestamps[-1]
+                last_date = datetime.fromtimestamp(last_ts).date()
+                today = datetime.now().date()
+                
+                # If last data point is from today, use it (might be intraday)
+                if last_date == today and closes[-1] is not None and closes[-1] > 0:
+                    current_price = float(closes[-1])
+                    current_idx = len(closes) - 1
+                    logger.info(f"✅ Using today's latest close price: {current_price} for {symbol}")
+            # Priority 3: Use most recent non-null close from historical data
+            if current_price is None or current_price <= 0:
+                for i in range(len(closes) - 1, -1, -1):
+                    if closes[i] is not None and closes[i] > 0:
+                        current_price = float(closes[i])
+                        current_idx = i
+                        logger.info(f"Using most recent historical close price: {current_price} for {symbol} (index {i})")
+                        break
+        
+        if current_price is None or current_price <= 0:
+            logger.warning(f"No valid current price found for {symbol} in alternative data")
+            return None
+        
+        # Get previous price (for change calculation)
+        previous_price = current_price
+        if current_idx is not None and current_idx > 0:
+            # We have an index, find the previous valid price
+            for i in range(current_idx - 1, -1, -1):
+                if i < len(closes) and closes[i] is not None and closes[i] > 0:
+                    previous_price = float(closes[i])
+                    break
+        else:
+            # current_idx is None (we used meta price), find the most recent close from history
+            for i in range(len(closes) - 1, -1, -1):
+                if closes[i] is not None and closes[i] > 0:
+                    # Use this as previous price (it's the last close we have)
+                    previous_price = float(closes[i])
+                    break
+        
         # Build history list
         history_list = []
         for i, ts in enumerate(timestamps[-100:]):  # Last 100 days
             idx = len(timestamps) - 100 + i if len(timestamps) > 100 else i
-            if idx < len(closes) and closes[idx] is not None:
+            if idx < len(closes) and closes[idx] is not None and closes[idx] > 0:
                 history_list.append({
                     "date": datetime.fromtimestamp(ts).strftime('%Y-%m-%d'),
-                    "open": float(opens[idx]) if idx < len(opens) and opens[idx] else 0.0,
-                    "high": float(highs[idx]) if idx < len(highs) and highs[idx] else 0.0,
-                    "low": float(lows[idx]) if idx < len(lows) and lows[idx] else 0.0,
+                    "open": float(opens[idx]) if idx < len(opens) and opens[idx] is not None else 0.0,
+                    "high": float(highs[idx]) if idx < len(highs) and highs[idx] is not None else 0.0,
+                    "low": float(lows[idx]) if idx < len(lows) and lows[idx] is not None else 0.0,
                     "close": float(closes[idx]),
-                    "volume": int(volumes[idx]) if idx < len(volumes) and volumes[idx] else 0
+                    "volume": int(volumes[idx]) if idx < len(volumes) and volumes[idx] is not None else 0
                 })
         
-        current_price = float(closes[-1]) if closes[-1] else 0.0
-        previous_price = float(closes[-2]) if len(closes) > 1 and closes[-2] else current_price
+        # Get the most recent non-null values for other fields (use same index as current_price)
+        current_volume = 0
+        current_high = current_price
+        current_low = current_price
+        current_open = current_price
+        
+        if current_idx is not None and current_idx >= 0:
+            # We have a valid index, use it
+            if current_idx < len(volumes) and volumes[current_idx] is not None:
+                current_volume = int(volumes[current_idx])
+            if current_idx < len(highs) and highs[current_idx] is not None:
+                current_high = float(highs[current_idx])
+            if current_idx < len(lows) and lows[current_idx] is not None:
+                current_low = float(lows[current_idx])
+            if current_idx < len(opens) and opens[current_idx] is not None:
+                current_open = float(opens[current_idx])
+        else:
+            # current_idx is None (we used meta price), use the most recent values from history
+            for i in range(len(volumes) - 1, -1, -1):
+                if i < len(volumes) and volumes[i] is not None:
+                    current_volume = int(volumes[i])
+                    break
+            for i in range(len(highs) - 1, -1, -1):
+                if i < len(highs) and highs[i] is not None:
+                    current_high = float(highs[i])
+                    break
+            for i in range(len(lows) - 1, -1, -1):
+                if i < len(lows) and lows[i] is not None:
+                    current_low = float(lows[i])
+                    break
+            for i in range(len(opens) - 1, -1, -1):
+                if i < len(opens) and opens[i] is not None:
+                    current_open = float(opens[i])
+                    break
         
         return {
             "symbol": symbol.upper(),
             "price": current_price,
-            "volume": int(volumes[-1]) if volumes and volumes[-1] else 0,
-            "high": float(highs[-1]) if highs and highs[-1] else current_price,
-            "low": float(lows[-1]) if lows and lows[-1] else current_price,
-            "open": float(opens[-1]) if opens and opens[-1] else current_price,
+            "volume": current_volume,
+            "high": current_high,
+            "low": current_low,
+            "open": current_open,
             "previous_close": previous_price,
             "change": current_price - previous_price,
             "change_percent": ((current_price - previous_price) / previous_price * 100) if previous_price > 0 else 0.0,
@@ -377,7 +476,9 @@ def _fetch_alternative_data(symbol: str):
             }
         }
     except Exception as e:
-        logger.error(f"Alternative data fetch failed: {e}")
+        logger.error(f"Alternative data fetch failed: {e}", exc_info=True)
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return None
 
 
@@ -395,18 +496,36 @@ def get_stock_data(symbol: str):
     This endpoint proxies requests to stock data providers
     """
     try:
-        # Check cache first
+        # Check if client wants to bypass cache (force refresh)
+        force_refresh = request.args.get('_refresh') is not None
+        
+        # Check cache first (unless force refresh is requested)
         cache_key = f"stock_{symbol.upper()}"
+        if not force_refresh:
         cached_data = get_cached(cache_key)
         if cached_data:
-            logger.info(f"Cache hit for {symbol}")
+                logger.debug(f"Cache hit for {symbol}")  # Changed to debug to reduce log spam
             return jsonify(cached_data)
+        else:
+            logger.debug(f"Force refresh requested for {symbol}, bypassing cache")
         
-        # Fetch from data provider (using yfinance as example)
-        # Note: yfinance uses curl which has SSL certificate issues on Windows
-        # We'll try multiple approaches to work around this
+        # Fetch from data provider
+        # Note: yfinance often has issues (SSL, "delisted" false positives), so we try alternative method first
+        # Try alternative method first for better reliability
+        alt_data = _fetch_alternative_data(symbol.upper())
+        if alt_data:
+            # Alternative method succeeded - use it (more reliable than yfinance)
+            if not force_refresh:
+                set_cache(cache_key, alt_data)
+            logger.debug(f"Using alternative data fetch for {symbol} (more reliable)")
+            return jsonify(alt_data)
+        
+        # Fallback to yfinance if alternative method fails
         try:
             import yfinance as yf
+            # Suppress yfinance's misleading "delisted" warnings
+            import warnings
+            warnings.filterwarnings('ignore', message='.*possibly delisted.*', category=UserWarning)
             
             # Approach 1: Try using yfinance.download() directly with session
             # This sometimes works better than Ticker for SSL issues
@@ -482,11 +601,13 @@ def get_stock_data(symbol: str):
             
             # If we got empty data, try alternative method (yfinance often fails silently with curl issues)
             if hist is None or hist.empty:
-                logger.info("yfinance returned empty data, trying alternative method (likely SSL/curl issue)...")
+                logger.debug(f"yfinance returned empty data for {symbol}, trying alternative method...")
                 alt_data = _fetch_alternative_data(symbol.upper())
                 if alt_data:
+                    # Don't cache if force_refresh was requested
+                    if not force_refresh:
                     set_cache(cache_key, alt_data)
-                    logger.info("Alternative data fetch succeeded!")
+                    logger.debug(f"Alternative data fetch succeeded for {symbol}")
                     return jsonify(alt_data)
                 else:
                     # If alternative also fails, return error
@@ -509,19 +630,20 @@ def get_stock_data(symbol: str):
             
             # If yfinance fails due to SSL/curl, try alternative approach
             if any(keyword in error_str for keyword in ["curl", "certificate", "ssl", "77", "noneType", "delisted"]):
-                logger.info("Attempting alternative data fetch method (bypassing curl)...")
+                logger.debug(f"Attempting alternative data fetch method for {symbol} (bypassing curl)...")
                 try:
                     # Try using requests directly to Yahoo Finance (simpler, bypasses curl)
                     alt_data = _fetch_alternative_data(symbol.upper())
                     if alt_data:
-                        # Cache the result
+                        # Don't cache if force_refresh was requested
+                        if not force_refresh:
                         set_cache(cache_key, alt_data)
-                        logger.info("Alternative data fetch succeeded!")
+                        logger.debug(f"Alternative data fetch succeeded for {symbol}")
                         return jsonify(alt_data)
                     else:
-                        logger.warning("Alternative data fetch returned no data")
+                        logger.warning(f"Alternative data fetch returned no data for {symbol}")
                 except Exception as alt_err:
-                    logger.error(f"Alternative fetch also failed: {alt_err}")
+                    logger.error(f"Alternative fetch also failed for {symbol}: {alt_err}")
                     import traceback
                     logger.error(traceback.format_exc())
             
@@ -586,8 +708,11 @@ def get_stock_data(symbol: str):
             logger.error(traceback.format_exc())
             raise
         
-        # Cache the result
+        # Cache the result (unless force refresh was requested)
+        if not force_refresh:
         set_cache(cache_key, data)
+        else:
+            logger.debug(f"Skipping cache for {symbol} (force refresh requested)")
         
         return jsonify(data)
     
@@ -609,8 +734,19 @@ def get_stock_history(symbol: str):
         if cached_data:
             return jsonify(cached_data)
         
+        # Try alternative method first (more reliable than yfinance)
+        alt_data = _fetch_alternative_history(symbol.upper(), period, interval)
+        if alt_data:
+            set_cache(cache_key, alt_data)
+            logger.debug(f"Using alternative history fetch for {symbol}")
+            return jsonify(alt_data)
+        
+        # Fallback to yfinance if alternative method fails
         try:
             import yfinance as yf
+            import warnings
+            # Suppress yfinance's misleading "delisted" warnings
+            warnings.filterwarnings('ignore', message='.*possibly delisted.*', category=UserWarning)
             
             # SSL verification is already disabled at startup
             ticker = yf.Ticker(symbol.upper())
@@ -621,9 +757,9 @@ def get_stock_history(symbol: str):
             
             hist = ticker.history(period=period, interval=interval, timeout=30)
             
-            # If yfinance fails, try alternative method
+            # If yfinance fails, try alternative method again
             if hist is None or hist.empty:
-                logger.info("yfinance returned empty history, trying alternative method...")
+                logger.debug(f"yfinance returned empty history for {symbol}, trying alternative method...")
                 alt_data = _fetch_alternative_history(symbol.upper(), period, interval)
                 if alt_data:
                     set_cache(cache_key, alt_data)

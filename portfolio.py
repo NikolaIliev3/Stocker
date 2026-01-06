@@ -92,9 +92,20 @@ class Portfolio:
         if action == "BUY":
             potential_win = (target_price - entry_price) * shares
             potential_loss = (entry_price - stop_loss) * shares
-        else:  # SELL (short)
+        elif action == "SELL":  # SELL (short)
             potential_win = (entry_price - target_price) * shares
             potential_loss = (stop_loss - entry_price) * shares
+        else:  # HOLD or other - treat as BUY scenario if target > entry, else SELL
+            if target_price > entry_price:
+                # Bullish scenario - calculate as BUY
+                potential_win = (target_price - entry_price) * shares
+                potential_loss = (entry_price - stop_loss) * shares
+                action = "BUY"  # Update action for display
+            else:
+                # Bearish scenario - calculate as SELL
+                potential_win = (entry_price - target_price) * shares
+                potential_loss = (stop_loss - entry_price) * shares
+                action = "SELL"  # Update action for display
         
         return {
             "symbol": symbol,

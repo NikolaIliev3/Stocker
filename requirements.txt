@@ -11,4 +11,6 @@ certifi>=2023.7.22
 pyinstaller>=5.13.0
 Pillow>=10.0.0
 pywin32>=306
+scikit-learn>=1.3.0
+joblib>=1.3.0
 

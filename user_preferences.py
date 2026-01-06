@@ -42,7 +42,21 @@ class UserPreferences:
             'language': 'en',
             'currency': 'USD',
             'strategy': 'trading',
-            'search_history': []  # List of previously searched symbols
+            'search_history': [],  # List of previously searched symbols
+            'training_symbols': {  # Last used symbols for training per strategy
+                'trading': 'AAPL,MSFT,GOOGL,AMZN,TSLA',
+                'mixed': 'AAPL,MSFT,GOOGL,AMZN,TSLA,META,NVDA,NFLX',
+                'investing': 'AAPL,MSFT,GOOGL,AMZN,TSLA'
+            },
+            'test_symbols': {  # Last used symbols for testing per strategy
+                'trading': 'AAPL,MSFT,GOOGL,AMZN,TSLA',
+                'mixed': 'AAPL,MSFT,GOOGL,AMZN,TSLA',
+                'investing': 'AAPL,MSFT,GOOGL,AMZN,TSLA'
+            },
+            'auto_learner_scan_interval_hours': 6,  # Default scan interval
+            'auto_learner_predictions_per_scan': 5,  # Default predictions per scan
+            'auto_learner_min_confidence': 60,  # Default minimum confidence
+            'backtest_strategies': ['trading', 'mixed', 'investing']  # Default: all strategies
         }
     
     def save(self):
@@ -131,6 +145,38 @@ class UserPreferences:
     def set_strategy(self, strategy: str):
         """Save strategy"""
         self.set('strategy', strategy)
+    
+    def get_training_symbols(self, strategy: str) -> str:
+        """Get last used training symbols for a strategy"""
+        training_symbols = self.preferences.get('training_symbols', {})
+        return training_symbols.get(strategy, 'AAPL,MSFT,GOOGL,AMZN,TSLA')
+    
+    def set_training_symbols(self, strategy: str, symbols: str):
+        """Save training symbols for a strategy"""
+        if 'training_symbols' not in self.preferences:
+            self.preferences['training_symbols'] = {}
+        self.preferences['training_symbols'][strategy] = symbols
+        self.save()
+    
+    def get_test_symbols(self, strategy: str) -> str:
+        """Get last used test symbols for a strategy"""
+        test_symbols = self.preferences.get('test_symbols', {})
+        return test_symbols.get(strategy, 'AAPL,MSFT,GOOGL,AMZN,TSLA')
+    
+    def set_test_symbols(self, strategy: str, symbols: str):
+        """Save test symbols for a strategy"""
+        if 'test_symbols' not in self.preferences:
+            self.preferences['test_symbols'] = {}
+        self.preferences['test_symbols'][strategy] = symbols
+        self.save()
+    
+    def get_backtest_strategies(self) -> list:
+        """Get selected strategies for backtesting"""
+        return self.preferences.get('backtest_strategies', ['trading', 'mixed', 'investing'])
+    
+    def set_backtest_strategies(self, strategies: list):
+        """Save selected strategies for backtesting"""
+        self.set('backtest_strategies', strategies)
 
 
 

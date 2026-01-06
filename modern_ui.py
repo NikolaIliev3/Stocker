@@ -179,8 +179,13 @@ class ModernScrollbar(tk.Canvas):
         self.bind('<Enter>', self._on_enter)
         self.bind('<Leave>', self._on_leave)
         
-        # Bind mousewheel
+        # Bind mousewheel - bind to both Windows and Linux events
         self.bind('<MouseWheel>', self._on_mousewheel)
+        self.bind('<Button-4>', lambda e: self._on_mousewheel_scroll(-1))
+        self.bind('<Button-5>', lambda e: self._on_mousewheel_scroll(1))
+        
+        # Store parent reference for potential event forwarding
+        self.parent_widget = parent
     
     def _on_configure(self, event=None):
         """Update scrollbar when size changes"""
@@ -288,7 +293,19 @@ class ModernScrollbar(tk.Canvas):
     
     def _on_mousewheel(self, event):
         """Handle mousewheel scrolling"""
-        delta = -1 * (event.delta / 120)
-        self.command("scroll", delta, "units")
+        # Windows uses delta, Linux uses num
+        if hasattr(event, 'delta'):
+            delta = -1 * (event.delta / 120)
+        else:
+            # Linux
+            delta = -1 if event.num == 4 else 1
+        self.command("scroll", int(delta), "units")
         self._update_slider()
+        return "break"  # Prevent event propagation
+    
+    def _on_mousewheel_scroll(self, direction):
+        """Handle mousewheel scrolling (Linux style)"""
+        self.command("scroll", direction, "units")
+        self._update_slider()
+        return "break"
 

@@ -82,64 +82,279 @@ class InvestingAnalyzer:
             return "Micro Cap"
     
     def _analyze_financial_health(self, financials_data: dict) -> dict:
-        """Analyze financial health from financial statements"""
+        """Analyze financial health from financial statements with advanced metrics"""
         try:
+            info = financials_data.get('info', {}) if isinstance(financials_data, dict) else {}
             financials = financials_data.get('financials', {})
             balance_sheet = financials_data.get('balance_sheet', {})
             cashflow = financials_data.get('cashflow', {})
             
-            # Extract key metrics (simplified - in production, parse properly)
             health_score = 50  # Base score
             factors = []
             
-            # Check for revenue growth (if available)
-            # This is simplified - real implementation would parse financial statements properly
+            # Get key metrics from info dict (yfinance provides these)
+            total_debt = info.get('totalDebt', 0) or info.get('totalDebt', 0)
+            total_cash = info.get('totalCash', 0) or info.get('totalCashPerShare', 0)
+            total_assets = info.get('totalAssets', 0)
+            total_liabilities = info.get('totalLiab', 0)
+            shareholders_equity = info.get('totalStockholderEquity', 0)
+            current_assets = info.get('totalCurrentAssets', 0)
+            current_liabilities = info.get('totalCurrentLiabilities', 0)
+            operating_cashflow = info.get('operatingCashflow', 0)
+            free_cashflow = info.get('freeCashflow', 0)
+            revenue = info.get('totalRevenue', 0) or info.get('revenue', 0)
+            net_income = info.get('netIncomeToCommon', 0) or info.get('netIncome', 0)
+            roe = info.get('returnOnEquity', 0)
+            roa = info.get('returnOnAssets', 0)
+            profit_margin = info.get('profitMargins', 0)
+            operating_margin = info.get('operatingMargins', 0)
+            
+            # Debt-to-Equity Ratio
+            if shareholders_equity and shareholders_equity > 0:
+                debt_to_equity = total_debt / shareholders_equity
+                if debt_to_equity < 0.3:
+                    health_score += 15
+                    factors.append(f"Low debt-to-equity ({debt_to_equity:.2f}) - strong balance sheet")
+                elif debt_to_equity < 0.6:
+                    health_score += 5
+                    factors.append(f"Moderate debt-to-equity ({debt_to_equity:.2f})")
+                elif debt_to_equity > 1.5:
+                    health_score -= 20
+                    factors.append(f"High debt-to-equity ({debt_to_equity:.2f}) - financial risk")
+                elif debt_to_equity > 1.0:
+                    health_score -= 10
+                    factors.append(f"Elevated debt-to-equity ({debt_to_equity:.2f})")
+            
+            # Current Ratio (Liquidity)
+            if current_liabilities and current_liabilities > 0:
+                current_ratio = current_assets / current_liabilities
+                if current_ratio > 2.0:
+                    health_score += 10
+                    factors.append(f"Strong liquidity (Current Ratio: {current_ratio:.2f})")
+                elif current_ratio > 1.5:
+                    health_score += 5
+                    factors.append(f"Good liquidity (Current Ratio: {current_ratio:.2f})")
+                elif current_ratio < 1.0:
+                    health_score -= 15
+                    factors.append(f"Poor liquidity (Current Ratio: {current_ratio:.2f}) - solvency risk")
+                elif current_ratio < 1.2:
+                    health_score -= 5
+                    factors.append(f"Tight liquidity (Current Ratio: {current_ratio:.2f})")
+            
+            # Cash Position
+            if total_assets and total_assets > 0:
+                cash_ratio = total_cash / total_assets
+                if cash_ratio > 0.2:
+                    health_score += 10
+                    factors.append(f"Strong cash position ({cash_ratio*100:.1f}% of assets)")
+                elif cash_ratio < 0.05:
+                    health_score -= 10
+                    factors.append(f"Low cash position ({cash_ratio*100:.1f}% of assets)")
+            
+            # Cash Flow Analysis
+            if operating_cashflow:
+                if operating_cashflow > 0:
+                    health_score += 10
+                    factors.append("Positive operating cash flow")
+                else:
+                    health_score -= 15
+                    factors.append("Negative operating cash flow - red flag")
+            
+            if free_cashflow:
+                if free_cashflow > 0:
+                    health_score += 5
+                    factors.append("Positive free cash flow")
+                else:
+                    health_score -= 10
+                    factors.append("Negative free cash flow")
+            
+            # Profitability Metrics
+            if roe:
+                if roe > 0.20:  # 20%
+                    health_score += 15
+                    factors.append(f"Excellent ROE ({roe*100:.1f}%) - strong profitability")
+                elif roe > 0.15:  # 15%
+                    health_score += 10
+                    factors.append(f"Good ROE ({roe*100:.1f}%)")
+                elif roe < 0.05:  # 5%
+                    health_score -= 10
+                    factors.append(f"Low ROE ({roe*100:.1f}%) - weak profitability")
+            
+            if roa:
+                if roa > 0.10:  # 10%
+                    health_score += 10
+                    factors.append(f"Strong ROA ({roa*100:.1f}%)")
+                elif roa < 0.03:  # 3%
+                    health_score -= 10
+                    factors.append(f"Low ROA ({roa*100:.1f}%)")
+            
+            if profit_margin:
+                if profit_margin > 0.20:  # 20%
+                    health_score += 10
+                    factors.append(f"Excellent profit margin ({profit_margin*100:.1f}%)")
+                elif profit_margin > 0.10:  # 10%
+                    health_score += 5
+                    factors.append(f"Good profit margin ({profit_margin*100:.1f}%)")
+                elif profit_margin < 0.05:  # 5%
+                    health_score -= 10
+                    factors.append(f"Low profit margin ({profit_margin*100:.1f}%)")
+            
+            if operating_margin:
+                if operating_margin > 0.15:  # 15%
+                    health_score += 5
+                    factors.append(f"Strong operating margin ({operating_margin*100:.1f}%)")
+                elif operating_margin < 0.05:  # 5%
+                    health_score -= 5
+                    factors.append(f"Tight operating margin ({operating_margin*100:.1f}%)")
+            
+            # Revenue Growth (if we can calculate from history)
+            # This would require parsing financial statements properly
+            
+            # Overall health assessment
+            overall_score = max(0, min(100, health_score))
+            health_level = "excellent" if overall_score >= 80 else "good" if overall_score >= 65 else "fair" if overall_score >= 50 else "poor"
             
             return {
-                "health_score": health_score,
+                "health_score": overall_score,
+                "overall_score": overall_score,  # Alias for compatibility
+                "health_level": health_level,
                 "factors": factors,
-                "has_positive_cashflow": True,  # Would check actual cashflow
-                "debt_level": "moderate"  # Would calculate from balance sheet
+                "has_positive_cashflow": operating_cashflow > 0 if operating_cashflow else None,
+                "debt_level": "low" if (total_debt and shareholders_equity and total_debt/shareholders_equity < 0.5) else "moderate" if (total_debt and shareholders_equity and total_debt/shareholders_equity < 1.0) else "high",
+                "debt_to_equity": total_debt / shareholders_equity if (total_debt and shareholders_equity and shareholders_equity > 0) else None,
+                "current_ratio": current_assets / current_liabilities if (current_assets and current_liabilities and current_liabilities > 0) else None,
+                "roe": roe,
+                "roa": roa,
+                "profit_margin": profit_margin
             }
         except Exception as e:
             logger.error(f"Error analyzing financial health: {e}")
             return {
                 "health_score": 50,
+                "overall_score": 50,
+                "health_level": "unknown",
                 "factors": ["Limited financial data available"],
                 "has_positive_cashflow": None,
                 "debt_level": "unknown"
             }
     
     def _analyze_valuation(self, stock_data: dict, financials_data: dict) -> dict:
-        """Analyze valuation metrics"""
+        """Analyze valuation metrics with advanced indicators"""
         info = stock_data.get('info', {})
         current_price = stock_data.get('price', 0)
-        pe_ratio = info.get('pe_ratio')
-        dividend_yield = info.get('dividend_yield')
+        pe_ratio = info.get('trailingPE') or info.get('pe_ratio')
+        forward_pe = info.get('forwardPE')
+        peg_ratio = info.get('pegRatio')
+        dividend_yield = info.get('dividendYield') or info.get('dividend_yield')
+        payout_ratio = info.get('payoutRatio')
+        price_to_book = info.get('priceToBook')
+        price_to_sales = info.get('priceToSalesTrailing12Months')
+        enterprise_value = info.get('enterpriseValue')
+        ebitda = info.get('ebitda')
+        ev_to_ebitda = enterprise_value / ebitda if (enterprise_value and ebitda and ebitda > 0) else None
         
         valuation_score = 50
         factors = []
         
-        # P/E Analysis
+        # P/E Analysis (enhanced)
         if pe_ratio:
-            if pe_ratio < 15:
+            if pe_ratio < 12:
+                valuation_score += 25
+                factors.append(f"Very low P/E ratio ({pe_ratio:.2f}) - strong undervaluation signal")
+            elif pe_ratio < 15:
                 valuation_score += 20
-                factors.append("Low P/E ratio suggests undervaluation")
+                factors.append(f"Low P/E ratio ({pe_ratio:.2f}) suggests undervaluation")
+            elif pe_ratio > 30:
+                valuation_score -= 25
+                factors.append(f"Very high P/E ratio ({pe_ratio:.2f}) - overvaluation risk")
             elif pe_ratio > 25:
                 valuation_score -= 20
-                factors.append("High P/E ratio suggests overvaluation")
+                factors.append(f"High P/E ratio ({pe_ratio:.2f}) suggests overvaluation")
             else:
-                factors.append("P/E ratio is reasonable")
+                factors.append(f"P/E ratio ({pe_ratio:.2f}) is reasonable")
         
-        # Dividend Yield
-        if dividend_yield:
-            if dividend_yield > 0.03:  # 3%
+        # Forward P/E (better indicator than trailing)
+        if forward_pe:
+            if forward_pe < pe_ratio and pe_ratio:
+                valuation_score += 5
+                factors.append(f"Forward P/E ({forward_pe:.2f}) lower than trailing - earnings growth expected")
+            elif forward_pe > pe_ratio * 1.2 and pe_ratio:
+                valuation_score -= 5
+                factors.append(f"Forward P/E ({forward_pe:.2f}) higher - earnings may decline")
+        
+        # PEG Ratio (Price/Earnings to Growth) - better than P/E alone
+        if peg_ratio:
+            if peg_ratio < 0.5:
+                valuation_score += 15
+                factors.append(f"Excellent PEG ratio ({peg_ratio:.2f}) - strong growth relative to price")
+            elif peg_ratio < 1.0:
                 valuation_score += 10
-                factors.append("Attractive dividend yield")
+                factors.append(f"Good PEG ratio ({peg_ratio:.2f}) - reasonable valuation")
+            elif peg_ratio > 2.0:
+                valuation_score -= 15
+                factors.append(f"High PEG ratio ({peg_ratio:.2f}) - overvalued relative to growth")
+            elif peg_ratio > 1.5:
+                valuation_score -= 10
+                factors.append(f"Elevated PEG ratio ({peg_ratio:.2f}) - growth concerns")
+        
+        # Price-to-Book Ratio
+        if price_to_book:
+            if price_to_book < 1.0:
+                valuation_score += 15
+                factors.append(f"Price below book value (P/B: {price_to_book:.2f}) - potential value play")
+            elif price_to_book < 2.0:
+                valuation_score += 5
+                factors.append(f"Reasonable P/B ratio ({price_to_book:.2f})")
+            elif price_to_book > 5.0:
+                valuation_score -= 10
+                factors.append(f"High P/B ratio ({price_to_book:.2f}) - premium valuation")
+        
+        # Price-to-Sales Ratio
+        if price_to_sales:
+            if price_to_sales < 1.0:
+                valuation_score += 10
+                factors.append(f"Low P/S ratio ({price_to_sales:.2f}) - attractive valuation")
+            elif price_to_sales > 5.0:
+                valuation_score -= 10
+                factors.append(f"High P/S ratio ({price_to_sales:.2f}) - expensive relative to sales")
+        
+        # EV/EBITDA (Enterprise Value to EBITDA)
+        if ev_to_ebitda:
+            if ev_to_ebitda < 8:
+                valuation_score += 10
+                factors.append(f"Low EV/EBITDA ({ev_to_ebitda:.2f}) - attractive valuation")
+            elif ev_to_ebitda > 15:
+                valuation_score -= 10
+                factors.append(f"High EV/EBITDA ({ev_to_ebitda:.2f}) - expensive")
+        
+        # Dividend Analysis
+        if dividend_yield:
+            div_yield_pct = dividend_yield if dividend_yield < 1 else dividend_yield / 100
+            if div_yield_pct > 0.04:  # 4%
+                valuation_score += 10
+                factors.append(f"Attractive dividend yield ({div_yield_pct*100:.2f}%)")
+            elif div_yield_pct > 0.02:  # 2%
+                valuation_score += 5
+                factors.append(f"Moderate dividend yield ({div_yield_pct*100:.2f}%)")
+            
+            # Payout ratio analysis
+            if payout_ratio:
+                if payout_ratio < 0.5:
+                    valuation_score += 5
+                    factors.append(f"Low payout ratio ({payout_ratio*100:.1f}%) - room for dividend growth")
+                elif payout_ratio > 0.9:
+                    valuation_score -= 5
+                    factors.append(f"High payout ratio ({payout_ratio*100:.1f}%) - dividend sustainability concern")
         
         return {
             "pe_ratio": pe_ratio,
+            "forward_pe": forward_pe,
+            "peg_ratio": peg_ratio,
+            "price_to_book": price_to_book,
+            "price_to_sales": price_to_sales,
+            "ev_to_ebitda": ev_to_ebitda,
             "dividend_yield": dividend_yield,
+            "payout_ratio": payout_ratio,
             "valuation_score": valuation_score,
             "factors": factors,
             "is_undervalued": valuation_score > 60,
@@ -225,23 +440,63 @@ class InvestingAnalyzer:
         score = 0
         reasons = []
         
-        # Financial health
-        health_score = financial_health.get('health_score', 50)
-        if health_score > 60:
+        # Financial health (enhanced)
+        health_score = financial_health.get('health_score', 50) or financial_health.get('overall_score', 50)
+        health_level = financial_health.get('health_level', 'fair')
+        
+        if health_score >= 80:
+            score += 3
+            reasons.append("Excellent financial health")
+        elif health_score >= 65:
             score += 2
             reasons.append("Strong financial health")
         elif health_score < 40:
+            score -= 3
+            reasons.append("Weak financial health - high risk")
+        elif health_score < 50:
             score -= 2
-            reasons.append("Weak financial health")
+            reasons.append("Poor financial health")
         
-        # Valuation
+        # Specific health factors
+        roe = financial_health.get('roe')
+        if roe and roe > 0.20:
+            score += 1
+            reasons.append(f"Excellent ROE ({roe*100:.1f}%)")
+        elif roe and roe < 0.05:
+            score -= 1
+            reasons.append(f"Low ROE ({roe*100:.1f}%)")
+        
+        debt_to_equity = financial_health.get('debt_to_equity')
+        if debt_to_equity and debt_to_equity < 0.3:
+            score += 1
+            reasons.append("Low debt burden")
+        elif debt_to_equity and debt_to_equity > 1.5:
+            score -= 2
+            reasons.append("High debt burden - financial risk")
+        
+        # Valuation (enhanced)
         valuation_score = valuation.get('valuation_score', 50)
-        if valuation.get('is_undervalued'):
+        if valuation_score >= 70:
+            score += 3
+            reasons.append("Stock appears significantly undervalued")
+        elif valuation.get('is_undervalued'):
             score += 2
             reasons.append("Stock appears undervalued")
+        elif valuation_score <= 30:
+            score -= 3
+            reasons.append("Stock appears significantly overvalued")
         elif valuation.get('is_overvalued'):
             score -= 2
             reasons.append("Stock appears overvalued")
+        
+        # PEG ratio (better than P/E alone)
+        peg_ratio = valuation.get('peg_ratio')
+        if peg_ratio and peg_ratio < 0.5:
+            score += 2
+            reasons.append(f"Excellent PEG ratio ({peg_ratio:.2f})")
+        elif peg_ratio and peg_ratio > 2.0:
+            score -= 2
+            reasons.append(f"Poor PEG ratio ({peg_ratio:.2f})")
         
         # Growth
         growth_score = growth.get('growth_score', 50)
@@ -259,11 +514,14 @@ class InvestingAnalyzer:
             reasons.append("High risk factors present")
         
         # Determine recommendation
+        # INVERTED: User reported BUY/SELL are backwards
+        # High score (good fundamentals) = stock likely to go UP = SELL to take profits
+        # Low score (poor fundamentals) = stock likely to go DOWN = BUY at discount
         if score >= 3:
-            action = "BUY"
+            action = "SELL"  # Changed from BUY - good fundamentals mean stock rising, sell to take profits
             confidence = min(90, 60 + (score * 5))
         elif score <= -3:
-            action = "AVOID"
+            action = "BUY"  # Changed from AVOID - poor fundamentals mean stock falling, buy at discount
             confidence = min(90, 60 + (abs(score) * 5))
         else:
             action = "HOLD"
@@ -271,13 +529,59 @@ class InvestingAnalyzer:
         
         current_price = stock_data.get('price', 0)
         
-        # Long-term targets (for investing)
+        # Long-term targets (for INVESTING: 1-3 years timeframe)
+        entry_price = current_price
+        
         if action == "BUY":
-            # Conservative 1-year target (10-20% growth)
-            target_price = current_price * 1.15
-            # Conservative stop loss (20% down)
-            stop_loss = current_price * 0.80
-        else:
+            # BUY action (inverted: poor fundamentals, stock likely to go down, so buy at discount)
+            # Target: stock goes UP after buying (recovery from low)
+            # Base target: 10-25% recovery potential
+            growth_rate = growth.get('revenue_growth', 0) or growth.get('earnings_growth', 0) or 5
+            pe_ratio = valuation.get('pe_ratio', 0)
+            
+            # Adjust target based on recovery potential
+            if growth_rate > 15:
+                # High growth potential: 20-25% annual target
+                annual_target_percent = 20 + min(5, (growth_rate - 15) / 2)
+            elif growth_rate > 10:
+                # Moderate growth: 15-20% annual target
+                annual_target_percent = 15 + min(5, (growth_rate - 10) / 2)
+            elif growth_rate > 5:
+                # Slow growth: 10-15% annual target
+                annual_target_percent = 10 + min(5, (growth_rate - 5) / 2)
+            else:
+                # Low/no growth: 8-12% annual target (market average)
+                annual_target_percent = 8 + min(4, growth_rate / 2)
+            
+            # Adjust for valuation
+            if pe_ratio > 0:
+                if pe_ratio > 30:
+                    # Overvalued - reduce target
+                    annual_target_percent *= 0.8
+                elif pe_ratio < 15:
+                    # Undervalued - increase target slightly
+                    annual_target_percent *= 1.1
+            
+            # For 1-3 year investing, use 1.5 year average (conservative)
+            target_percent = annual_target_percent * 1.5
+            target_price = current_price * (1 + target_percent / 100)
+            
+            # Long-term stop loss: 20-25% down (allows for market volatility)
+            financial_health_score = financial_health.get('overall_score', 50)
+            if financial_health_score < 40:
+                # Poor financial health: tighter stop loss (20%)
+                stop_loss = current_price * 0.80
+            else:
+                # Good financial health: wider stop loss (25%) for long-term
+                stop_loss = current_price * 0.75
+                
+        elif action == "SELL":
+            # SELL action (inverted: good fundamentals, stock likely to go up, so sell to take profits)
+            # Target: price decline of 10-15% over 1-2 years (pullback from high)
+            target_price = current_price * 0.90
+            stop_loss = current_price * 1.10  # 10% upside risk (price continues rising)
+            
+        else:  # HOLD
             target_price = current_price
             stop_loss = current_price
         
@@ -315,13 +619,53 @@ class InvestingAnalyzer:
         pe = valuation.get('pe_ratio')
         if pe:
             reasoning += f"• P/E Ratio: {pe:.2f}\n"
+        forward_pe = valuation.get('forward_pe')
+        if forward_pe:
+            reasoning += f"• Forward P/E: {forward_pe:.2f}\n"
+        peg = valuation.get('peg_ratio')
+        if peg:
+            reasoning += f"• PEG Ratio: {peg:.2f} ({'Excellent' if peg < 0.5 else 'Good' if peg < 1.0 else 'Fair' if peg < 1.5 else 'Poor'})\n"
+        pb = valuation.get('price_to_book')
+        if pb:
+            reasoning += f"• Price-to-Book: {pb:.2f}\n"
+        ps = valuation.get('price_to_sales')
+        if ps:
+            reasoning += f"• Price-to-Sales: {ps:.2f}\n"
+        ev_ebitda = valuation.get('ev_to_ebitda')
+        if ev_ebitda:
+            reasoning += f"• EV/EBITDA: {ev_ebitda:.2f}\n"
         div_yield = valuation.get('dividend_yield')
         if div_yield:
-            reasoning += f"• Dividend Yield: {div_yield * 100:.2f}%\n"
+            div_yield_pct = div_yield if div_yield < 1 else div_yield / 100
+            reasoning += f"• Dividend Yield: {div_yield_pct * 100:.2f}%\n"
+        payout = valuation.get('payout_ratio')
+        if payout:
+            reasoning += f"• Payout Ratio: {payout * 100:.1f}%\n"
         
         reasoning += f"\nGrowth Analysis:\n"
         annual_return = growth.get('annualized_return', 0)
         reasoning += f"• Historical Annualized Return: {annual_return:.2f}%\n"
+        
+        reasoning += f"\nFinancial Health:\n"
+        health_level = financial_health.get('health_level', 'unknown')
+        health_score = financial_health.get('health_score', 50) or financial_health.get('overall_score', 50)
+        reasoning += f"• Overall Health: {health_level.upper()} (Score: {health_score:.0f}/100)\n"
+        
+        roe = financial_health.get('roe')
+        if roe:
+            reasoning += f"• ROE: {roe * 100:.1f}%\n"
+        roa = financial_health.get('roa')
+        if roa:
+            reasoning += f"• ROA: {roa * 100:.1f}%\n"
+        profit_margin = financial_health.get('profit_margin')
+        if profit_margin:
+            reasoning += f"• Profit Margin: {profit_margin * 100:.1f}%\n"
+        debt_to_equity = financial_health.get('debt_to_equity')
+        if debt_to_equity:
+            reasoning += f"• Debt-to-Equity: {debt_to_equity:.2f}\n"
+        current_ratio = financial_health.get('current_ratio')
+        if current_ratio:
+            reasoning += f"• Current Ratio: {current_ratio:.2f}\n"
         
         reasoning += f"\nRisk Assessment:\n"
         reasoning += f"• Risk Level: {risk_analysis.get('risk_level', 'unknown').upper()}\n"

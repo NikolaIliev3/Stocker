@@ -8,12 +8,13 @@ import threading
 import logging
 from pathlib import Path
 from datetime import datetime
+from typing import List, Dict
 import time
-import matplotlib
+import matplotlib  # pyright: ignore[reportMissingImports]
 matplotlib.use('TkAgg')
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
-import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # pyright: ignore[reportMissingImports]
+from matplotlib.figure import Figure  # pyright: ignore[reportMissingImports]
+import matplotlib.pyplot as plt  # pyright: ignore[reportMissingImports]
 
 from config import APP_DATA_DIR, INITIAL_BALANCE
 from data_fetcher import StockDataFetcher
@@ -30,6 +31,15 @@ from user_preferences import UserPreferences
 from loading_screen import LoadingScreen
 from modern_settings import ModernDropdownButton
 from market_scanner import MarketScanner
+from hybrid_predictor import HybridStockPredictor
+from training_pipeline import MLTrainingPipeline, AutoTrainingManager
+from model_tester import ModelTester
+from auto_learner import AutoLearner
+from learning_tracker import LearningTracker
+from continuous_backtester import ContinuousBacktester
+from stock_monitor import StockMonitor
+from momentum_monitor import MomentumMonitor
+from trend_change_predictor import TrendChangePredictor
 
 # Configure logging
 logging.basicConfig(
@@ -74,7 +84,7 @@ class StockerApp:
         
         # Initialize components
         self.data_fetcher = StockDataFetcher()
-        self.trading_analyzer = TradingAnalyzer()
+        self.trading_analyzer = TradingAnalyzer(data_fetcher=self.data_fetcher)
         self.investing_analyzer = InvestingAnalyzer()
         self.mixed_analyzer = MixedAnalyzer()
         self.chart_generator = ChartGenerator()
@@ -82,7 +92,49 @@ class StockerApp:
         self.predictions_tracker = PredictionsTracker(APP_DATA_DIR)
         self.theme_manager = ThemeManager()
         self.preferences = UserPreferences(APP_DATA_DIR)
-        self.market_scanner = MarketScanner(self.data_fetcher)
+        self.market_scanner = MarketScanner(
+            self.data_fetcher, 
+            data_dir=APP_DATA_DIR,
+            trading_analyzer=self.trading_analyzer,
+            investing_analyzer=self.investing_analyzer,
+            mixed_analyzer=self.mixed_analyzer
+        )
+        
+        # Initialize hybrid AI system
+        self.data_dir = APP_DATA_DIR
+        self.hybrid_predictors = {
+            'trading': HybridStockPredictor(APP_DATA_DIR, 'trading', 
+                                            trading_analyzer=self.trading_analyzer),
+            'mixed': HybridStockPredictor(APP_DATA_DIR, 'mixed',
+                                         mixed_analyzer=self.mixed_analyzer),
+            'investing': HybridStockPredictor(APP_DATA_DIR, 'investing',
+                                            investing_analyzer=self.investing_analyzer)
+        }
+        self.training_manager = MLTrainingPipeline(self.data_fetcher, APP_DATA_DIR)
+        self.model_tester = ModelTester(APP_DATA_DIR, self.data_fetcher)
+        self.auto_training = AutoTrainingManager(self)
+        self.auto_learner = AutoLearner(self)  # Automatic self-learning system
+        
+        # Load auto-learner settings from preferences
+        saved_interval = self.preferences.get('auto_learner_scan_interval_hours')
+        saved_predictions = self.preferences.get('auto_learner_predictions_per_scan')
+        saved_confidence = self.preferences.get('auto_learner_min_confidence')
+        
+        if saved_interval is not None or saved_predictions is not None or saved_confidence is not None:
+            self.auto_learner.update_config(
+                scan_interval_hours=saved_interval,
+                predictions_per_scan=saved_predictions,
+                min_confidence=saved_confidence
+            )
+            logger.info(f"Loaded auto-learner settings: interval={saved_interval}h, predictions={saved_predictions}, confidence={saved_confidence}%")
+        
+        self.learning_tracker = LearningTracker(APP_DATA_DIR)  # Track all learning sources
+        self.backtester = ContinuousBacktester(self, APP_DATA_DIR)  # Continuous backtesting system
+        self.stock_monitor = StockMonitor(APP_DATA_DIR)  # Monitor stocks for BUY signals
+        self.momentum_monitor = MomentumMonitor(APP_DATA_DIR)  # Monitor momentum and trend changes
+        self.trend_change_predictor = TrendChangePredictor(data_dir=APP_DATA_DIR)  # Predict trend changes
+        from trend_change_tracker import TrendChangeTracker
+        self.trend_change_tracker = TrendChangeTracker(APP_DATA_DIR)  # Track trend change predictions for learning
         
         # Load preferences and store as instance variables
         self.saved_language = self.preferences.get_language()
@@ -108,15 +160,50 @@ class StockerApp:
         
         # Verify predictions on startup
         self._verify_predictions_on_startup()
+        
+        # Start periodic automatic verification (every hour)
+        self._start_periodic_verification()
+        
+        # Start periodic trend change verification
+        self._start_trend_change_verification()
+        
+        # Schedule automatic training checks
+        self._schedule_auto_training()
+        
+        # Check for auto-training on startup (after delay)
+        self.root.after(5000, self.auto_training.check_and_train)
+        
+        # Start automatic self-learning (scans stocks and makes predictions automatically)
+        self.root.after(10000, self.auto_learner.start)  # Start after 10 seconds
+        
+        # Start continuous backtesting (tests algorithm on random historical points)
+        self.root.after(20000, self.backtester.start)  # Start after 20 seconds
+        
+        # Start stock monitoring for BUY signals (check every 30 minutes)
+        self.root.after(30000, self._start_stock_monitoring)  # Start after 30 seconds
+        
+        # Start momentum monitoring for predictions (check every 15 minutes)
+        self.root.after(60000, self._start_momentum_monitoring)  # Start after 1 minute
     
     def _verify_predictions_on_startup(self):
-        """Verify all active predictions when app starts"""
+        """Verify all active predictions when app starts - only checks predictions that have reached their target date"""
         def verify_in_background():
             try:
-                logger.info("Verifying active predictions...")
-                result = self.predictions_tracker.verify_all_active_predictions(self.data_fetcher)
+                logger.info("Verifying predictions that have reached their target date...")
+                # Only verify predictions that have reached their estimated target date
+                result = self.predictions_tracker.verify_all_active_predictions(self.data_fetcher, check_all=False)
                 if result['verified'] > 0:
-                    self.root.after(0, self._show_verification_results, result)
+                    newly_verified = result.get('newly_verified', [])
+                    # Record learning events for verified predictions
+                    for pred in newly_verified:
+                        if pred.get('was_correct') is not None:
+                            self.learning_tracker.record_verified_prediction(
+                                pred.get('was_correct', False),
+                                pred.get('strategy', 'trading')
+                            )
+                    self.root.after(0, self._show_verification_results, result, newly_verified)
+                    # Trigger auto-training on verified predictions
+                    self.root.after(0, self._trigger_auto_training)
             except Exception as e:
                 logger.error(f"Error verifying predictions: {e}")
         
@@ -124,14 +211,664 @@ class StockerApp:
         thread.daemon = True
         thread.start()
     
-    def _show_verification_results(self, result: dict):
+    def _start_periodic_verification(self):
+        """Start periodic automatic verification of predictions"""
+        # Check every hour (3600000 milliseconds)
+        check_interval_ms = 3600000  # 1 hour
+        
+        def periodic_check():
+            def verify_in_background():
+                try:
+                    logger.info("Periodic verification of predictions...")
+                    result = self.predictions_tracker.verify_all_active_predictions(self.data_fetcher)
+                    if result['verified'] > 0:
+                        newly_verified = result.get('newly_verified', [])
+                        # Record learning events for verified predictions
+                        for pred in newly_verified:
+                            if pred.get('was_correct') is not None:
+                                self.learning_tracker.record_verified_prediction(
+                                    pred.get('was_correct', False),
+                                    pred.get('strategy', 'trading')
+                                )
+                        self.root.after(0, self._show_verification_notifications, newly_verified)
+                        self.root.after(0, self._update_predictions_display)
+                        # Trigger auto-training
+                        self.root.after(0, self._trigger_auto_training)
+                        # Update ML status
+                        self.root.after(0, self._update_ml_status)
+                except Exception as e:
+                    logger.error(f"Error in periodic verification: {e}")
+            
+            thread = threading.Thread(target=verify_in_background)
+            thread.daemon = True
+            thread.start()
+            
+            # Schedule next check
+            self.root.after(check_interval_ms, periodic_check)
+        
+        # Start first check after 1 hour
+        self.root.after(check_interval_ms, periodic_check)
+    
+    def _start_trend_change_verification(self):
+        """Start periodic automatic verification of trend change predictions"""
+        # Check every 6 hours (21600000 milliseconds)
+        check_interval_ms = 21600000  # 6 hours
+        
+        def periodic_check():
+            def verify_in_background():
+                try:
+                    logger.info("Periodic verification of trend change predictions...")
+                    active_predictions = self.trend_change_tracker.get_active_predictions()
+                    
+                    if not active_predictions:
+                        return
+                    
+                    verified_count = 0
+                    for pred in active_predictions:
+                        try:
+                            # Check if estimated date has passed
+                            estimated_date = datetime.fromisoformat(pred['estimated_date'])
+                            if datetime.now() >= estimated_date:
+                                # Verify this prediction
+                                symbol = pred['symbol']
+                                
+                                # Fetch current data
+                                stock_data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=False)
+                                history_data = self.data_fetcher.fetch_stock_history(symbol, period='3mo')
+                                
+                                if 'error' in stock_data or not history_data.get('data'):
+                                    continue
+                                
+                                # Perform trading analysis to get current trend
+                                trading_analysis = self.trading_analyzer.analyze(stock_data, history_data)
+                                if 'error' in trading_analysis:
+                                    continue
+                                
+                                current_trend = trading_analysis.get('price_action', {}).get('trend', 'sideways')
+                                predicted_change = pred['predicted_change']
+                                original_trend = pred['current_trend']
+                                
+                                # Determine if prediction was correct
+                                was_correct = False
+                                actual_change = None
+                                
+                                if predicted_change == 'bullish_reversal':
+                                    # Predicted bullish reversal (downtrend -> uptrend)
+                                    if original_trend == 'downtrend' and current_trend == 'uptrend':
+                                        was_correct = True
+                                        actual_change = 'bullish_reversal'
+                                    elif current_trend == original_trend:
+                                        actual_change = 'no_change'
+                                    else:
+                                        actual_change = f'{original_trend}_to_{current_trend}'
+                                
+                                elif predicted_change == 'bearish_reversal':
+                                    # Predicted bearish reversal (uptrend -> downtrend)
+                                    if original_trend == 'uptrend' and current_trend == 'downtrend':
+                                        was_correct = True
+                                        actual_change = 'bearish_reversal'
+                                    elif current_trend == original_trend:
+                                        actual_change = 'no_change'
+                                    else:
+                                        actual_change = f'{original_trend}_to_{current_trend}'
+                                
+                                # Verify the prediction
+                                verified_pred = self.trend_change_tracker.verify_prediction(
+                                    pred['id'],
+                                    actual_change or current_trend,
+                                    was_correct
+                                )
+                                
+                                if verified_pred:
+                                    verified_count += 1
+                                    # Record in learning tracker
+                                    self.learning_tracker.record_verified_trend_change(
+                                        was_correct=was_correct,
+                                        predicted_change=predicted_change,
+                                        actual_change=actual_change or current_trend,
+                                        confidence=pred.get('confidence', 0)
+                                    )
+                                    
+                                    logger.info(f"✅ Verified trend change prediction #{pred['id']} for {symbol}: {'correct' if was_correct else 'incorrect'}")
+                        except Exception as e:
+                            logger.error(f"Error verifying trend change prediction #{pred.get('id')}: {e}")
+                    
+                    if verified_count > 0:
+                        logger.info(f"Verified {verified_count} trend change prediction(s)")
+                        
+                        # Learn from verified predictions to improve future estimates
+                        verified_predictions = [
+                            p for p in active_predictions 
+                            if p.get('verified') and p.get('was_correct') is not None
+                        ]
+                        if verified_predictions:
+                            self.trend_change_predictor.learn_from_verified_predictions(verified_predictions)
+                        
+                        # Trigger auto-training to learn from verified predictions
+                        self.root.after(0, self._trigger_auto_training)
+                        # Update ML status
+                        self.root.after(0, self._update_ml_status)
+                except Exception as e:
+                    logger.error(f"Error in trend change verification: {e}")
+            
+            thread = threading.Thread(target=verify_in_background)
+            thread.daemon = True
+            thread.start()
+            
+            # Schedule next check
+            self.root.after(check_interval_ms, periodic_check)
+        
+        # Start first check after 1 hour
+        self.root.after(3600000, periodic_check)
+    
+    def _start_stock_monitoring(self):
+        """Start periodic monitoring of stocks for BUY signals"""
+        # Check every 30 minutes (1800000 milliseconds)
+        check_interval_ms = 1800000  # 30 minutes
+        
+        def periodic_monitor():
+            def monitor_in_background():
+                try:
+                    monitored_symbols = self.stock_monitor.get_monitored_stocks()
+                    if not monitored_symbols:
+                        logger.debug("No stocks to monitor")
+                        return
+                    
+                    logger.info(f"Checking {len(monitored_symbols)} monitored stocks for BUY signals...")
+                    buy_signals = []
+                    
+                    for symbol in monitored_symbols:
+                        try:
+                            stock_info = self.stock_monitor.get_stock_info(symbol)
+                            if not stock_info:
+                                continue
+                            
+                            strategy = stock_info.get('strategy', 'mixed')
+                            
+                            # Re-analyze the stock
+                            stock_data = self.data_fetcher.fetch_stock_data(symbol)
+                            if 'error' in stock_data:
+                                logger.debug(f"Could not fetch data for {symbol}: {stock_data.get('error')}")
+                                continue
+                            
+                            history_data = self.data_fetcher.fetch_stock_history(symbol)
+                            if 'error' in history_data:
+                                logger.debug(f"Could not fetch history for {symbol}: {history_data.get('error')}")
+                                continue
+                            
+                            # Get financials for mixed/investing strategies
+                            financials_data = None
+                            if strategy in ['mixed', 'investing']:
+                                try:
+                                    financials_data = self.data_fetcher.fetch_financials(symbol)
+                                except:
+                                    pass
+                            
+                            # Get hybrid predictor for the strategy
+                            hybrid_predictor = self.hybrid_predictors.get(strategy)
+                            if not hybrid_predictor:
+                                continue
+                            
+                            # Make prediction
+                            analysis = hybrid_predictor.predict(stock_data, history_data, financials_data)
+                            if 'error' in analysis:
+                                logger.debug(f"Analysis error for {symbol}: {analysis.get('error')}")
+                                continue
+                            
+                            recommendation = analysis.get('recommendation', {})
+                            new_action = recommendation.get('action', 'HOLD')
+                            new_confidence = recommendation.get('confidence', 0)
+                            
+                            # Check if changed to BUY
+                            if self.stock_monitor.check_for_buy_signal(symbol, new_action, new_confidence):
+                                buy_signals.append({
+                                    'symbol': symbol,
+                                    'confidence': new_confidence,
+                                    'entry_price': recommendation.get('entry_price', stock_data.get('price', 0)),
+                                    'target_price': recommendation.get('target_price', 0),
+                                    'strategy': strategy
+                                })
+                                logger.info(f"🟢 BUY SIGNAL: {symbol} changed to BUY ({new_confidence:.1f}% confidence)")
+                        
+                        except Exception as e:
+                            logger.error(f"Error monitoring {symbol}: {e}")
+                            continue
+                    
+                    # Show notifications for BUY signals
+                    if buy_signals:
+                        self.root.after(0, self._show_buy_signal_notifications, buy_signals)
+                
+                except Exception as e:
+                    logger.error(f"Error in stock monitoring: {e}")
+            
+            thread = threading.Thread(target=monitor_in_background)
+            thread.daemon = True
+            thread.start()
+            
+            # Schedule next check
+            self.root.after(check_interval_ms, periodic_monitor)
+        
+        # Start first check after 30 minutes
+        self.root.after(check_interval_ms, periodic_monitor)
+    
+    def _show_buy_signal_notifications(self, buy_signals: List[Dict]):
+        """Show notifications for BUY signals"""
+        for signal in buy_signals:
+            symbol = signal['symbol']
+            confidence = signal['confidence']
+            entry_price = signal.get('entry_price', 0)
+            target_price = signal.get('target_price', 0)
+            strategy = signal.get('strategy', 'mixed')
+            
+            message = f"🟢 BUY SIGNAL: {symbol}\n\n"
+            message += f"Stock changed to BUY recommendation!\n"
+            message += f"Confidence: {confidence:.1f}%\n"
+            if entry_price > 0:
+                entry_usd = f"${entry_price:,.2f}"
+                entry_eur = f"€{self.localization.convert_from_usd(entry_price, 'EUR'):,.2f}"
+                message += f"Entry Price: {entry_usd} USD / {entry_eur} EUR\n"
+            if target_price > 0:
+                target_usd = f"${target_price:,.2f}"
+                target_eur = f"€{self.localization.convert_from_usd(target_price, 'EUR'):,.2f}"
+                message += f"Target Price: {target_usd} USD / {target_eur} EUR\n"
+            message += f"Strategy: {strategy.title()}\n\n"
+            message += "Click OK to analyze this stock now."
+            
+            # Show notification
+            messagebox.showinfo(
+                "🟢 BUY Signal Detected!",
+                message
+            )
+            
+            logger.info(f"Showed BUY signal notification for {symbol}")
+    
+    def _start_momentum_monitoring(self):
+        """Start periodic monitoring of stocks in predictions for momentum/trend changes"""
+        # Check every 15 minutes (900000 milliseconds)
+        check_interval_ms = 900000  # 15 minutes
+        
+        def periodic_momentum_check():
+            def check_in_background():
+                try:
+                    # Get all active predictions
+                    active_predictions = [
+                        p for p in self.predictions_tracker.predictions 
+                        if p.get('status') == 'active'
+                    ]
+                    
+                    if not active_predictions:
+                        logger.debug("No active predictions to monitor for momentum changes")
+                        return
+                    
+                    logger.info(f"Checking {len(active_predictions)} predictions for momentum/trend changes...")
+                    momentum_changes = []
+                    
+                    for pred in active_predictions:
+                        symbol = pred.get('symbol', '').upper()
+                        if not symbol:
+                            continue
+                        
+                        try:
+                            strategy = pred.get('strategy', 'mixed')
+                            
+                            # Fetch current data
+                            stock_data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=True)
+                            if 'error' in stock_data:
+                                logger.debug(f"Could not fetch data for {symbol}: {stock_data.get('error')}")
+                                continue
+                            
+                            history_data = self.data_fetcher.fetch_stock_history(symbol)
+                            if 'error' in history_data:
+                                logger.debug(f"Could not fetch history for {symbol}: {history_data.get('error')}")
+                                continue
+                            
+                            # Check momentum for trading and mixed strategies (both use technical indicators)
+                            if strategy in ["trading", "mixed"]:
+                                # Perform trading analysis to get indicators
+                                trading_analysis = self.trading_analyzer.analyze(stock_data, history_data)
+                                if 'error' in trading_analysis:
+                                    continue
+                                
+                                # Check for momentum changes
+                                if 'indicators' in trading_analysis and 'price_action' in trading_analysis and 'momentum_analysis' in trading_analysis:
+                                    changes = self.momentum_monitor.update_momentum_state(
+                                        symbol,
+                                        trading_analysis['indicators'],
+                                        trading_analysis['price_action'],
+                                        trading_analysis['momentum_analysis']
+                                    )
+                                    
+                                    # If significant changes detected, add to notification list
+                                    if changes.get('trend_reversed') or (changes.get('momentum_changed') and len(changes.get('changes', [])) > 0):
+                                        momentum_changes.append({
+                                            'symbol': symbol,
+                                            'prediction_id': pred.get('id'),
+                                            'action': pred.get('action'),
+                                            'strategy': strategy,
+                                            'changes': changes
+                                        })
+                                        logger.info(f"🔄 Momentum/Trend change detected for {symbol} (prediction #{pred.get('id')}): {len(changes.get('changes', []))} changes")
+                            
+                        except Exception as e:
+                            logger.error(f"Error checking momentum for {symbol}: {e}")
+                            continue
+                    
+                    # Show notifications for momentum changes
+                    if momentum_changes:
+                        self.root.after(0, self._show_momentum_change_notifications, momentum_changes)
+                
+                except Exception as e:
+                    logger.error(f"Error in momentum monitoring: {e}")
+            
+            thread = threading.Thread(target=check_in_background)
+            thread.daemon = True
+            thread.start()
+            
+            # Schedule next check
+            self.root.after(check_interval_ms, periodic_momentum_check)
+        
+        # Start first check
+        periodic_momentum_check()
+    
+    def _show_momentum_change_notification(self, symbol: str, changes: Dict):
+        """Show notification for momentum/trend change in currently analyzed stock"""
+        if not changes.get('changes'):
+            return
+        
+        change_list = changes['changes']
+        is_trend_reversal = changes.get('trend_reversed', False)
+        recommendation = changes.get('recommendation', {})
+        trend_change = changes.get('trend_change')
+        
+        # Determine title and action
+        action = recommendation.get('action', 'HOLD')
+        confidence = recommendation.get('confidence', 50)
+        
+        if is_trend_reversal:
+            title = f"⚠️ Trend Reversal: {action} (Confidence: {confidence}%)"
+        else:
+            title = f"🔄 Momentum Change: {action} (Confidence: {confidence}%)"
+        
+        message = f"{symbol} - Technical Analysis Update\n\n"
+        
+        # Show trend change if available
+        if trend_change:
+            message += f"📊 TREND CHANGE: {trend_change}\n\n"
+        
+        # Show recommendation
+        action_emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "🟡"
+        message += f"{action_emoji} RECOMMENDATION: {action} (Confidence: {confidence}%)\n\n"
+        
+        # Show recommendation reasons
+        reasons = recommendation.get('reasons', [])
+        if reasons:
+            message += "Key Factors:\n"
+            for reason in reasons:
+                message += f"• {reason}\n"
+            message += "\n"
+        
+        # Show detected changes
+        message += "Detected Changes:\n"
+        for change in change_list[:5]:  # Show first 5 changes
+            message += f"• {change}\n"
+        
+        if len(change_list) > 5:
+            message += f"\n... and {len(change_list) - 5} more changes"
+        
+        messagebox.showinfo(title, message)
+        logger.info(f"Showed momentum change notification for {symbol}: {action} ({confidence}%)")
+    
+    def _show_momentum_change_notifications(self, momentum_changes: List[Dict]):
+        """Show notifications for momentum/trend changes in predictions"""
+        for change_info in momentum_changes:
+            symbol = change_info['symbol']
+            pred_id = change_info['prediction_id']
+            pred_action = change_info['action']
+            changes = change_info['changes']
+            
+            change_list = changes.get('changes', [])
+            if not change_list:
+                continue
+            
+            is_trend_reversal = changes.get('trend_reversed', False)
+            recommendation = changes.get('recommendation', {})
+            trend_change = changes.get('trend_change')
+            
+            # Get recommendation details
+            new_action = recommendation.get('action', 'HOLD')
+            confidence = recommendation.get('confidence', 50)
+            
+            # Determine if recommendation changed
+            action_changed = (new_action != pred_action)
+            
+            # Check if it's a strategy change (BUY↔SELL, HOLD→BUY/SELL)
+            is_strategy_change = False
+            if action_changed:
+                if (pred_action == 'BUY' and new_action == 'SELL') or \
+                   (pred_action == 'SELL' and new_action == 'BUY') or \
+                   (pred_action == 'HOLD' and new_action in ['BUY', 'SELL']):
+                    is_strategy_change = True
+            
+            if is_trend_reversal:
+                title = f"⚠️ Trend Reversal in Prediction #{pred_id}!"
+            else:
+                title = f"🔄 Momentum Change in Prediction #{pred_id}"
+            
+            message = f"Prediction #{pred_id}: {symbol}\n"
+            message += f"Previous Recommendation: {pred_action}\n\n"
+            
+            # Show trend change if available
+            if trend_change:
+                message += f"📊 TREND CHANGE: {trend_change}\n\n"
+            
+            # Show new recommendation
+            action_emoji = "🟢" if new_action == "BUY" else "🔴" if new_action == "SELL" else "🟡"
+            message += f"{action_emoji} NEW RECOMMENDATION: {new_action} (Confidence: {confidence}%)\n"
+            
+            if action_changed:
+                if pred_action == "BUY" and new_action == "SELL":
+                    message += "⚠️ WARNING: Recommendation changed from BUY to SELL!\n"
+                elif pred_action == "SELL" and new_action == "BUY":
+                    message += "✅ OPPORTUNITY: Recommendation changed from SELL to BUY!\n"
+                elif pred_action == "HOLD" and new_action in ["BUY", "SELL"]:
+                    message += f"📈 New trading signal: {new_action}\n"
+            else:
+                message += f"✓ Recommendation unchanged ({pred_action})\n"
+            
+            message += "\n"
+            
+            # Show recommendation reasons
+            reasons = recommendation.get('reasons', [])
+            if reasons:
+                message += "Key Factors:\n"
+                for reason in reasons:
+                    message += f"• {reason}\n"
+                message += "\n"
+            
+            # Show detected changes
+            message += "Detected Changes:\n"
+            for change in change_list[:5]:  # Show first 5 changes
+                message += f"• {change}\n"
+            
+            if len(change_list) > 5:
+                message += f"\n... and {len(change_list) - 5} more changes"
+            
+            # If strategy changed, update the prediction automatically
+            if is_strategy_change:
+                try:
+                    # Get current price for recalculation
+                    current_stock_data = self.data_fetcher.fetch_stock_data(symbol)
+                    current_price_usd = current_stock_data.get('price', 0)
+                    
+                    if current_price_usd > 0:
+                        # Get prediction to get strategy
+                        prediction = self.predictions_tracker.get_prediction_by_id(pred_id)
+                        if prediction:
+                            strategy = prediction.get('strategy', 'trading')
+                            
+                            # Recalculate targets based on new action and current price
+                            if new_action == 'BUY':
+                                if strategy == "trading":
+                                    new_target_price = current_price_usd * 1.03  # 3% target
+                                    new_stop_loss = current_price_usd * 0.97  # 3% stop loss
+                                elif strategy == "mixed":
+                                    new_target_price = current_price_usd * 1.06  # 6% target
+                                    new_stop_loss = current_price_usd * 0.95  # 5% stop loss
+                                else:  # investing
+                                    new_target_price = current_price_usd * 1.12  # 12% target
+                                    new_stop_loss = current_price_usd * 0.80  # 20% stop loss
+                            elif new_action == 'SELL':
+                                if strategy == "trading":
+                                    new_target_price = current_price_usd * 0.97  # 3% down
+                                    new_stop_loss = current_price_usd * 1.03  # 3% stop loss
+                                elif strategy == "mixed":
+                                    new_target_price = current_price_usd * 0.94  # 6% down
+                                    new_stop_loss = current_price_usd * 1.05  # 5% stop loss
+                                else:  # investing
+                                    new_target_price = current_price_usd * 0.88  # 12% down
+                                    new_stop_loss = current_price_usd * 1.20  # 20% stop loss
+                            else:  # HOLD - keep existing targets
+                                new_target_price = prediction.get('target_price', current_price_usd)
+                                new_stop_loss = prediction.get('stop_loss', current_price_usd)
+                            
+                            # Update reasoning to include strategy change info
+                            new_reasoning = f"Strategy changed from {pred_action} to {new_action}. " + \
+                                          f"Original reasoning: {prediction.get('reasoning', 'N/A')}"
+                            
+                            # Update the prediction
+                            if self.predictions_tracker.update_prediction_action(
+                                pred_id, new_action, current_price_usd, 
+                                new_target_price, new_stop_loss, confidence, new_reasoning
+                            ):
+                                message += f"\n✅ Prediction #{pred_id} has been automatically updated!\n"
+                                message += f"   New Entry: {self.localization.format_currency(current_price_usd)}\n"
+                                message += f"   New Target: {self.localization.format_currency(new_target_price)}\n"
+                                message += f"   New Stop Loss: {self.localization.format_currency(new_stop_loss)}\n"
+                                logger.info(f"Auto-updated prediction #{pred_id}: {pred_action} → {new_action}")
+                            else:
+                                message += "\n⚠️ Could not update prediction automatically.\n"
+                except Exception as e:
+                    logger.error(f"Error auto-updating prediction #{pred_id}: {e}")
+                    message += "\n⚠️ Error updating prediction automatically.\n"
+            else:
+                message += "\n\n💡 Consider reviewing your prediction strategy."
+            
+            messagebox.showinfo(title, message)
+            logger.info(f"Showed momentum change notification for prediction #{pred_id} ({symbol}): {pred_action} → {new_action} ({confidence}%)")
+            
+            # Update predictions display if strategy changed
+            if is_strategy_change:
+                self._update_predictions_display()
+    
+    def _show_verification_results(self, result: dict, newly_verified: list = None):
         """Show prediction verification results"""
         if result['verified'] > 0:
             accuracy = result['accuracy']
             message = f"Verified {result['verified']} prediction(s). "
             message += f"Accuracy: {accuracy:.1f}% ({result['correct']}/{result['verified']} correct)"
             messagebox.showinfo("Predictions Verified", message)
+            
+            # Update performance tracking for hybrid system
+            if newly_verified:
+                self._update_performance_tracking(newly_verified)
+            
+            # Update ML status to show improvements
+            self._update_ml_status()
+            
             self._update_predictions_display()
+    
+    def _update_performance_tracking(self, verified_predictions: list):
+        """Update performance tracking for hybrid system"""
+        try:
+            for pred in verified_predictions:
+                # Get the original prediction to find which predictor was used
+                pred_id = pred.get('id')
+                original_pred = self.predictions_tracker.get_prediction_by_id(pred_id)
+                
+                if original_pred:
+                    strategy = original_pred.get('strategy', self.current_strategy)
+                    hybrid_predictor = self.hybrid_predictors.get(strategy)
+                    
+                    if hybrid_predictor:
+                        # Create prediction dict for performance tracking
+                        prediction_dict = {
+                            'method': 'hybrid_ensemble',
+                            'rule_prediction': {
+                                'action': original_pred.get('action', 'HOLD'),
+                                'confidence': original_pred.get('confidence', 50)
+                            },
+                            'ml_prediction': {
+                                'action': original_pred.get('action', 'HOLD'),
+                                'confidence': original_pred.get('confidence', 50)
+                            },
+                            'recommendation': {
+                                'confidence': original_pred.get('confidence', 50)
+                            }
+                        }
+                        
+                        hybrid_predictor.update_performance(
+                            prediction_dict,
+                            pred.get('was_correct', False)
+                        )
+        except Exception as e:
+            logger.error(f"Error updating performance tracking: {e}")
+    
+    def _trigger_auto_training(self):
+        """Trigger automatic training on verified predictions"""
+        def train_in_background():
+            try:
+                self.auto_training.check_and_train()
+            except Exception as e:
+                logger.error(f"Error triggering auto-training: {e}")
+        
+        thread = threading.Thread(target=train_in_background)
+        thread.daemon = True
+        thread.start()
+    
+    def _schedule_auto_training(self):
+        """Schedule automatic training checks"""
+        # Check every 6 hours
+        check_interval_ms = 6 * 3600 * 1000  # 6 hours
+        
+        def periodic_check():
+            self.auto_training.check_and_train()
+            # Schedule next check
+            self.root.after(check_interval_ms, periodic_check)
+        
+        # Start first check after 1 hour
+        self.root.after(3600 * 1000, periodic_check)
+    
+    def _show_verification_notifications(self, newly_verified: list):
+        """Show individual notifications for newly verified predictions"""
+        if not newly_verified:
+            return
+        
+        for pred in newly_verified:
+            symbol = pred['symbol']
+            action = pred['action']
+            was_correct = pred.get('was_correct', False)
+            actual_price = pred.get('actual_price_at_target', 0)
+            
+            # Create notification message
+            status_icon = "✓" if was_correct else "✗"
+            status_text = "CORRECT" if was_correct else "INCORRECT"
+            
+            message = f"{status_icon} Prediction #{pred['id']} - {symbol} ({action})\n\n"
+            message += f"Status: {status_text}\n"
+            message += f"Target: {self.localization.format_currency(pred['target_price'])}\n"
+            message += f"Actual Price: {self.localization.format_currency(actual_price)}\n"
+            
+            if was_correct:
+                message += f"\n🎉 Your prediction was correct!"
+            else:
+                message += f"\n❌ Your prediction did not come true."
+            
+            # Show notification
+            title = f"Prediction Verified - {symbol}"
+            messagebox.showinfo(title, message)
+        
+        # Also update the predictions display
+        self._update_predictions_display()
     
     def _apply_theme(self, theme_name: str):
         """Apply a theme to the entire application with full UI refresh"""
@@ -276,7 +1013,16 @@ class StockerApp:
             self._change_currency,
             theme
         )
-        self.currency_dropdown.pack(side=tk.LEFT)
+        self.currency_dropdown.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Close button
+        self.close_btn = ModernButton(
+            settings_frame,
+            "✕ " + self.localization.t('close'),
+            command=self._close_app,
+            theme=theme
+        )
+        self.close_btn.pack(side=tk.LEFT)
         
         # Main content area
         content_frame = tk.Frame(main_container, bg=theme['bg'])
@@ -310,26 +1056,42 @@ class StockerApp:
         sidebar.bind('<Configure>', configure_scroll_region)
         sidebar_canvas.bind('<Configure>', lambda e: sidebar_canvas.itemconfig(sidebar_canvas.find_all()[0], width=e.width) if sidebar_canvas.find_all() else None)
         
-        # Bind mousewheel to canvas and sidebar - fix for Windows
-        def on_mousewheel(event):
+        # Bind mousewheel to entire sidebar container for smooth scrolling
+        def on_sidebar_mousewheel(event):
             # Windows uses delta, Linux uses different values
             delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
             if isinstance(delta, (int, float)):
-                sidebar_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+                # Smooth scrolling - use smaller increments
+                scroll_amount = int(-1 * (delta / 120)) * 3  # 3 units for smoother scroll
+                sidebar_canvas.yview_scroll(scroll_amount, "units")
+            return "break"  # Prevent event propagation
         
-        # Bind to multiple events for compatibility
-        sidebar_canvas.bind("<MouseWheel>", on_mousewheel)
-        sidebar.bind("<MouseWheel>", on_mousewheel)
-        sidebar_canvas.bind("<Button-4>", lambda e: sidebar_canvas.yview_scroll(-1, "units"))
-        sidebar_canvas.bind("<Button-5>", lambda e: sidebar_canvas.yview_scroll(1, "units"))
-        sidebar.bind("<Button-4>", lambda e: sidebar_canvas.yview_scroll(-1, "units"))
-        sidebar.bind("<Button-5>", lambda e: sidebar_canvas.yview_scroll(1, "units"))
+        # Bind to all levels for maximum compatibility - with return "break" to prevent conflicts
+        sidebar_container.bind("<MouseWheel>", on_sidebar_mousewheel)
+        sidebar_canvas.bind("<MouseWheel>", on_sidebar_mousewheel)
+        sidebar.bind("<MouseWheel>", on_sidebar_mousewheel)
         
-        # Focus handling for mousewheel
-        def on_enter(event):
-            sidebar_canvas.focus_set()
-        sidebar_canvas.bind("<Enter>", on_enter)
-        sidebar.bind("<Enter>", on_enter)
+        # Also bind to all child widgets in sidebar
+        def bind_sidebar_children(parent):
+            for child in parent.winfo_children():
+                if isinstance(child, (tk.Frame, tk.Canvas, tk.Label, tk.Button)):
+                    child.bind("<MouseWheel>", on_sidebar_mousewheel)
+                    if isinstance(child, tk.Frame):
+                        bind_sidebar_children(child)
+        
+        bind_sidebar_children(sidebar)
+        
+        # Linux/Unix support
+        sidebar_container.bind("<Button-4>", lambda e: sidebar_canvas.yview_scroll(-3, "units") or "break")
+        sidebar_container.bind("<Button-5>", lambda e: sidebar_canvas.yview_scroll(3, "units") or "break")
+        sidebar_canvas.bind("<Button-4>", lambda e: sidebar_canvas.yview_scroll(-3, "units") or "break")
+        sidebar_canvas.bind("<Button-5>", lambda e: sidebar_canvas.yview_scroll(3, "units") or "break")
+        sidebar.bind("<Button-4>", lambda e: sidebar_canvas.yview_scroll(-3, "units") or "break")
+        sidebar.bind("<Button-5>", lambda e: sidebar_canvas.yview_scroll(3, "units") or "break")
+        
+        # Store reference for later cleanup
+        self.sidebar_container = sidebar_container
+        self.sidebar_canvas = sidebar_canvas
         
         # Strategy Selection Card
         self.strategy_card = ModernCard(sidebar, self.localization.t('strategy'), theme=theme, padding=20)
@@ -459,6 +1221,184 @@ class StockerApp:
                     command=self._show_predictions_tab, theme=theme)
         self.view_all_btn.pack(fill=tk.X)
         
+        # AI Training Status Card
+        self.ml_status_card = ModernCard(sidebar, "🤖 AI Training Status", theme=theme, padding=20)
+        self.ml_status_card.pack(fill=tk.X, pady=(0, 15))
+        
+        # Status label with detailed stats
+        self.ml_status_label = tk.Label(
+            self.ml_status_card.content_frame,
+            text="Checking AI status...",
+            bg=theme['card_bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 9),
+            justify=tk.LEFT,
+            wraplength=280
+        )
+        self.ml_status_label.pack(anchor=tk.W, pady=(0, 8))
+        
+        # Performance stats labels
+        self.ml_stats_frame = tk.Frame(self.ml_status_card.content_frame, bg=theme['card_bg'])
+        self.ml_stats_frame.pack(fill=tk.X, pady=(0, 8))
+        
+        self.ml_accuracy_label = tk.Label(
+            self.ml_stats_frame,
+            text="",
+            bg=theme['card_bg'],
+            fg=theme['accent'],
+            font=('Segoe UI', 10, 'bold')
+        )
+        self.ml_accuracy_label.pack(anchor=tk.W)
+        
+        self.ml_rule_label = tk.Label(
+            self.ml_stats_frame,
+            text="",
+            bg=theme['card_bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 8)
+        )
+        self.ml_rule_label.pack(anchor=tk.W)
+        
+        self.ml_hybrid_label = tk.Label(
+            self.ml_stats_frame,
+            text="",
+            bg=theme['card_bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 8)
+        )
+        self.ml_hybrid_label.pack(anchor=tk.W)
+        
+        # Learning progress bar
+        self.learning_progress_frame = tk.Frame(self.ml_status_card.content_frame, bg=theme['card_bg'])
+        self.learning_progress_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.learning_progress_label = tk.Label(
+            self.learning_progress_frame,
+            text="Learning Progress:",
+            bg=theme['card_bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 8)
+        )
+        self.learning_progress_label.pack(anchor=tk.W)
+        
+        self.learning_progress_bar = ttk.Progressbar(
+            self.learning_progress_frame,
+            mode='determinate',
+            length=280,
+            maximum=100
+        )
+        self.learning_progress_bar.pack(fill=tk.X, pady=(5, 0))
+        
+        # Megamind Status (Learning Tracker)
+        megamind_frame = tk.Frame(self.ml_status_card.content_frame, bg=theme['card_bg'])
+        megamind_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        megamind_header = tk.Label(
+            megamind_frame,
+            text="🧠 MEGAMIND STATUS",
+            bg=theme['card_bg'],
+            fg=theme['accent'],
+            font=('Segoe UI', 9, 'bold')
+        )
+        megamind_header.pack(anchor=tk.W)
+        
+        self.megamind_status_label = tk.Label(
+            megamind_frame,
+            text="Initializing...",
+            bg=theme['card_bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 7),
+            wraplength=280,
+            justify=tk.LEFT
+        )
+        self.megamind_status_label.pack(anchor=tk.W, pady=(3, 0))
+        
+        # Auto-learner status
+        auto_learner_frame = tk.Frame(self.ml_status_card.content_frame, bg=theme['card_bg'])
+        auto_learner_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        self.auto_learner_status_label = tk.Label(
+            auto_learner_frame,
+            text="🤖 Auto-Learner: Starting...",
+            bg=theme['card_bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 8),
+            wraplength=280,
+            justify=tk.LEFT
+        )
+        self.auto_learner_status_label.pack(anchor=tk.W)
+        
+        # Button frame
+        btn_frame = tk.Frame(self.ml_status_card.content_frame, bg=theme['card_bg'])
+        btn_frame.pack(fill=tk.X)
+        
+        self.train_btn = ModernButton(
+            btn_frame,
+            "Train AI Model",
+            command=self._show_training_dialog,
+            theme=theme
+        )
+        self.train_btn.pack(fill=tk.X, pady=(0, 5))
+        
+        self.view_stats_btn = ModernButton(
+            btn_frame,
+            "View Detailed Stats",
+            command=self._show_detailed_stats,
+            theme=theme
+        )
+        self.view_stats_btn.pack(fill=tk.X, pady=(0, 5))
+        
+        self.test_model_btn = ModernButton(
+            btn_frame,
+            "Test Model",
+            command=self._show_test_dialog,
+            theme=theme
+        )
+        self.test_model_btn.pack(fill=tk.X, pady=(0, 5))
+        
+        self.backtest_btn = ModernButton(
+            btn_frame,
+            "🧪 Run Backtest",
+            command=self._run_backtest,
+            theme=theme
+        )
+        self.backtest_btn.pack(fill=tk.X, pady=(0, 5))
+        
+        self.view_backtest_results_btn = ModernButton(
+            btn_frame,
+            "📊 View Backtest Results",
+            command=self._show_backtest_results,
+            theme=theme
+        )
+        self.view_backtest_results_btn.pack(fill=tk.X, pady=(0, 5))
+        
+        # Scan Now button for immediate learning
+        self.scan_now_btn = ModernButton(
+            btn_frame,
+            "🔍 Scan Market Now",
+            command=self._trigger_manual_scan,
+            theme=theme
+        )
+        self.scan_now_btn.pack(fill=tk.X, pady=(0, 5))
+        
+        # Auto-Learner Settings button
+        self.auto_learner_settings_btn = ModernButton(
+            btn_frame,
+            "⚙️ Auto-Learner Settings",
+            command=self._show_auto_learner_settings,
+            theme=theme
+        )
+        self.auto_learner_settings_btn.pack(fill=tk.X)
+        
+        # Store previous accuracy for improvement detection
+        self.previous_accuracy = {}
+        
+        # Update ML status on startup
+        self.root.after(100, self._update_ml_status)
+        
+        # Update test button state based on model availability
+        self.root.after(200, self._update_test_button_state)
+        
         # Right panel - Results area
         results_panel = tk.Frame(content_frame, bg=theme['bg'])
         results_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -478,6 +1418,76 @@ class StockerApp:
         
         self.notebook = ttk.Notebook(notebook_container)
         self.notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # Bind mousewheel to notebook for smooth scrolling in tabs
+        def on_notebook_mousewheel(event):
+            # Get the currently selected tab
+            try:
+                selected_tab = self.notebook.nametowidget(self.notebook.select())
+                
+                # Check if the tab has scrollable content
+                delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
+                if isinstance(delta, (int, float)):
+                    scroll_amount = int(-1 * (delta / 120)) * 3
+                    
+                    # Try to scroll the active tab's content
+                    for widget in selected_tab.winfo_children():
+                        if isinstance(widget, tk.Canvas):
+                            widget.yview_scroll(scroll_amount, "units")
+                            return "break"
+                        elif isinstance(widget, scrolledtext.ScrolledText):
+                            widget.yview_scroll(scroll_amount, "units")
+                            return "break"
+            except:
+                pass
+        
+        notebook_container.bind("<MouseWheel>", on_notebook_mousewheel)
+        self.notebook.bind("<MouseWheel>", on_notebook_mousewheel)
+        
+        # Universal handler that checks mouse position and routes to correct area
+        # Defined here so it can reference both sidebar and notebook handlers
+        def universal_wheel_handler(event):
+            try:
+                x, y = event.x_root, event.y_root
+                
+                # Check sidebar first (with some padding for better detection)
+                try:
+                    sidebar_x = sidebar_container.winfo_rootx()
+                    sidebar_y = sidebar_container.winfo_rooty()
+                    sidebar_w = sidebar_container.winfo_width()
+                    sidebar_h = sidebar_container.winfo_height()
+                    
+                    if (sidebar_x <= x <= sidebar_x + sidebar_w and 
+                        sidebar_y <= y <= sidebar_y + sidebar_h):
+                        on_sidebar_mousewheel(event)
+                        return "break"
+                except:
+                    pass
+                
+                # Check notebook area
+                try:
+                    notebook_x = notebook_container.winfo_rootx()
+                    notebook_y = notebook_container.winfo_rooty()
+                    notebook_w = notebook_container.winfo_width()
+                    notebook_h = notebook_container.winfo_height()
+                    
+                    if (notebook_x <= x <= notebook_x + notebook_w and 
+                        notebook_y <= y <= notebook_y + notebook_h):
+                        on_notebook_mousewheel(event)
+                        return "break"
+                except:
+                    pass
+            except:
+                pass
+        
+        # Bind to parent containers and root window to catch events when hovering
+        content_frame.bind("<MouseWheel>", universal_wheel_handler)
+        results_panel.bind("<MouseWheel>", universal_wheel_handler)
+        # Also bind to root window to catch all mousewheel events
+        self.root.bind("<MouseWheel>", universal_wheel_handler)
+        
+        # Store notebook container reference
+        self.notebook_container = notebook_container
         
         # Analysis tab
         self.analysis_frame = tk.Frame(self.notebook, bg=theme['frame_bg'])
@@ -515,18 +1525,51 @@ class StockerApp:
                                                        insertbackground=theme['fg'])
         self.potential_text.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
         
-        # Predictions tab - make it scrollable
+        # Bind mousewheel to potential text for smooth scrolling
+        def on_potential_scroll(event):
+            delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
+            if isinstance(delta, (int, float)):
+                scroll_amount = int(-1 * (delta / 120)) * 3
+                self.potential_text.yview_scroll(scroll_amount, "units")
+        self.potential_frame.bind("<MouseWheel>", on_potential_scroll)
+        self.potential_text.bind("<MouseWheel>", on_potential_scroll)
+        
+        # Bind mousewheel to all tab frames (after they're all created)
+        def bind_tab_scrolling(frame):
+            """Recursively bind mousewheel to all widgets in a frame"""
+            frame.bind("<MouseWheel>", on_notebook_mousewheel)
+            for child in frame.winfo_children():
+                if isinstance(child, (tk.Frame, tk.Canvas, scrolledtext.ScrolledText)):
+                    child.bind("<MouseWheel>", on_notebook_mousewheel)
+                    if isinstance(child, tk.Frame):
+                        bind_tab_scrolling(child)
+        
+        # Bind scrolling to all tab frames
+        bind_tab_scrolling(self.analysis_frame)
+        bind_tab_scrolling(self.chart_frame)
+        bind_tab_scrolling(self.indicators_frame)
+        bind_tab_scrolling(self.potential_frame)
+        
+        # Predictions tab - use Notebook for multiple tabs
         predictions_container = tk.Frame(self.notebook, bg=theme['bg'])
         self.notebook.add(predictions_container, text=self.localization.t('predictions'))
         
+        # Create notebook for predictions sub-tabs
+        self.predictions_notebook = ttk.Notebook(predictions_container)
+        self.predictions_notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # Regular Predictions tab
+        regular_predictions_container = tk.Frame(self.predictions_notebook, bg=theme['bg'])
+        self.predictions_notebook.add(regular_predictions_container, text="Predictions")
+        
         # Create canvas and scrollbar for scrollable predictions tab
-        predictions_canvas = tk.Canvas(predictions_container, bg=theme['bg'], highlightthickness=0)
+        predictions_canvas = tk.Canvas(regular_predictions_container, bg=theme['bg'], highlightthickness=0)
         self.predictions_frame = tk.Frame(predictions_canvas, bg=theme['bg'])
         
         predictions_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
         # Modern scrollbar for predictions tab
-        predictions_scrollbar = ModernScrollbar(predictions_container, command=predictions_canvas.yview, theme=theme)
+        predictions_scrollbar = ModernScrollbar(regular_predictions_container, command=predictions_canvas.yview, theme=theme)
         predictions_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
         # Force initial update
         predictions_canvas.update_idletasks()
@@ -542,26 +1585,67 @@ class StockerApp:
         self.predictions_frame.bind('<Configure>', configure_predictions_scroll)
         predictions_canvas.bind('<Configure>', lambda e: predictions_canvas.itemconfig(predictions_canvas.find_all()[0], width=e.width) if predictions_canvas.find_all() else None)
         
-        # Bind mousewheel - fix for Windows
+        # Bind mousewheel for predictions tab - smooth scrolling
         def on_predictions_mousewheel(event):
             delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
             if isinstance(delta, (int, float)):
-                predictions_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+                scroll_amount = int(-1 * (delta / 120)) * 3  # Smooth scroll
+                predictions_canvas.yview_scroll(scroll_amount, "units")
+            return "break"  # Prevent event propagation
         
+        regular_predictions_container.bind("<MouseWheel>", on_predictions_mousewheel)
         predictions_canvas.bind("<MouseWheel>", on_predictions_mousewheel)
         self.predictions_frame.bind("<MouseWheel>", on_predictions_mousewheel)
-        predictions_canvas.bind("<Button-4>", lambda e: predictions_canvas.yview_scroll(-1, "units"))
-        predictions_canvas.bind("<Button-5>", lambda e: predictions_canvas.yview_scroll(1, "units"))
-        self.predictions_frame.bind("<Button-4>", lambda e: predictions_canvas.yview_scroll(-1, "units"))
-        self.predictions_frame.bind("<Button-5>", lambda e: predictions_canvas.yview_scroll(1, "units"))
+        regular_predictions_container.bind("<Button-4>", lambda e: predictions_canvas.yview_scroll(-3, "units") or "break")
+        regular_predictions_container.bind("<Button-5>", lambda e: predictions_canvas.yview_scroll(3, "units") or "break")
+        predictions_canvas.bind("<Button-4>", lambda e: predictions_canvas.yview_scroll(-3, "units") or "break")
+        predictions_canvas.bind("<Button-5>", lambda e: predictions_canvas.yview_scroll(3, "units") or "break")
+        self.predictions_frame.bind("<Button-4>", lambda e: predictions_canvas.yview_scroll(-3, "units") or "break")
+        self.predictions_frame.bind("<Button-5>", lambda e: predictions_canvas.yview_scroll(3, "units") or "break")
         
-        # Focus handling
-        def on_predictions_enter(event):
-            predictions_canvas.focus_set()
-        predictions_canvas.bind("<Enter>", on_predictions_enter)
-        self.predictions_frame.bind("<Enter>", on_predictions_enter)
+        # Store reference
+        self.predictions_container = predictions_container
+        self.predictions_canvas = predictions_canvas
+        
+        # Trend Change Predictions tab
+        trend_change_container = tk.Frame(self.predictions_notebook, bg=theme['bg'])
+        self.predictions_notebook.add(trend_change_container, text="Trend Changes")
+        
+        # Create canvas and scrollbar for trend change predictions
+        trend_change_canvas = tk.Canvas(trend_change_container, bg=theme['bg'], highlightthickness=0)
+        self.trend_change_frame = tk.Frame(trend_change_canvas, bg=theme['bg'])
+        
+        trend_change_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        trend_change_scrollbar = ModernScrollbar(trend_change_container, command=trend_change_canvas.yview, theme=theme)
+        trend_change_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+        trend_change_canvas.update_idletasks()
+        trend_change_scrollbar._update_slider()
+        
+        trend_change_canvas.configure(yscrollcommand=trend_change_scrollbar.set)
+        trend_change_canvas.create_window((0, 0), window=self.trend_change_frame, anchor=tk.NW)
+        
+        def configure_trend_change_scroll(event=None):
+            trend_change_canvas.configure(scrollregion=trend_change_canvas.bbox("all"))
+        
+        self.trend_change_frame.bind('<Configure>', configure_trend_change_scroll)
+        trend_change_canvas.bind('<Configure>', lambda e: trend_change_canvas.itemconfig(trend_change_canvas.find_all()[0], width=e.width) if trend_change_canvas.find_all() else None)
+        
+        def on_trend_change_mousewheel(event):
+            delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
+            if isinstance(delta, (int, float)):
+                scroll_amount = int(-1 * (delta / 120)) * 3
+                trend_change_canvas.yview_scroll(scroll_amount, "units")
+        
+        trend_change_container.bind("<MouseWheel>", on_trend_change_mousewheel)
+        trend_change_canvas.bind("<MouseWheel>", on_trend_change_mousewheel)
+        self.trend_change_frame.bind("<MouseWheel>", on_trend_change_mousewheel)
+        
+        self.trend_change_canvas = trend_change_canvas
         
         self._create_predictions_tab()
+        self._create_trend_change_tab()
+        self._load_trend_change_predictions()  # Load stored predictions
         
         # Update predictions display
         self._update_predictions_display()
@@ -662,6 +1746,7 @@ class StockerApp:
         self.calc_btn.config(text=self.localization.t('calculate_potential'))
         self.set_balance_btn.config(text=self.localization.t('set_balance'))
         self.view_all_btn.config(text=self.localization.t('view_all'))
+        self.close_btn.config(text="✕ " + self.localization.t('close'))
         
         # Update notebook tabs
         self.notebook.tab(0, text=self.localization.t('analysis'))
@@ -778,16 +1863,42 @@ class StockerApp:
         list_inner = tk.Frame(list_card.content_frame, bg=theme['card_bg'])
         list_inner.pack(fill=tk.BOTH, expand=True)
         
-        columns = ('ID', 'Symbol', 'Action', 'Entry', 'Target', 'Status', 'Result')
+        columns = ('ID', 'Symbol', 'Action', 'Entry', 'Target', 'Target Date', 'Status', 'Result', 'Delete')
         self.predictions_tree = ttk.Treeview(list_inner, columns=columns, show='headings', height=12)
         
         for col in columns:
             self.predictions_tree.heading(col, text=col, anchor=tk.CENTER)
-            self.predictions_tree.column(col, width=120, anchor=tk.CENTER)
+            if col == 'Target Date':
+                self.predictions_tree.column(col, width=120, anchor=tk.CENTER)
+            elif col == 'Delete':
+                self.predictions_tree.column(col, width=50, anchor=tk.CENTER)
+            else:
+                self.predictions_tree.column(col, width=100, anchor=tk.CENTER)
+        
+        # Bind click event on Delete column
+        self.predictions_tree.bind('<Button-1>', self._on_predictions_tree_click)
+        # Bind motion event for hover effect on Delete column
+        self.predictions_tree.bind('<Motion>', self._on_predictions_tree_motion)
+        self.predictions_tree.bind('<Leave>', self._on_predictions_tree_leave)
+        
+        # Track currently hovered delete cell
+        self.hovered_delete_item = None
         
         # Modern scrollbar for predictions tree
         tree_scrollbar = ModernScrollbar(list_inner, command=self.predictions_tree.yview, theme=theme)
         self.predictions_tree.configure(yscrollcommand=tree_scrollbar.set)
+        
+        # Bind mousewheel to treeview for scrolling
+        def on_tree_mousewheel(event):
+            delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
+            if isinstance(delta, (int, float)):
+                scroll_amount = int(-1 * (delta / 120)) * 3
+                self.predictions_tree.yview_scroll(scroll_amount, "units")
+            return "break"
+        
+        self.predictions_tree.bind("<MouseWheel>", on_tree_mousewheel)
+        self.predictions_tree.bind("<Button-4>", lambda e: self.predictions_tree.yview_scroll(-3, "units") or "break")
+        self.predictions_tree.bind("<Button-5>", lambda e: self.predictions_tree.yview_scroll(3, "units") or "break")
         
         self.predictions_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
@@ -823,7 +1934,7 @@ class StockerApp:
                     break
     
     def _save_current_prediction(self):
-        """Save current analysis as a prediction"""
+        """Save current analysis as a prediction - using CURRENT price"""
         if not self.current_analysis or 'error' in self.current_analysis:
             messagebox.showwarning(self.localization.t('no_analysis'), self.localization.t('please_analyze_stock'))
             return
@@ -832,37 +1943,143 @@ class StockerApp:
             messagebox.showwarning(self.localization.t('no_symbol'), self.localization.t('no_symbol'))
             return
         
+        # Fetch CURRENT price (not the price from when analysis was done)
+        symbol = self.current_symbol
+        try:
+            current_stock_data = self.data_fetcher.fetch_stock_data(symbol)
+            current_price_usd = current_stock_data.get('price', 0)
+            if current_price_usd <= 0:
+                raise ValueError("Could not fetch current price")
+        except Exception as e:
+            logger.error(f"Error fetching current price for prediction: {e}")
+            messagebox.showerror(self.localization.t('error'), 
+                               f"Could not fetch current price for {symbol}. Cannot save prediction.")
+            return
+        
         recommendation = self.current_analysis.get('recommendation', {})
         action = recommendation.get('action', 'HOLD')
-        entry_price = recommendation.get('entry_price', 0)
-        target_price = recommendation.get('target_price', 0)
-        stop_loss = recommendation.get('stop_loss', 0)
+        old_entry_price = recommendation.get('entry_price', current_price_usd)
+        old_target_price = recommendation.get('target_price', current_price_usd)
+        old_stop_loss = recommendation.get('stop_loss', current_price_usd)
         confidence = recommendation.get('confidence', 0)
         reasoning = self.current_analysis.get('reasoning', '')
         
-        if entry_price <= 0:
+        # Use CURRENT price as entry
+        entry_price = current_price_usd
+        
+        # Recalculate targets based on current price (proportional adjustment)
+        if old_entry_price > 0:
+            price_ratio = current_price_usd / old_entry_price
+            target_price = old_target_price * price_ratio
+            stop_loss = old_stop_loss * price_ratio
+        else:
+            target_price = old_target_price
+            stop_loss = old_stop_loss
+        
+        # Validate that targets make sense and haven't already been reached
+        if action == "BUY":
+            if current_price_usd >= target_price:
+                # Target already reached - recalculate a new target
+                # Use strategy-appropriate target based on current price
+                strategy = self.strategy_var.get()
+                if strategy == "trading":
+                    target_price = current_price_usd * 1.03  # 3% target for trading
+                elif strategy == "mixed":
+                    target_price = current_price_usd * 1.06  # 6% target for mixed
+                else:  # investing
+                    target_price = current_price_usd * 1.12  # 12% target for investing
+                
+                messagebox.showwarning(
+                    self.localization.t('warning'),
+                    f"Target price was already reached. New target set: {self.localization.format_currency(target_price)}"
+                )
+            
+            if stop_loss >= entry_price:
+                # Stop loss is above entry - invalid for BUY
+                if strategy == "trading":
+                    stop_loss = current_price_usd * 0.97  # 3% stop loss
+                elif strategy == "mixed":
+                    stop_loss = current_price_usd * 0.95  # 5% stop loss
+                else:  # investing
+                    stop_loss = current_price_usd * 0.80  # 20% stop loss
+        
+        elif action == "SELL":
+            if current_price_usd <= target_price:
+                # Target already reached - recalculate
+                strategy = self.strategy_var.get()
+                if strategy == "trading":
+                    target_price = current_price_usd * 0.97  # 3% down for trading
+                elif strategy == "mixed":
+                    target_price = current_price_usd * 0.94  # 6% down for mixed
+                else:  # investing
+                    target_price = current_price_usd * 0.88  # 12% down for investing
+                
+                messagebox.showwarning(
+                    self.localization.t('warning'),
+                    f"Target price was already reached. New target set: {self.localization.format_currency(target_price)}"
+                )
+            
+            if stop_loss <= entry_price:
+                # Stop loss is below entry - invalid for SELL
+                if strategy == "trading":
+                    stop_loss = current_price_usd * 1.03  # 3% stop loss
+                elif strategy == "mixed":
+                    stop_loss = current_price_usd * 1.05  # 5% stop loss
+                else:  # investing
+                    stop_loss = current_price_usd * 1.20  # 20% stop loss
+        
+        if entry_price <= 0 or target_price <= 0 or stop_loss <= 0:
             messagebox.showwarning(self.localization.t('invalid_prediction'), self.localization.t('invalid_prediction'))
             return
         
         strategy = self.strategy_var.get()
         
+        # Calculate estimated days based on strategy
+        if strategy == "trading":
+            estimated_days = 10  # Short-term: ~10 days
+        elif strategy == "mixed":
+            estimated_days = 21  # Medium-term: ~3 weeks
+        else:  # investing
+            estimated_days = 547  # Long-term: ~1.5 years
+        
         prediction = self.predictions_tracker.add_prediction(
             self.current_symbol, strategy, action, entry_price, 
-            target_price, stop_loss, confidence, reasoning
+            target_price, stop_loss, confidence, reasoning, estimated_days
         )
         
+        # Format target date for display
+        from datetime import datetime, timedelta
+        target_date = datetime.now() + timedelta(days=estimated_days)
+        target_date_str = target_date.strftime("%Y-%m-%d")
+        
         messagebox.showinfo(self.localization.t('prediction_saved'), 
-                          f"{self.localization.t('prediction_saved')} #{prediction['id']} - {self.current_symbol}")
+                          f"{self.localization.t('prediction_saved')} #{prediction['id']} - {self.current_symbol}\n"
+                          f"Entry: {self.localization.format_currency(entry_price)}\n"
+                          f"Target: {self.localization.format_currency(target_price)}\n"
+                          f"Estimated Target Date: {target_date_str}")
         self._update_predictions_display()
     
     def _verify_all_predictions(self):
-        """Manually verify all active predictions"""
+        """Manually verify all active predictions (checks all, not just those past target date)"""
         def verify_in_background():
             try:
                 self.root.after(0, self._update_status, self.localization.t('verifying_predictions'))
-                result = self.predictions_tracker.verify_all_active_predictions(self.data_fetcher)
-                self.root.after(0, self._show_verification_results, result)
-                self.root.after(0, self._update_predictions_display)
+                # check_all=True to verify all active predictions regardless of target date
+                result = self.predictions_tracker.verify_all_active_predictions(self.data_fetcher, check_all=True)
+                if result['verified'] > 0:
+                    newly_verified = result.get('newly_verified', [])
+                    # Record learning events for verified predictions
+                    for pred in newly_verified:
+                        if pred.get('was_correct') is not None:
+                            self.learning_tracker.record_verified_prediction(
+                                pred.get('was_correct', False),
+                                pred.get('strategy', 'trading')
+                            )
+                    self.root.after(0, self._show_verification_results, result, newly_verified)
+                    self.root.after(0, self._update_predictions_display)
+                else:
+                    messagebox.showinfo(self.localization.t('info'), 
+                                      self.localization.t('no_predictions_verified'))
             except Exception as e:
                 logger.error(f"Error verifying predictions: {e}")
                 self.root.after(0, lambda: messagebox.showerror(self.localization.t('error'), 
@@ -909,44 +2126,505 @@ class StockerApp:
             if pred['verified']:
                 result = f"✓ {self.localization.t('correct')}" if pred['was_correct'] else f"✗ {self.localization.t('incorrect')}"
             
+            # Format target date
+            target_date_str = "N/A"
+            estimated_date_str = pred.get('estimated_target_date')
+            if estimated_date_str:
+                try:
+                    from datetime import datetime
+                    target_date = datetime.fromisoformat(estimated_date_str)
+                    target_date_str = target_date.strftime("%Y-%m-%d")
+                except:
+                    target_date_str = "N/A"
+            
+            # Format prices in USD for predictions tab (always USD regardless of currency setting)
+            entry_usd = f"${pred['entry_price']:,.2f}"
+            target_usd = f"${pred['target_price']:,.2f}"
+            
             values = (
                 pred['id'],
                 pred['symbol'],
                 pred['action'],
-                self.localization.format_currency(pred['entry_price']),
-                self.localization.format_currency(pred['target_price']),
+                entry_usd,
+                target_usd,
+                target_date_str,
                 status.title(),
-                result
+                result,
+                '✕'  # X symbol for delete
             )
             
             item = self.predictions_tree.insert('', tk.END, values=values)
+            # Store prediction ID in item for easy lookup
+            self.predictions_tree.set(item, 'ID', pred['id'])
             
             # Tag items for color coding
+            tags = []
             if pred['verified']:
                 if pred['was_correct']:
                     self.predictions_tree.set(item, 'Result', f"✓ {self.localization.t('correct')}")
-                    self.predictions_tree.item(item, tags=('success',))
+                    tags.append('success')
                 else:
                     self.predictions_tree.set(item, 'Result', f"✗ {self.localization.t('incorrect')}")
-                    self.predictions_tree.item(item, tags=('error',))
+                    tags.append('error')
             else:
-                self.predictions_tree.item(item, tags=('pending',))
+                tags.append('pending')
+            
+            # Add delete tag for hover effect
+            tags.append('delete_cell')
+            self.predictions_tree.item(item, tags=tuple(tags))
         
         # Configure tags for colors
         self.predictions_tree.tag_configure('success', foreground=theme['success'])
         self.predictions_tree.tag_configure('error', foreground=theme['error'])
         self.predictions_tree.tag_configure('pending', foreground=theme['text_secondary'])
+        # Configure delete cell tag - default color (this won't affect other columns due to tag priority)
+        self.predictions_tree.tag_configure('delete_cell', foreground=theme['fg'])
+        # Configure delete hover tag - red color (will override other tags when applied)
+        self.predictions_tree.tag_configure('delete_hover', foreground='#FF0000')  # Red on hover
+        
+        # Ensure click handler is bound (in case tree was recreated)
+        self.predictions_tree.bind('<Button-1>', self._on_predictions_tree_click)
+        self.predictions_tree.bind('<Motion>', self._on_predictions_tree_motion)
+        self.predictions_tree.bind('<Leave>', self._on_predictions_tree_leave)
+    
+    def _create_trend_change_tab(self):
+        """Create the trend change predictions tab"""
+        theme = self.theme_manager.get_theme()
+        
+        # Header
+        header_frame = tk.Frame(self.trend_change_frame, bg=theme['bg'])
+        header_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        title_label = tk.Label(header_frame, text="Trend Change Predictions", 
+                              font=('Segoe UI', 14, 'bold'), bg=theme['bg'], fg=theme['fg'])
+        title_label.pack(side=tk.LEFT)
+        
+        refresh_btn = ModernButton(header_frame, text="Refresh", 
+                                  command=self._refresh_trend_changes, theme=theme)
+        refresh_btn.pack(side=tk.RIGHT)
+        
+        # Info label
+        info_label = tk.Label(self.trend_change_frame, 
+                             text="Predictions are generated automatically when analyzing stocks.\n"
+                                  "This tab shows when trend changes might occur based on technical indicators.",
+                             font=('Segoe UI', 9), bg=theme['bg'], fg=theme['text_secondary'],
+                             justify=tk.LEFT)
+        info_label.pack(fill=tk.X, pady=(0, 15))
+        
+        # Treeview for trend change predictions
+        list_card = ModernCard(self.trend_change_frame, "", theme=theme, padding=15)
+        list_card.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+        
+        list_inner = tk.Frame(list_card, bg=theme['card_bg'])
+        list_inner.pack(fill=tk.BOTH, expand=True)
+        
+        columns = ('Symbol', 'Current Trend', 'Predicted Change', 'Estimated Days', 'Estimated Date', 'Confidence', 'Delete')
+        self.trend_change_tree = ttk.Treeview(list_inner, columns=columns, show='headings', height=12)
+        
+        for col in columns:
+            self.trend_change_tree.heading(col, text=col, anchor=tk.CENTER)
+            if col == 'Estimated Date':
+                self.trend_change_tree.column(col, width=120, anchor=tk.CENTER)
+            elif col == 'Confidence':
+                self.trend_change_tree.column(col, width=100, anchor=tk.CENTER)
+            elif col == 'Delete':
+                self.trend_change_tree.column(col, width=50, anchor=tk.CENTER)
+            else:
+                self.trend_change_tree.column(col, width=120, anchor=tk.CENTER)
+        
+        # Bind click event on Delete column
+        self.trend_change_tree.bind('<Button-1>', self._on_trend_change_tree_click)
+        # Bind motion event for hover effect on Delete column
+        self.trend_change_tree.bind('<Motion>', self._on_trend_change_tree_motion)
+        self.trend_change_tree.bind('<Leave>', self._on_trend_change_tree_leave)
+        
+        # Track currently hovered delete cell
+        self.hovered_trend_delete_item = None
+        
+        tree_scrollbar = ModernScrollbar(list_inner, command=self.trend_change_tree.yview, theme=theme)
+        self.trend_change_tree.configure(yscrollcommand=tree_scrollbar.set)
+        
+        # Bind mousewheel to trend change treeview for scrolling
+        def on_trend_tree_mousewheel(event):
+            delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
+            if isinstance(delta, (int, float)):
+                scroll_amount = int(-1 * (delta / 120)) * 3
+                self.trend_change_tree.yview_scroll(scroll_amount, "units")
+            return "break"
+        
+        self.trend_change_tree.bind("<MouseWheel>", on_trend_tree_mousewheel)
+        self.trend_change_tree.bind("<Button-4>", lambda e: self.trend_change_tree.yview_scroll(-3, "units") or "break")
+        self.trend_change_tree.bind("<Button-5>", lambda e: self.trend_change_tree.yview_scroll(3, "units") or "break")
+        
+        self.trend_change_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+        
+        # Store trend change predictions
+        self.trend_change_predictions = []
+    
+    def _update_trend_change_display(self):
+        """Update the trend change predictions display"""
+        theme = self.theme_manager.get_theme()
+        
+        # Load active predictions from persistent storage
+        try:
+            active_predictions = self.trend_change_tracker.get_active_predictions()
+            # Update in-memory list with stored predictions
+            # Merge with any new predictions that haven't been saved yet
+            stored_ids = {p['id'] for p in active_predictions}
+            new_predictions = [p for p in self.trend_change_predictions if p.get('id') not in stored_ids]
+            self.trend_change_predictions = active_predictions + new_predictions
+        except Exception as e:
+            logger.error(f"Error loading trend change predictions: {e}")
+        
+        # Clear tree
+        for item in self.trend_change_tree.get_children():
+            self.trend_change_tree.delete(item)
+        
+        # Add all trend change predictions
+        for pred in self.trend_change_predictions:
+            # Format date
+            try:
+                from datetime import datetime
+                estimated_date = datetime.fromisoformat(pred['estimated_date'])
+                date_str = estimated_date.strftime("%Y-%m-%d")
+            except:
+                date_str = "N/A"
+            
+            # Format predicted change
+            change_type = pred['predicted_change']
+            if change_type == 'bullish_reversal':
+                change_display = "🔼 Bullish Reversal"
+            elif change_type == 'bearish_reversal':
+                change_display = "🔽 Bearish Reversal"
+            elif change_type == 'continuation':
+                change_display = "➡️ Continuation"
+            else:
+                change_display = change_type.replace('_', ' ').title()
+            
+            values = (
+                pred['symbol'],
+                pred['current_trend'].title(),
+                change_display,
+                f"{pred['estimated_days']} days",
+                date_str,
+                f"{pred['confidence']:.0f}%",
+                '✕'  # X symbol for delete
+            )
+            
+            item = self.trend_change_tree.insert('', tk.END, values=values)
+            
+            # Store prediction ID in item for easy lookup
+            pred_id = pred.get('id')
+            if pred_id:
+                self.trend_change_tree.set(item, 'ID', pred_id)
+            
+            # Tag based on confidence
+            tags = []
+            if pred['confidence'] >= 75:
+                tags.append('high_confidence')
+            elif pred['confidence'] >= 60:
+                tags.append('medium_confidence')
+            else:
+                tags.append('low_confidence')
+            
+            # Add delete cell tag
+            tags.append('delete_cell')
+            self.trend_change_tree.item(item, tags=tuple(tags))
+        
+        # Configure tags
+        self.trend_change_tree.tag_configure('high_confidence', foreground=theme['success'])
+        self.trend_change_tree.tag_configure('medium_confidence', foreground=theme['warning'])
+        self.trend_change_tree.tag_configure('low_confidence', foreground=theme['text_secondary'])
+        self.trend_change_tree.tag_configure('delete_cell', foreground=theme['fg'])
+        self.trend_change_tree.tag_configure('delete_hover', foreground='#FF0000')  # Red on hover
+        
+        # Ensure click handler is bound (in case tree was recreated)
+        self.trend_change_tree.bind('<Button-1>', self._on_trend_change_tree_click)
+        self.trend_change_tree.bind('<Motion>', self._on_trend_change_tree_motion)
+        self.trend_change_tree.bind('<Leave>', self._on_trend_change_tree_leave)
+    
+    def _on_trend_change_tree_click(self, event):
+        """Handle click on trend change tree, specifically for delete column"""
+        region = self.trend_change_tree.identify_region(event.x, event.y)
+        
+        if region == 'cell':
+            column = self.trend_change_tree.identify_column(event.x)
+            item = self.trend_change_tree.identify_row(event.y)
+            
+            if item and column:
+                col_index = int(column.replace('#', '')) - 1
+                columns = ('Symbol', 'Current Trend', 'Predicted Change', 'Estimated Days', 'Estimated Date', 'Confidence', 'Delete')
+                
+                if col_index < len(columns) and columns[col_index] == 'Delete':
+                    # Get prediction ID
+                    pred_id = self.trend_change_tree.set(item, 'ID')
+                    if pred_id:
+                        try:
+                            pred_id = int(pred_id)
+                            # Confirm deletion
+                            if messagebox.askyesno(
+                                "Delete Prediction",
+                                f"Are you sure you want to delete this trend change prediction?"
+                            ):
+                                # Delete from tracker
+                                if self.trend_change_tracker.delete_prediction(pred_id):
+                                    # Remove from display
+                                    self.trend_change_predictions = [
+                                        p for p in self.trend_change_predictions if p.get('id') != pred_id
+                                    ]
+                                    self._update_trend_change_display()
+                                    messagebox.showinfo("Deleted", "Trend change prediction deleted successfully.")
+                                else:
+                                    messagebox.showwarning("Error", "Could not delete prediction.")
+                        except (ValueError, TypeError) as e:
+                            logger.error(f"Error parsing prediction ID: {e}")
+    
+    def _on_trend_change_tree_motion(self, event):
+        """Handle mouse motion over trend change tree for delete hover effect"""
+        region = self.trend_change_tree.identify_region(event.x, event.y)
+        if region == 'cell':
+            column = self.trend_change_tree.identify_column(event.x)
+            item = self.trend_change_tree.identify_row(event.y)
+            
+            if item and column:
+                col_index = int(column.replace('#', '')) - 1
+                columns = ('Symbol', 'Current Trend', 'Predicted Change', 'Estimated Days', 'Estimated Date', 'Confidence', 'Delete')
+                
+                if col_index < len(columns) and columns[col_index] == 'Delete':
+                    # Remove hover from previous item if any
+                    if hasattr(self, 'hovered_trend_delete_item') and self.hovered_trend_delete_item and self.hovered_trend_delete_item != item:
+                        self._remove_trend_delete_hover(self.hovered_trend_delete_item)
+                    
+                    # Add hover effect to current item
+                    if not hasattr(self, 'hovered_trend_delete_item') or self.hovered_trend_delete_item != item:
+                        self._add_trend_delete_hover(item)
+                        self.hovered_trend_delete_item = item
+                else:
+                    # Not hovering over Delete column, remove hover if any
+                    if hasattr(self, 'hovered_trend_delete_item') and self.hovered_trend_delete_item:
+                        self._remove_trend_delete_hover(self.hovered_trend_delete_item)
+                        self.hovered_trend_delete_item = None
+            else:
+                # No item, remove hover if any
+                if hasattr(self, 'hovered_trend_delete_item') and self.hovered_trend_delete_item:
+                    self._remove_trend_delete_hover(self.hovered_trend_delete_item)
+                    self.hovered_trend_delete_item = None
+        else:
+            # Not in a cell, remove hover if any
+            if hasattr(self, 'hovered_trend_delete_item') and self.hovered_trend_delete_item:
+                self._remove_trend_delete_hover(self.hovered_trend_delete_item)
+                self.hovered_trend_delete_item = None
+    
+    def _on_trend_change_tree_leave(self, event):
+        """Handle mouse leaving trend change tree"""
+        if hasattr(self, 'hovered_trend_delete_item') and self.hovered_trend_delete_item:
+            self._remove_trend_delete_hover(self.hovered_trend_delete_item)
+            self.hovered_trend_delete_item = None
+    
+    def _add_trend_delete_hover(self, item):
+        """Add hover effect to delete cell in trend change tree"""
+        current_tags = list(self.trend_change_tree.item(item, 'tags'))
+        if 'delete_hover' not in current_tags:
+            current_tags.append('delete_hover')
+            self.trend_change_tree.item(item, tags=tuple(current_tags))
+    
+    def _remove_trend_delete_hover(self, item):
+        """Remove hover effect from delete cell in trend change tree"""
+        current_tags = list(self.trend_change_tree.item(item, 'tags'))
+        if 'delete_hover' in current_tags:
+            current_tags.remove('delete_hover')
+            self.trend_change_tree.item(item, tags=tuple(current_tags))
+    
+    def _load_trend_change_predictions(self):
+        """Load trend change predictions from persistent storage"""
+        try:
+            active_predictions = self.trend_change_tracker.get_active_predictions()
+            self.trend_change_predictions = active_predictions
+            # Update display if tab is already created
+            if hasattr(self, 'trend_change_tree'):
+                self._update_trend_change_display()
+            logger.info(f"Loaded {len(active_predictions)} trend change predictions from storage")
+        except Exception as e:
+            logger.error(f"Error loading trend change predictions: {e}")
+            self.trend_change_predictions = []
+    
+    def _refresh_trend_changes(self):
+        """Refresh trend change predictions for current symbol"""
+        if not hasattr(self, 'current_symbol') or not self.current_symbol:
+            messagebox.showinfo("Info", "Please analyze a stock first to generate trend change predictions.")
+            return
+        
+        # Re-analyze current symbol to get fresh predictions
+        self._perform_analysis(self.current_symbol)
     
     def _refresh_predictions(self):
         """Refresh predictions display"""
         self._update_predictions_display()
+    
+    def _on_predictions_tree_click(self, event):
+        """Handle click on predictions tree, specifically for delete column"""
+        # Prevent default selection behavior when clicking Delete column
+        region = self.predictions_tree.identify_region(event.x, event.y)
+        
+        # Debug: log what region was clicked
+        logger.info(f"Click detected - region: {region}, x={event.x}, y={event.y}")
+        
+        if region == 'cell':
+            column = self.predictions_tree.identify_column(event.x)  # Only takes x coordinate
+            item = self.predictions_tree.identify_row(event.y)
+            
+            logger.debug(f"Clicked: column={column}, item={item}")
+            
+            if item and column:
+                # Get column index (column is '#1', '#2', etc. - 1-indexed)
+                # When show='headings', columns start at '#1' (no '#0' tree column)
+                try:
+                    col_num = int(column.replace('#', ''))
+                    col_index = col_num - 1  # Convert to 0-indexed
+                    columns = ('ID', 'Symbol', 'Action', 'Entry', 'Target', 'Target Date', 'Status', 'Result', 'Delete')
+                    
+                    logger.debug(f"Column number: {col_num}, index: {col_index}, total columns: {len(columns)}")
+                    
+                    # Check if clicked on Delete column (should be column #9, index 8)
+                    if col_index >= 0 and col_index < len(columns):
+                        column_name = columns[col_index]
+                        logger.debug(f"Column name: {column_name}")
+                        
+                        if column_name == 'Delete':
+                            # Prevent row selection when clicking delete
+                            self.predictions_tree.selection_remove(self.predictions_tree.selection())
+                            
+                            # Get prediction ID
+                            values = self.predictions_tree.item(item, 'values')
+                            logger.info(f"Delete column clicked! Item values: {values}")
+                            
+                            if len(values) > 0:
+                                pred_id = values[0]
+                                try:
+                                    pred_id = int(pred_id)
+                                    # Confirm deletion
+                                    symbol = values[1] if len(values) > 1 else "Unknown"
+                                    
+                                    logger.info(f"Delete clicked for prediction #{pred_id} ({symbol})")
+                                    
+                                    # Show confirmation dialog
+                                    result = messagebox.askyesno(
+                                        self.localization.t('confirm_delete'),
+                                        f"{self.localization.t('delete_prediction')} #{pred_id} ({symbol})?"
+                                    )
+                                    
+                                    if result:
+                                        logger.info(f"User confirmed deletion of prediction #{pred_id}")
+                                        if self.predictions_tracker.delete_prediction(pred_id):
+                                            self._update_predictions_display()
+                                            messagebox.showinfo(
+                                                self.localization.t('success'),
+                                                f"{self.localization.t('prediction_deleted')} #{pred_id}"
+                                            )
+                                            logger.info(f"Successfully deleted prediction #{pred_id}")
+                                        else:
+                                            logger.error(f"Failed to delete prediction #{pred_id}")
+                                            messagebox.showerror(
+                                                self.localization.t('error'),
+                                                f"Could not delete prediction #{pred_id}"
+                                            )
+                                    else:
+                                        logger.info(f"User cancelled deletion of prediction #{pred_id}")
+                                    
+                                    # Return break to prevent further event processing
+                                    return "break"
+                                except (ValueError, IndexError) as e:
+                                    logger.error(f"Error deleting prediction: {e}", exc_info=True)
+                                    messagebox.showerror(
+                                        self.localization.t('error'),
+                                        f"Error deleting prediction: {str(e)}"
+                                    )
+                            else:
+                                logger.warning(f"No values found for item: {item}")
+                                messagebox.showwarning(
+                                    self.localization.t('warning'),
+                                    "Could not find prediction data. Please try again."
+                                )
+                except (ValueError, IndexError) as e:
+                    logger.error(f"Error parsing column click: {e}", exc_info=True)
+        else:
+            logger.debug(f"Click was not on a cell, region: {region}")
+    
+    def _on_predictions_tree_motion(self, event):
+        """Handle mouse motion over predictions tree for delete hover effect"""
+        region = self.predictions_tree.identify_region(event.x, event.y)
+        if region == 'cell':
+            column = self.predictions_tree.identify_column(event.x)  # Only takes x coordinate
+            item = self.predictions_tree.identify_row(event.y)
+            
+            if item and column:
+                # Get column index (column is '#1', '#2', etc.)
+                col_index = int(column.replace('#', '')) - 1
+                columns = ('ID', 'Symbol', 'Action', 'Entry', 'Target', 'Target Date', 'Status', 'Result', 'Delete')
+                
+                # Check if hovering over Delete column
+                if col_index < len(columns) and columns[col_index] == 'Delete':
+                    # Remove hover from previous item if any
+                    if self.hovered_delete_item and self.hovered_delete_item != item:
+                        self._remove_delete_hover(self.hovered_delete_item)
+                    
+                    # Add hover effect to current item
+                    if self.hovered_delete_item != item:
+                        self._add_delete_hover(item)
+                        self.hovered_delete_item = item
+                else:
+                    # Not hovering over Delete column, remove hover if any
+                    if self.hovered_delete_item:
+                        self._remove_delete_hover(self.hovered_delete_item)
+                        self.hovered_delete_item = None
+            else:
+                # No item, remove hover if any
+                if self.hovered_delete_item:
+                    self._remove_delete_hover(self.hovered_delete_item)
+                    self.hovered_delete_item = None
+        else:
+            # Not in a cell, remove hover if any
+            if self.hovered_delete_item:
+                self._remove_delete_hover(self.hovered_delete_item)
+                self.hovered_delete_item = None
+    
+    def _on_predictions_tree_leave(self, event):
+        """Handle mouse leaving predictions tree"""
+        if self.hovered_delete_item:
+            self._remove_delete_hover(self.hovered_delete_item)
+            self.hovered_delete_item = None
+    
+    def _add_delete_hover(self, item):
+        """Add hover effect to delete cell"""
+        current_tags = list(self.predictions_tree.item(item, 'tags'))
+        if 'delete_hover' not in current_tags:
+            current_tags.append('delete_hover')
+            self.predictions_tree.item(item, tags=tuple(current_tags))
+    
+    def _remove_delete_hover(self, item):
+        """Remove hover effect from delete cell"""
+        current_tags = list(self.predictions_tree.item(item, 'tags'))
+        if 'delete_hover' in current_tags:
+            current_tags.remove('delete_hover')
+            self.predictions_tree.item(item, tags=tuple(current_tags))
     
     def _on_strategy_change(self):
         """Handle strategy change with animation"""
         self.current_strategy = self.strategy_var.get()
         self.preferences.set_strategy(self.current_strategy)
         self._update_strategy_visual_feedback()
+        self._update_ml_status()  # Update ML status for new strategy
         logger.info(f"Strategy changed to: {self.current_strategy}")
+        
+        # Update hybrid predictor for new strategy if needed
+        if self.current_strategy not in self.hybrid_predictors:
+            self.hybrid_predictors[self.current_strategy] = HybridStockPredictor(
+                self.data_dir, self.current_strategy,
+                trading_analyzer=self.trading_analyzer if self.current_strategy == 'trading' else None,
+                investing_analyzer=self.investing_analyzer if self.current_strategy == 'investing' else None,
+                mixed_analyzer=self.mixed_analyzer if self.current_strategy == 'mixed' else None
+            )
     
     def _analyze_stock(self):
         """Analyze a stock based on selected strategy"""
@@ -1039,13 +2717,97 @@ class StockerApp:
             if self.market_scan_cancelled:
                 return
             
-            recommendations = self.market_scanner.scan_market(strategy, max_results=10)
+            recommendations = self.market_scanner.scan_market(
+                strategy, max_results=10, 
+                predictions_tracker=self.predictions_tracker
+            )
             
             if self.market_scan_cancelled:
                 return
             
             processes.append(f"Found {len(recommendations)} recommendations")
             self.root.after(0, lambda: self.loading_screen.update_processes(processes) if self.loading_screen else None)
+            
+            # Generate trend change predictions for scanned stocks
+            if strategy in ['trading', 'mixed']:
+                processes.append("Generating trend change predictions...")
+                self.root.after(0, lambda: self.loading_screen.update_processes(processes) if self.loading_screen else None)
+                
+                trend_predictions_count = 0
+                for rec in recommendations:
+                    if self.market_scan_cancelled:
+                        break
+                    
+                    symbol = rec['symbol']
+                    try:
+                        # Fetch history data for trend change prediction
+                        history_data = self.data_fetcher.fetch_stock_history(symbol, period='3mo')
+                        if not history_data or 'error' in history_data:
+                            continue
+                        
+                        # Perform trading analysis to get indicators
+                        stock_data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=False)
+                        if 'error' in stock_data:
+                            continue
+                        
+                        trading_analysis = self.trading_analyzer.analyze(stock_data, history_data)
+                        if 'error' in trading_analysis:
+                            continue
+                        
+                        if 'indicators' in trading_analysis and 'price_action' in trading_analysis:
+                            # Generate trend change predictions
+                            trend_predictions = self.trend_change_predictor.predict_trend_changes(
+                                symbol,
+                                history_data,
+                                trading_analysis['indicators'],
+                                trading_analysis['price_action']
+                            )
+                            
+                            if trend_predictions:
+                                # Remove old predictions for this symbol (from display)
+                                self.trend_change_predictions = [
+                                    p for p in self.trend_change_predictions if p.get('symbol', '').upper() != symbol.upper()
+                                ]
+                                
+                                # Store predictions
+                                for pred in trend_predictions:
+                                    try:
+                                        stored_pred = self.trend_change_tracker.add_prediction(
+                                            symbol=pred['symbol'],
+                                            current_trend=pred['current_trend'],
+                                            predicted_change=pred['predicted_change'],
+                                            estimated_days=pred['estimated_days'],
+                                            estimated_date=pred['estimated_date'],
+                                            confidence=pred['confidence'],
+                                            reasoning=pred['reasoning'],
+                                            key_indicators=pred.get('key_indicators', {})
+                                        )
+                                        
+                                        # Update the prediction in memory with the stored ID
+                                        pred['id'] = stored_pred['id']
+                                        
+                                        # Add to in-memory list
+                                        self.trend_change_predictions.append(pred)
+                                        
+                                        # Record in learning tracker
+                                        self.learning_tracker.record_trend_change_prediction(
+                                            symbol=pred['symbol'],
+                                            predicted_change=pred['predicted_change'],
+                                            estimated_days=pred['estimated_days'],
+                                            confidence=pred['confidence']
+                                        )
+                                        
+                                        trend_predictions_count += 1
+                                    except Exception as e:
+                                        logger.error(f"Error recording trend change prediction for {symbol}: {e}")
+                    except Exception as e:
+                        logger.error(f"Error generating trend change predictions for {symbol}: {e}")
+                
+                if trend_predictions_count > 0:
+                    processes.append(f"Generated {trend_predictions_count} trend change predictions")
+                    self.root.after(0, lambda: self.loading_screen.update_processes(processes) if self.loading_screen else None)
+                    # Update trend change display
+                    self.root.after(0, self._update_trend_change_display)
             
             # Update UI in main thread
             self.root.after(0, self._display_market_recommendations, recommendations)
@@ -1087,16 +2849,56 @@ class StockerApp:
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.create_window((0, 0), window=scroll_frame, anchor=tk.NW)
         
+        # Mousewheel scrolling handler
+        def on_mousewheel(event):
+            delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
+            if isinstance(delta, (int, float)):
+                scroll_amount = int(-1 * (delta / 120)) * 3
+                canvas.yview_scroll(scroll_amount, "units")
+            return "break"
+        
+        # Bind mousewheel to canvas and all child widgets
+        canvas.bind("<MouseWheel>", on_mousewheel)
+        canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-3, "units") or "break")
+        canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(3, "units") or "break")
+        
+        # Also bind to scroll_frame and all its children
+        def bind_scroll_to_children(parent):
+            parent.bind("<MouseWheel>", on_mousewheel)
+            parent.bind("<Button-4>", lambda e: canvas.yview_scroll(-3, "units") or "break")
+            parent.bind("<Button-5>", lambda e: canvas.yview_scroll(3, "units") or "break")
+            for child in parent.winfo_children():
+                if isinstance(child, (tk.Frame, tk.Label, tk.Button)):
+                    child.bind("<MouseWheel>", on_mousewheel)
+                    child.bind("<Button-4>", lambda e: canvas.yview_scroll(-3, "units") or "break")
+                    child.bind("<Button-5>", lambda e: canvas.yview_scroll(3, "units") or "break")
+                    if isinstance(child, tk.Frame):
+                        bind_scroll_to_children(child)
+        
+        bind_scroll_to_children(scroll_frame)
+        
         # Display each recommendation
         for i, rec in enumerate(recommendations):
             card = ModernCard(scroll_frame, f"{rec['symbol']} - {rec['name']}", theme=theme, padding=15)
             card.pack(fill=tk.X, padx=20, pady=10)
             
-            info_text = f"Price: {self.localization.format_currency(rec['price'])}\n"
+            # Format prices in both USD and EUR
+            price_usd = f"${rec['price']:,.2f}"
+            price_eur = f"€{self.localization.convert_from_usd(rec['price'], 'EUR'):,.2f}"
+            info_text = f"Price: {price_usd} USD / {price_eur} EUR\n"
             info_text += f"Confidence: {rec['confidence']:.1f}%\n"
-            info_text += f"Entry: {self.localization.format_currency(rec['entry_price'])}\n"
-            info_text += f"Target: {self.localization.format_currency(rec['target_price'])}\n"
-            info_text += f"Stop Loss: {self.localization.format_currency(rec['stop_loss'])}\n\n"
+            
+            entry_usd = f"${rec['entry_price']:,.2f}"
+            entry_eur = f"€{self.localization.convert_from_usd(rec['entry_price'], 'EUR'):,.2f}"
+            info_text += f"Entry: {entry_usd} USD / {entry_eur} EUR\n"
+            
+            target_usd = f"${rec['target_price']:,.2f}"
+            target_eur = f"€{self.localization.convert_from_usd(rec['target_price'], 'EUR'):,.2f}"
+            info_text += f"Target: {target_usd} USD / {target_eur} EUR\n"
+            
+            stop_usd = f"${rec['stop_loss']:,.2f}"
+            stop_eur = f"€{self.localization.convert_from_usd(rec['stop_loss'], 'EUR'):,.2f}"
+            info_text += f"Stop Loss: {stop_usd} USD / {stop_eur} EUR\n\n"
             info_text += f"Reasoning: {rec['reasoning']}"
             
             info_label = tk.Label(card.content_frame, text=info_text, bg=theme['card_bg'],
@@ -1108,10 +2910,20 @@ class StockerApp:
                                       command=lambda s=rec['symbol']: self._analyze_symbol_from_rec(s, rec_window),
                                       theme=theme)
             analyze_btn.pack(fill=tk.X, pady=(10, 0))
+            
+            # Bind mousewheel to card and its children
+            card.bind("<MouseWheel>", on_mousewheel)
+            card.content_frame.bind("<MouseWheel>", on_mousewheel)
+            info_label.bind("<MouseWheel>", on_mousewheel)
+            analyze_btn.bind("<MouseWheel>", on_mousewheel)
         
         def configure_scroll(event=None):
             canvas.configure(scrollregion=canvas.bbox("all"))
         scroll_frame.bind('<Configure>', configure_scroll)
+        
+        # Force initial scrollbar update
+        rec_window.update_idletasks()
+        scrollbar._update_slider()
     
     def _analyze_symbol_from_rec(self, symbol: str, window):
         """Analyze a symbol from recommendations window"""
@@ -1157,8 +2969,8 @@ class StockerApp:
             self.root.after(0, lambda: self.loading_screen.update_processes(processes) if self.loading_screen else None)
             self.root.after(0, self._update_status, self.localization.t('fetching_data', symbol=symbol))
             
-            # Fetch stock data
-            stock_data = self.data_fetcher.fetch_stock_data(symbol)
+            # Fetch stock data with cache bypass to ensure fresh price
+            stock_data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=True)
             
             if self.analysis_cancelled:
                 return
@@ -1173,15 +2985,23 @@ class StockerApp:
             
             self.current_symbol = symbol
             self.current_data = stock_data
+            # Log the price we received from the backend
+            logger.info(f"🔍 PRICE DEBUG: Received price from backend for {symbol}: {stock_data.get('price')}")
             
             strategy = self.strategy_var.get()
             
-            # Perform analysis based on strategy
+            # Perform analysis using hybrid AI system
+            processes.append("Analyzing with hybrid AI system...")
+            self.root.after(0, lambda: self.loading_screen.update_processes(processes) if self.loading_screen else None)
+            
+            # Get hybrid predictor for current strategy
+            hybrid_predictor = self.hybrid_predictors[strategy]
+            
             if strategy == "trading":
                 processes.append("Performing technical analysis...")
                 self.root.after(0, lambda: self.loading_screen.update_processes(processes) if self.loading_screen else None)
                 self.root.after(0, self._update_status, self.localization.t('performing_trading_analysis'))
-                analysis = self.trading_analyzer.analyze(stock_data, history_data)
+                analysis = hybrid_predictor.predict(stock_data, history_data, None)
             elif strategy == "mixed":
                 if self.analysis_cancelled:
                     return
@@ -1193,7 +3013,7 @@ class StockerApp:
                 processes.append("Performing mixed analysis...")
                 self.root.after(0, lambda: self.loading_screen.update_processes(processes) if self.loading_screen else None)
                 self.root.after(0, self._update_status, self.localization.t('performing_mixed_analysis'))
-                analysis = self.mixed_analyzer.analyze(stock_data, financials_data, history_data)
+                analysis = hybrid_predictor.predict(stock_data, history_data, financials_data)
             else:  # investing
                 if self.analysis_cancelled:
                     return
@@ -1205,7 +3025,7 @@ class StockerApp:
                 processes.append("Performing fundamental analysis...")
                 self.root.after(0, lambda: self.loading_screen.update_processes(processes) if self.loading_screen else None)
                 self.root.after(0, self._update_status, self.localization.t('performing_fundamental_analysis'))
-                analysis = self.investing_analyzer.analyze(stock_data, financials_data, history_data)
+                analysis = hybrid_predictor.predict(stock_data, history_data, financials_data)
             
             if self.analysis_cancelled:
                 return
@@ -1215,8 +3035,97 @@ class StockerApp:
             
             self.current_analysis = analysis
             
+            # Check for momentum/trend changes (for currently analyzed stock)
+            # For trading strategy, we have full indicator data
+            trading_analysis_for_trend = None
+            if strategy == "trading" and 'indicators' in analysis and 'price_action' in analysis and 'momentum_analysis' in analysis:
+                trading_analysis_for_trend = analysis
+                momentum_changes = self.momentum_monitor.update_momentum_state(
+                    symbol,
+                    analysis['indicators'],
+                    analysis['price_action'],
+                    analysis['momentum_analysis']
+                )
+                
+                # Show notification if significant changes detected
+                if momentum_changes.get('trend_reversed') or (momentum_changes.get('momentum_changed') and len(momentum_changes.get('changes', [])) > 0):
+                    self.root.after(0, self._show_momentum_change_notification, symbol, momentum_changes)
+            
+            # For mixed strategy, we need to get technical indicators separately
+            elif strategy == "mixed":
+                try:
+                    # Perform trading analysis to get indicators for momentum monitoring
+                    trading_analysis = self.trading_analyzer.analyze(stock_data, history_data)
+                    trading_analysis_for_trend = trading_analysis
+                    if 'indicators' in trading_analysis and 'price_action' in trading_analysis and 'momentum_analysis' in trading_analysis:
+                        momentum_changes = self.momentum_monitor.update_momentum_state(
+                            symbol,
+                            trading_analysis['indicators'],
+                            trading_analysis['price_action'],
+                            trading_analysis['momentum_analysis']
+                        )
+                        
+                        # Show notification if significant changes detected
+                        if momentum_changes.get('trend_reversed') or (momentum_changes.get('momentum_changed') and len(momentum_changes.get('changes', [])) > 0):
+                            self.root.after(0, self._show_momentum_change_notification, symbol, momentum_changes)
+                except Exception as e:
+                    logger.debug(f"Could not check momentum for mixed strategy: {e}")
+            
+            # Generate trend change predictions
+            if trading_analysis_for_trend and 'indicators' in trading_analysis_for_trend and 'price_action' in trading_analysis_for_trend:
+                try:
+                    trend_predictions = self.trend_change_predictor.predict_trend_changes(
+                        symbol,
+                        history_data,
+                        trading_analysis_for_trend['indicators'],
+                        trading_analysis_for_trend['price_action']
+                    )
+                    # Store predictions and update display
+                    if trend_predictions:
+                        # Remove old predictions for this symbol (from display)
+                        self.trend_change_predictions = [
+                            p for p in self.trend_change_predictions if p['symbol'] != symbol.upper()
+                        ]
+                        
+                        # Add new predictions to display
+                        self.trend_change_predictions.extend(trend_predictions)
+                        
+                        # Record predictions in tracker for learning system
+                        for pred in trend_predictions:
+                            try:
+                                stored_pred = self.trend_change_tracker.add_prediction(
+                                    symbol=pred['symbol'],
+                                    current_trend=pred['current_trend'],
+                                    predicted_change=pred['predicted_change'],
+                                    estimated_days=pred['estimated_days'],
+                                    estimated_date=pred['estimated_date'],
+                                    confidence=pred['confidence'],
+                                    reasoning=pred['reasoning'],
+                                    key_indicators=pred.get('key_indicators', {})
+                                )
+                                
+                                # Update the prediction in memory with the stored ID
+                                pred['id'] = stored_pred['id']
+                                
+                                # Record in learning tracker
+                                self.learning_tracker.record_trend_change_prediction(
+                                    symbol=pred['symbol'],
+                                    predicted_change=pred['predicted_change'],
+                                    estimated_days=pred['estimated_days'],
+                                    confidence=pred['confidence']
+                                )
+                                
+                                logger.info(f"📊 Recorded trend change prediction #{stored_pred['id']} for {symbol}")
+                            except Exception as e:
+                                logger.error(f"Error recording trend change prediction: {e}")
+                        
+                        # Update display
+                        self.root.after(0, self._update_trend_change_display)
+                except Exception as e:
+                    logger.error(f"Error generating trend change predictions: {e}")
+            
             # Update UI in main thread
-            self.root.after(0, self._display_analysis, analysis, history_data)
+            self.root.after(0, self._display_analysis, analysis, history_data, symbol)
             
         except Exception as e:
             if not self.analysis_cancelled:
@@ -1233,8 +3142,18 @@ class StockerApp:
         theme = self.theme_manager.get_theme()
         self.results_title.config(text=message, fg=theme['accent'])
     
-    def _display_analysis(self, analysis: dict, history_data: dict):
-        """Display analysis results with animations"""
+    def _display_analysis(self, analysis: dict, history_data: dict, symbol: str = None):
+        """Display analysis results with animations
+        
+        Args:
+            analysis: Analysis results dictionary
+            history_data: Historical price data
+            symbol: Stock symbol (if None, uses self.current_symbol)
+        """
+        # Use provided symbol or fall back to current_symbol
+        if symbol is None:
+            symbol = self.current_symbol
+        
         if 'error' in analysis:
             self.analysis_text.delete(1.0, tk.END)
             self.analysis_text.insert(tk.END, f"Error: {analysis['error']}")
@@ -1249,10 +3168,177 @@ class StockerApp:
         action = recommendation.get('action', 'HOLD')
         confidence = recommendation.get('confidence', 0)
         
+        # Add stock to monitoring system (track all analyzed stocks)
+        if self.current_symbol:
+            self.stock_monitor.add_stock(
+                self.current_symbol, 
+                action, 
+                self.strategy_var.get(),
+                confidence
+            )
+        
+        # Automatically save prediction if it's a BUY or SELL recommendation
+        if action in ['BUY', 'SELL'] and symbol:
+            entry_price = recommendation.get('entry_price', 0)
+            target_price = recommendation.get('target_price', 0)
+            stop_loss = recommendation.get('stop_loss', 0)
+            
+            # Only save if we have valid prices
+            if entry_price > 0 and target_price > 0:
+                # Check if this prediction already exists (same symbol with active prediction)
+                # Replace if action contrasts (BUY vs SELL or vice versa)
+                strategy = self.strategy_var.get()
+                existing = None
+                for pred in self.predictions_tracker.predictions:
+                    if (pred['symbol'] == symbol.upper() and 
+                        pred['status'] == 'active'):
+                        # Found an active prediction for this symbol
+                        existing = pred
+                        break
+                
+                # Calculate estimated days based on strategy
+                if strategy == "trading":
+                    estimated_days = 10  # Short-term: ~10 days
+                elif strategy == "mixed":
+                    estimated_days = 21  # Medium-term: ~3 weeks
+                else:  # investing
+                    estimated_days = 547  # Long-term: ~1.5 years
+                
+                if existing:
+                    old_action = existing.get('action', 'HOLD')
+                    # Check if actions contrast (BUY vs SELL or SELL vs BUY)
+                    actions_contrast = (
+                        (old_action == 'BUY' and action == 'SELL') or
+                        (old_action == 'SELL' and action == 'BUY') or
+                        (old_action != action)  # Also update if action changed in any way
+                    )
+                    
+                    # Update existing prediction (always update, but log if contrasting)
+                    existing['action'] = action  # Update action
+                    existing['entry_price'] = entry_price
+                    existing['target_price'] = target_price
+                    existing['stop_loss'] = stop_loss
+                    existing['confidence'] = confidence
+                    existing['reasoning'] = reasoning
+                    existing['strategy'] = strategy  # Update strategy if changed
+                    existing['timestamp'] = datetime.now().isoformat()
+                    # Update estimated target date
+                    from datetime import timedelta
+                    existing['estimated_days'] = estimated_days
+                    existing['estimated_target_date'] = (datetime.now() + timedelta(days=estimated_days)).isoformat()
+                    self.predictions_tracker.save()
+                    
+                    if actions_contrast:
+                        logger.info(f"Replaced contrasting prediction for {symbol}: {old_action} → {action}")
+                    else:
+                        logger.info(f"Updated existing prediction for {symbol}")
+                else:
+                    # Create new prediction
+                    prediction = self.predictions_tracker.add_prediction(
+                        symbol, strategy, action, entry_price,
+                        target_price, stop_loss, confidence, reasoning, estimated_days
+                    )
+                    logger.info(f"Auto-saved prediction #{prediction['id']} for {symbol} (target date: {prediction.get('estimated_target_date', 'N/A')})")
+                    
+                    # Add to monitoring (already added above, but ensure it's updated)
+                    self.stock_monitor.add_stock(symbol, action, strategy, confidence)
+                    
+                    # Record learning event
+                    self.learning_tracker.record_manual_analysis(symbol)
+                
+                # Update predictions display
+                self._update_predictions_display()
+                
+                # Trigger background training on this stock's historical data
+                self._train_on_stock_background(symbol, strategy)
+        
         theme = self.theme_manager.get_theme()
+        
+        # Get recommendation details
+        recommendation = analysis.get('recommendation', {})
+        entry_price = recommendation.get('entry_price', 0)
+        target_price = recommendation.get('target_price', 0)
+        stop_loss = recommendation.get('stop_loss', 0)
+        
+        # Calculate estimated days based on strategy
+        strategy = self.strategy_var.get()
+        if strategy == "trading":
+            estimated_days = 10  # Short-term: ~10 days
+        elif strategy == "mixed":
+            estimated_days = 21  # Medium-term: ~3 weeks
+        else:  # investing
+            estimated_days = 547  # Long-term: ~1.5 years
+        
+        # Calculate target date
+        from datetime import timedelta
+        target_date = datetime.now() + timedelta(days=estimated_days)
+        target_date_str = target_date.strftime("%Y-%m-%d")
+        
+        # Get current price for display
+        # Use the price from stock_data that was just fetched during analysis (most recent)
+        current_price_display = None
+        try:
+            # First, try to use the price from the stock_data that was just fetched
+            # This is the most current since it was fetched right before analysis
+            if hasattr(self, 'current_data') and self.current_data and 'price' in self.current_data:
+                current_price_display = self.current_data.get('price', 0)
+                logger.info(f"🔍 PRICE DEBUG: Using price from current_data: {current_price_display} (raw value)")
+            
+            # If not available, fetch fresh data with cache bypass
+            if not current_price_display or current_price_display <= 0:
+                symbol_to_fetch = symbol or self.current_symbol
+                if symbol_to_fetch:
+                    logger.debug(f"Fetching fresh price for {symbol_to_fetch} (bypassing cache)")
+                    current_stock_data = self.data_fetcher.fetch_stock_data(symbol_to_fetch, force_refresh=True)
+                    current_price_display = current_stock_data.get('price', 0)
+                    # Update current_data with fresh price
+                    if current_stock_data and 'price' in current_stock_data:
+                        if not hasattr(self, 'current_data') or not self.current_data:
+                            self.current_data = {}
+                        self.current_data['price'] = current_price_display
+                        logger.debug(f"Updated current_data with fresh price: {current_price_display}")
+        except Exception as e:
+            logger.error(f"Could not fetch current price for display: {e}")
+            # Fallback to price from recommendation if available
+            if not current_price_display:
+                current_price_display = recommendation.get('entry_price', 0)
+                logger.debug(f"Using fallback price from recommendation: {current_price_display}")
         
         header = f"{'='*60}\n"
         header += f"RECOMMENDATION: {action} (Confidence: {confidence}%)\n"
+        header += f"{'='*60}\n\n"
+        
+        # Display current market price in both USD and EUR
+        if current_price_display and current_price_display > 0:
+            # Format in USD (always show USD first as it's the base currency)
+            price_usd = f"${current_price_display:,.2f}"
+            # Convert to EUR
+            price_eur = self.localization.convert_from_usd(current_price_display, 'EUR')
+            price_eur_formatted = f"€{price_eur:,.2f}"
+            logger.info(f"🔍 PRICE DEBUG: Displaying price - Raw: {current_price_display}, USD: {price_usd}, EUR: {price_eur_formatted}")
+            header += f"📊 CURRENT MARKET PRICE:\n"
+            header += f"   {price_usd} USD / {price_eur_formatted} EUR\n\n"
+        
+        # Add prediction details (show in both USD and EUR)
+        if action in ['BUY', 'SELL'] and entry_price > 0 and target_price > 0:
+            header += f"📊 PREDICTION DETAILS:\n"
+            # Format entry price
+            entry_usd = f"${entry_price:,.2f}"
+            entry_eur = f"€{self.localization.convert_from_usd(entry_price, 'EUR'):,.2f}"
+            header += f"   Entry Price: {entry_usd} USD / {entry_eur} EUR\n"
+            # Format target price
+            target_usd = f"${target_price:,.2f}"
+            target_eur = f"€{self.localization.convert_from_usd(target_price, 'EUR'):,.2f}"
+            header += f"   Target Price: {target_usd} USD / {target_eur} EUR\n"
+            # Format stop loss
+            stop_usd = f"${stop_loss:,.2f}"
+            stop_eur = f"€{self.localization.convert_from_usd(stop_loss, 'EUR'):,.2f}"
+            header += f"   Stop Loss: {stop_usd} USD / {stop_eur} EUR\n"
+            header += f"   Estimated Days to Target: {estimated_days} days\n"
+            header += f"   Estimated Target Date: {target_date_str}\n\n"
+        
+        header += f"{'='*60}\n"
+        header += f"ANALYSIS:\n"
         header += f"{'='*60}\n\n"
         
         self.analysis_text.insert(tk.END, header)
@@ -1264,14 +3350,122 @@ class StockerApp:
                                      foreground=theme['accent'])
         
         # Update title with animation
-        symbol = self.current_symbol or "Stock"
-        self._fade_title(f"{symbol} - Analysis Results")
+        display_symbol = symbol or self.current_symbol or "Stock"
+        self._fade_title(f"{display_symbol} - Analysis Results")
         
         # Generate and display charts
         self._display_charts(history_data, analysis.get('indicators', {}))
         
         # Store for potential calculation
         self.current_analysis = analysis
+    
+    def _train_on_stock_background(self, symbol: str, strategy: str):
+        """Train ML model on a specific stock's historical data in the background"""
+        if not symbol:
+            return
+        
+        def train_in_background():
+            try:
+                logger.info(f"🔄 Starting background training on {symbol} for {strategy} strategy...")
+                
+                # Calculate date range (use last 5 years for training)
+                from datetime import datetime, timedelta
+                end_date = datetime.now().strftime('%Y-%m-%d')
+                start_date = (datetime.now() - timedelta(days=5*365)).strftime('%Y-%m-%d')
+                
+                # Generate training samples for this stock
+                try:
+                    # Determine lookforward_days based on strategy
+                    if strategy == "trading":
+                        lookforward_days = 10
+                    elif strategy == "investing":
+                        lookforward_days = 547  # ~1.5 years
+                    else:  # mixed
+                        lookforward_days = 21  # ~3 weeks
+                    
+                    # Generate training samples
+                    training_samples = self.training_manager.data_generator.generate_training_samples(
+                        symbol, start_date, end_date, strategy, lookforward_days
+                    )
+                    
+                    if len(training_samples) < 50:
+                        logger.info(f"⚠️ Insufficient training samples for {symbol}: {len(training_samples)} < 50. "
+                                  f"Data will be used in next full training cycle.")
+                        return
+                    
+                    logger.info(f"✅ Generated {len(training_samples)} training samples for {symbol}")
+                    
+                    # Load existing ML model
+                    from ml_training import StockPredictionML
+                    ml_model = StockPredictionML(self.data_dir, strategy)
+                    
+                    # If model exists, we can do incremental training
+                    # Otherwise, we need at least 100 samples to train a new model
+                    if ml_model.is_trained():
+                        # Model exists - we can do incremental training
+                        # For now, we'll retrain with existing + new data
+                        # In the future, we could implement true incremental learning
+                        logger.info(f"🔄 Model exists for {strategy}, preparing for incremental update...")
+                        
+                        # Check if we have enough samples to retrain
+                        # We need at least 100 samples total, so if this stock alone has 100+, we can retrain
+                        if len(training_samples) >= 100:
+                            logger.info(f"✅ Enough samples ({len(training_samples)}) to retrain model on {symbol}")
+                            result = ml_model.train(training_samples)
+                            
+                            if 'error' not in result:
+                                test_acc = result.get('test_accuracy', 0) * 100
+                                train_acc = result.get('train_accuracy', 0) * 100
+                                logger.info(f"✅ Model retrained on {symbol}! "
+                                          f"Train: {train_acc:.1f}%, Test: {test_acc:.1f}%")
+                                
+                                # Record learning event
+                                self.learning_tracker.record_background_training(
+                                    symbol, len(training_samples), strategy, True
+                                )
+                                
+                                # Update ML status in UI
+                                self.root.after(0, self._update_ml_status)
+                            else:
+                                logger.warning(f"⚠️ Retraining failed: {result.get('error')}")
+                        else:
+                            logger.info(f"📊 {len(training_samples)} samples from {symbol} - "
+                                      f"will be combined with other stocks in next full training")
+                    else:
+                        # No model exists yet - need at least 100 samples to train
+                        if len(training_samples) >= 100:
+                            logger.info(f"✅ Training new model on {symbol} ({len(training_samples)} samples)...")
+                            result = ml_model.train(training_samples)
+                            
+                            if 'error' not in result:
+                                test_acc = result.get('test_accuracy', 0) * 100
+                                train_acc = result.get('train_accuracy', 0) * 100
+                                logger.info(f"✅ New model trained on {symbol}! "
+                                          f"Train: {train_acc:.1f}%, Test: {test_acc:.1f}%")
+                                
+                                # Record learning event
+                                self.learning_tracker.record_background_training(
+                                    symbol, len(training_samples), strategy, True
+                                )
+                                
+                                # Update ML status in UI
+                                self.root.after(0, self._update_ml_status)
+                            else:
+                                logger.warning(f"⚠️ Training failed: {result.get('error')}")
+                        else:
+                            logger.info(f"📊 {len(training_samples)} samples from {symbol} - "
+                                      f"need {100 - len(training_samples)} more to train new model")
+                    
+                except Exception as e:
+                    logger.warning(f"Error generating training samples for {symbol}: {e}")
+                    
+            except Exception as e:
+                logger.error(f"Error in background training for {symbol}: {e}")
+        
+        # Run in background thread (non-blocking)
+        thread = threading.Thread(target=train_in_background)
+        thread.daemon = True
+        thread.start()
     
     def _fade_title(self, new_text: str):
         """Animate title change"""
@@ -1316,17 +3510,102 @@ class StockerApp:
             messagebox.showerror(self.localization.t('input_error'), f"{self.localization.t('input_error')}: {str(e)}")
             return
         
+        # Fetch CURRENT price (not the price from when analysis was done)
+        # Force refresh to get the latest price, not cached data
+        symbol = self.current_symbol or "UNKNOWN"
+        try:
+            current_stock_data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=True)
+            current_price_usd = current_stock_data.get('price', 0)
+            if current_price_usd <= 0:
+                raise ValueError("Could not fetch current price")
+        except Exception as e:
+            logger.error(f"Error fetching current price: {e}")
+            messagebox.showerror(self.localization.t('error'), 
+                               f"Could not fetch current price for {symbol}. Using analysis price.")
+            current_price_usd = None
+        
         recommendation = self.current_analysis.get('recommendation', {})
         action = recommendation.get('action', 'HOLD')
-        entry_price = recommendation.get('entry_price', 0)
-        target_price = recommendation.get('target_price', 0)
-        stop_loss = recommendation.get('stop_loss', 0)
+        
+        # Use current price as entry if available, otherwise use recommendation entry price
+        if current_price_usd and current_price_usd > 0:
+            entry_price = current_price_usd
+            # Adjust target and stop loss proportionally based on price change
+            old_entry = recommendation.get('entry_price', current_price_usd)
+            if old_entry > 0:
+                price_ratio = current_price_usd / old_entry
+                target_price = recommendation.get('target_price', current_price_usd) * price_ratio
+                stop_loss = recommendation.get('stop_loss', current_price_usd) * price_ratio
+            else:
+                target_price = recommendation.get('target_price', current_price_usd)
+                stop_loss = recommendation.get('stop_loss', current_price_usd)
+        else:
+            entry_price = recommendation.get('entry_price', 0)
+            target_price = recommendation.get('target_price', 0)
+            stop_loss = recommendation.get('stop_loss', 0)
         
         if entry_price <= 0:
             messagebox.showwarning(self.localization.t('warning'), self.localization.t('warning'))
             return
         
-        symbol = self.current_symbol or "UNKNOWN"
+        # Validate targets haven't already been reached
+        strategy = self.strategy_var.get()
+        if action == "BUY" and current_price_usd >= target_price:
+            # Target already reached - recalculate new target
+            if strategy == "trading":
+                target_price = current_price_usd * 1.03
+            elif strategy == "mixed":
+                target_price = current_price_usd * 1.06
+            else:  # investing
+                target_price = current_price_usd * 1.12
+            
+            messagebox.showwarning(
+                self.localization.t('warning'),
+                f"⚠️ Target already reached!\n"
+                f"Current: {self.localization.format_currency(current_price_usd)}\n"
+                f"Old Target: {self.localization.format_currency(recommendation.get('target_price', 0))}\n"
+                f"New Target: {self.localization.format_currency(target_price)}"
+            )
+        
+        elif action == "SELL" and current_price_usd <= target_price:
+            # Target already reached - recalculate new target
+            if strategy == "trading":
+                target_price = current_price_usd * 0.97
+            elif strategy == "mixed":
+                target_price = current_price_usd * 0.94
+            else:  # investing
+                target_price = current_price_usd * 0.88
+            
+            messagebox.showwarning(
+                self.localization.t('warning'),
+                f"⚠️ Target already reached!\n"
+                f"Current: {self.localization.format_currency(current_price_usd)}\n"
+                f"Old Target: {self.localization.format_currency(recommendation.get('target_price', 0))}\n"
+                f"New Target: {self.localization.format_currency(target_price)}"
+            )
+        
+        # Check if HOLD recommendation (needs special handling)
+        is_hold_recommendation = (action == 'HOLD')
+        
+        # For HOLD recommendations, calculate as BUY scenario for hypothetical analysis
+        # Determine if it's a bullish or bearish HOLD based on target vs entry
+        if is_hold_recommendation:
+            # If target is above entry, treat as bullish (BUY scenario)
+            # If target is below entry, treat as bearish (SELL scenario)
+            # If all prices are the same, use 5% up/down hypothetical
+            if entry_price == target_price == stop_loss:
+                # All prices same - use hypothetical 5% up/down
+                current_price = entry_price
+                target_price = current_price * 1.05  # 5% target
+                stop_loss = current_price * 0.95     # 5% stop loss
+                action = 'BUY'  # Use BUY for hypothetical calculation
+            elif target_price > entry_price:
+                # Target above entry - bullish HOLD, calculate as BUY
+                action = 'BUY'
+            else:
+                # Target below entry - bearish HOLD, calculate as SELL
+                action = 'SELL'
+        
         potential = self.portfolio.calculate_potential_trade(
             symbol, budget, entry_price, target_price, stop_loss, action
         )
@@ -1340,16 +3619,175 @@ class StockerApp:
         output = f"{'='*60}\n"
         output += f"{self.localization.t('potential_trade')} - {potential['symbol']}\n"
         output += f"{'='*60}\n\n"
-        output += f"{self.localization.t('action')}: {potential['action']}\n"
+        
+        # Add HOLD warning if applicable
+        if is_hold_recommendation:
+            output += f"⚠️ {self.localization.t('hold_no_trade')}\n"
+            output += f"{self.localization.t('hold_explanation')}\n\n"
+            output += f"{self.localization.t('hypothetical_scenario')}\n"
+            output += f"{'='*60}\n\n"
+        
+        # Add current price display in both USD and EUR
+        output += f"📊 CURRENT MARKET PRICE:\n"
+        if current_price_usd and current_price_usd > 0:
+            # Format in USD (always show USD first as it's the base currency)
+            price_usd_str = f"${current_price_usd:,.2f}"
+            # Convert to EUR
+            price_eur = self.localization.convert_from_usd(current_price_usd, 'EUR')
+            price_eur_str = f"€{price_eur:,.2f}"
+            output += f"   Current Price: {price_usd_str} USD / {price_eur_str} EUR\n"
+            price_change = ((current_price_usd - entry_price) / entry_price * 100) if entry_price > 0 else 0
+            if abs(price_change) > 0.01:
+                change_symbol = "📈" if price_change > 0 else "📉"
+                output += f"   {change_symbol} Change from Entry: {price_change:+.2f}%\n"
+        else:
+            # Fallback: show entry price in both currencies
+            price_usd_str = f"${entry_price:,.2f}"
+            price_eur = self.localization.convert_from_usd(entry_price, 'EUR')
+            price_eur_str = f"€{price_eur:,.2f}"
+            output += f"   Current Price: {price_usd_str} USD / {price_eur_str} EUR (from analysis)\n"
+        output += "\n"
+        
+        # Check for existing prediction for this stock (exclude HOLD/AVOID as they're not actionable)
+        symbol_upper = symbol.upper()
+        
+        # First, clean up any invalid HOLD/AVOID predictions for this symbol
+        cleaned = False
+        for pred in self.predictions_tracker.predictions:
+            if (pred.get('symbol', '').upper() == symbol_upper 
+                and pred.get('status') == 'active'
+                and pred.get('action') in ['HOLD', 'AVOID']):
+                # Mark invalid HOLD/AVOID predictions as expired
+                pred['status'] = 'expired'
+                cleaned = True
+                logger.debug(f"Cleaned up invalid {pred.get('action')} prediction for {symbol}")
+            elif (pred.get('symbol', '').upper() == symbol_upper 
+                  and pred.get('status') == 'active'
+                  and pred.get('action') in ['BUY', 'SELL']
+                  and pred.get('entry_price', 0) > 0
+                  and abs(pred.get('target_price', 0) - pred.get('entry_price', 0)) < 0.01):
+                # Mark predictions with same entry/target as expired
+                pred['status'] = 'expired'
+                cleaned = True
+                logger.debug(f"Cleaned up invalid prediction with same entry/target for {symbol}")
+        
+        if cleaned:
+            self.predictions_tracker.save()
+        
+        # Now get only valid actionable predictions
+        active_predictions = [
+            p for p in self.predictions_tracker.predictions 
+            if p.get('symbol', '').upper() == symbol_upper 
+            and p.get('status') == 'active'
+            and p.get('action') in ['BUY', 'SELL']  # Only show actionable predictions
+            and p.get('entry_price', 0) > 0
+            and abs(p.get('target_price', 0) - p.get('entry_price', 0)) >= 0.01  # Entry and target must be different
+        ]
+        
+        if active_predictions:
+            # Get the most recent active prediction
+            latest_prediction = max(active_predictions, key=lambda p: p.get('timestamp', ''))
+            pred_action = latest_prediction.get('action', 'HOLD')
+            pred_target = latest_prediction.get('target_price', 0)
+            pred_entry = latest_prediction.get('entry_price', 0)
+            pred_estimated_date = latest_prediction.get('estimated_target_date')
+            pred_estimated_days = latest_prediction.get('estimated_days', 0)
+            pred_confidence = latest_prediction.get('confidence', 0)
+            
+            # Skip if entry and target are the same (invalid prediction)
+            if pred_entry > 0 and abs(pred_target - pred_entry) < 0.01:
+                logger.debug(f"Skipping invalid prediction for {symbol}: entry and target are the same")
+            else:
+                output += f"🤖 ACTIVE PREDICTION FOUND:\n"
+                output += f"   Action: {pred_action}\n"
+                # Format entry price in both currencies
+                pred_entry_usd = f"${pred_entry:,.2f}"
+                pred_entry_eur = f"€{self.localization.convert_from_usd(pred_entry, 'EUR'):,.2f}"
+                output += f"   Entry Price: {pred_entry_usd} USD / {pred_entry_eur} EUR\n"
+                # Format target price in both currencies
+                pred_target_usd = f"${pred_target:,.2f}"
+                pred_target_eur = f"€{self.localization.convert_from_usd(pred_target, 'EUR'):,.2f}"
+                output += f"   Target Price: {pred_target_usd} USD / {pred_target_eur} EUR\n"
+                output += f"   Confidence: {pred_confidence:.1f}%\n"
+                
+                if pred_estimated_date:
+                    try:
+                        from datetime import datetime
+                        target_date = datetime.fromisoformat(pred_estimated_date)
+                        now = datetime.now()
+                        days_remaining = (target_date - now).days
+                        
+                        if days_remaining > 0:
+                            output += f"   📅 Estimated Target Date: {target_date.strftime('%Y-%m-%d')}\n"
+                            output += f"   ⏰ Days Remaining: {days_remaining} days\n"
+                            
+                            # Calculate expected price movement (show in both currencies)
+                            if current_price_usd and current_price_usd > 0:
+                                if pred_action == "BUY":
+                                    price_diff = pred_target - current_price_usd
+                                    price_change_pct = (price_diff / current_price_usd) * 100
+                                    price_diff_usd = f"${price_diff:,.2f}"
+                                    price_diff_eur = f"€{self.localization.convert_from_usd(price_diff, 'EUR'):,.2f}"
+                                    output += f"   📈 Expected Rise: {price_diff_usd} USD / {price_diff_eur} EUR ({price_change_pct:+.2f}%)\n"
+                                elif pred_action == "SELL":
+                                    price_diff = current_price_usd - pred_target
+                                    price_change_pct = (price_diff / current_price_usd) * 100
+                                    price_diff_usd = f"${price_diff:,.2f}"
+                                    price_diff_eur = f"€{self.localization.convert_from_usd(price_diff, 'EUR'):,.2f}"
+                                    output += f"   📉 Expected Fall: {price_diff_usd} USD / {price_diff_eur} EUR ({price_change_pct:+.2f}%)\n"
+                        else:
+                            output += f"   ⚠️ Target date passed ({abs(days_remaining)} days ago)\n"
+                    except Exception as e:
+                        logger.debug(f"Error parsing estimated date: {e}")
+                elif pred_estimated_days:
+                    from datetime import datetime, timedelta
+                    target_date = datetime.now() + timedelta(days=pred_estimated_days)
+                    output += f"   📅 Estimated Target Date: {target_date.strftime('%Y-%m-%d')}\n"
+                    output += f"   ⏰ Days Remaining: {pred_estimated_days} days\n"
+                
+                output += "\n"
+        
+        # Show the calculated action (BUY/SELL) for the scenario
+        output += f"{'='*60}\n"
+        output += f"TRADE CALCULATION:\n"
+        output += f"{'='*60}\n\n"
+        # For HOLD recommendations, clarify that this is hypothetical
+        action_display = potential['action']
+        if is_hold_recommendation:
+            action_display = f"{action_display} (Hypothetical - Original Recommendation: HOLD)"
+        output += f"{self.localization.t('action')}: {action_display}\n"
         output += f"{self.localization.t('shares')}: {potential['shares']}\n"
-        output += f"{self.localization.t('budget_used')}: {self.localization.format_currency(potential['budget_used'])}\n\n"
-        output += f"{self.localization.t('entry_price')}: {self.localization.format_currency(potential['entry_price'])}\n"
-        output += f"{self.localization.t('target_price')}: {self.localization.format_currency(potential['target_price'])}\n"
-        output += f"{self.localization.t('stop_loss')}: {self.localization.format_currency(potential['stop_loss'])}\n\n"
-        output += f"{self.localization.t('potential_win')}: {self.localization.format_currency(potential['potential_win'])} "
-        output += f"({potential['potential_win_percent']:.2f}%)\n"
-        output += f"{self.localization.t('potential_loss')}: {self.localization.format_currency(potential['potential_loss'])} "
-        output += f"({potential['potential_loss_percent']:.2f}%)\n\n"
+        
+        # Format budget used in both currencies
+        budget_usd = f"${potential['budget_used']:,.2f}"
+        budget_eur = f"€{self.localization.convert_from_usd(potential['budget_used'], 'EUR'):,.2f}"
+        output += f"{self.localization.t('budget_used')}: {budget_usd} USD / {budget_eur} EUR\n\n"
+        
+        # Format entry price in both currencies
+        entry_usd = f"${potential['entry_price']:,.2f}"
+        entry_eur = f"€{self.localization.convert_from_usd(potential['entry_price'], 'EUR'):,.2f}"
+        output += f"{self.localization.t('entry_price')}: {entry_usd} USD / {entry_eur} EUR\n"
+        
+        # Format target price in both currencies
+        target_usd = f"${potential['target_price']:,.2f}"
+        target_eur = f"€{self.localization.convert_from_usd(potential['target_price'], 'EUR'):,.2f}"
+        output += f"{self.localization.t('target_price')}: {target_usd} USD / {target_eur} EUR\n"
+        
+        # Format stop loss in both currencies
+        stop_usd = f"${potential['stop_loss']:,.2f}"
+        stop_eur = f"€{self.localization.convert_from_usd(potential['stop_loss'], 'EUR'):,.2f}"
+        output += f"{self.localization.t('stop_loss')}: {stop_usd} USD / {stop_eur} EUR\n\n"
+        
+        # Format potential win in both currencies
+        win_usd = f"${potential['potential_win']:,.2f}"
+        win_eur = f"€{self.localization.convert_from_usd(potential['potential_win'], 'EUR'):,.2f}"
+        output += f"{self.localization.t('potential_win')}: {win_usd} USD / {win_eur} EUR ({potential['potential_win_percent']:.2f}%)\n"
+        
+        # Format potential loss in both currencies
+        loss_usd = f"${potential['potential_loss']:,.2f}"
+        loss_eur = f"€{self.localization.convert_from_usd(potential['potential_loss'], 'EUR'):,.2f}"
+        output += f"{self.localization.t('potential_loss')}: {loss_usd} USD / {loss_eur} EUR ({potential['potential_loss_percent']:.2f}%)\n\n"
+        
         output += f"{self.localization.t('risk_reward_ratio')}: {potential['risk_reward_ratio']:.2f}\n"
         
         self.potential_text.delete(1.0, tk.END)
@@ -1367,15 +3805,22 @@ class StockerApp:
         ttk.Label(dialog, text=f"{self.localization.t('initial_balance')} ({currency_symbol}):").pack(pady=10)
         balance_entry = ttk.Entry(dialog, width=20)
         balance_entry.pack(pady=5)
-        balance_entry.insert(0, str(self.portfolio.balance))
+        # Display current balance in user's selected currency
+        current_balance_display = self.localization.convert_from_usd(self.portfolio.balance)
+        balance_entry.insert(0, str(current_balance_display))
         balance_entry.focus()
         
         def save_balance():
             try:
-                balance = float(balance_entry.get())
-                if balance < 0:
+                balance_input = float(balance_entry.get())
+                if balance_input < 0:
                     raise ValueError(self.localization.t('balance_must_positive'))
-                self.portfolio.set_balance(balance)
+                
+                # Convert the input from current currency to USD before storing
+                # Portfolio always stores balance in USD (base currency)
+                balance_usd = self.localization.convert_to_usd(balance_input, self.localization.currency)
+                
+                self.portfolio.set_balance(balance_usd)
                 self._update_portfolio_display()
                 dialog.destroy()
                 messagebox.showinfo(self.localization.t('success'), self.localization.t('balance_updated'))
@@ -1394,11 +3839,1524 @@ class StockerApp:
                                      f"{self.localization.t('win_rate')}: {stats['win_rate']:.1f}%",
                                fg=theme['text_secondary'])
     
+    def _close_app(self):
+        """Close the application"""
+        self.root.quit()
+        self.root.destroy()
+    
     def _show_error(self, message: str):
         """Show error message"""
         theme = self.theme_manager.get_theme()
         messagebox.showerror(self.localization.t('error'), message)
         self.results_title.config(text=self.localization.t('stock_analysis_results'), fg=theme['fg'])
+    
+    def _update_ml_status(self):
+        """Update ML training status with detailed stats"""
+        theme = self.theme_manager.get_theme()
+        strategy = self.current_strategy
+        
+        # Check if ML model exists
+        from secure_ml_storage import SecureMLStorage
+        storage = SecureMLStorage(self.data_dir)
+        ml_model_file = f"ml_model_{strategy}.pkl"
+        ml_trained = storage.model_exists(ml_model_file)
+        
+        hybrid_predictor = self.hybrid_predictors.get(strategy)
+        
+        if not hybrid_predictor:
+            self.ml_status_label.config(
+                text="AI System: Initializing...",
+                fg=theme['text_secondary']
+            )
+            return
+        
+        # Get comprehensive performance stats
+        rule_perf = hybrid_predictor._get_recent_performance('weight_based')
+        ml_perf = hybrid_predictor._get_recent_performance('ml_based')
+        hybrid_perf = hybrid_predictor._get_recent_performance('hybrid')
+        
+        # Get total verified predictions
+        verified = self.predictions_tracker.get_verified_predictions()
+        strategy_verified = [p for p in verified if p.get('strategy') == strategy]
+        total_verified = len(strategy_verified)
+        
+        # Update status label
+        if ml_trained:
+            self.ml_status_label.config(
+                text=f"🤖 AI Model: ✓ Trained\nStrategy: {strategy.title()}",
+                fg=theme['success']
+            )
+        else:
+            self.ml_status_label.config(
+                text=f"🤖 AI Model: Not Trained\nStrategy: {strategy.title()}",
+                fg=theme['text_secondary']
+            )
+        
+        # Update accuracy stats
+        if hybrid_perf and hybrid_perf.get('total', 0) > 0:
+            hybrid_acc = hybrid_perf['accuracy']
+            hybrid_correct = hybrid_perf['correct']
+            hybrid_total = hybrid_perf['total']
+            
+            # Check for improvement
+            prev_acc = self.previous_accuracy.get(strategy, hybrid_acc)
+            if hybrid_acc > prev_acc + 2:  # Improved by 2% or more
+                self._show_improvement_notification(strategy, prev_acc, hybrid_acc)
+            self.previous_accuracy[strategy] = hybrid_acc
+            
+            # Update accuracy label
+            color = theme['success'] if hybrid_acc >= 70 else theme['warning'] if hybrid_acc >= 60 else theme['error']
+            self.ml_accuracy_label.config(
+                text=f"Hybrid Accuracy: {hybrid_acc:.1f}% ({hybrid_correct}/{hybrid_total})",
+                fg=color
+            )
+            
+            # Update rule-based stats
+            if rule_perf and rule_perf.get('total', 0) > 0:
+                rule_acc = rule_perf['accuracy']
+                self.ml_rule_label.config(
+                    text=f"Rule-based: {rule_acc:.1f}% | ML: {ml_perf['accuracy']:.1f}%" if ml_perf else f"Rule-based: {rule_acc:.1f}%",
+                    fg=theme['text_secondary']
+                )
+            else:
+                self.ml_rule_label.config(text="", fg=theme['text_secondary'])
+            
+            # Update hybrid label
+            self.ml_hybrid_label.config(
+                text=f"Best Method: {'Hybrid' if hybrid_acc >= max(rule_perf.get('accuracy', 0) if rule_perf else 0, ml_perf.get('accuracy', 0) if ml_perf else 0) else 'Individual'}",
+                fg=theme['accent']
+            )
+        else:
+            self.ml_accuracy_label.config(text="No verified predictions yet", fg=theme['text_secondary'])
+            self.ml_rule_label.config(text="", fg=theme['text_secondary'])
+            self.ml_hybrid_label.config(text="", fg=theme['text_secondary'])
+        
+        # Update learning progress bar
+        # Progress based on number of verified predictions (max at 200)
+        progress = min(100, (total_verified / 200) * 100)
+        self.learning_progress_bar['value'] = progress
+        
+        # Update progress label
+        if total_verified < 50:
+            progress_text = f"Learning Progress: {total_verified}/50 predictions"
+            self.learning_progress_label.config(text=progress_text, fg=theme['text_secondary'])
+        elif total_verified < 200:
+            progress_text = f"Learning Progress: {total_verified}/200 predictions"
+            self.learning_progress_label.config(text=progress_text, fg=theme['accent'])
+        else:
+            progress_text = f"Learning Progress: {total_verified}+ predictions (Advanced)"
+            self.learning_progress_label.config(text=progress_text, fg=theme['success'])
+        
+        # Update auto-learner status
+        if hasattr(self, 'auto_learner'):
+            status = self.auto_learner.get_status()
+            if status['is_running']:
+                if status['is_scanning']:
+                    status_text = "🤖 Auto-Learner: Scanning market..."
+                else:
+                    last_scan = status.get('last_scan_time', {})
+                    last_predictions = status.get('last_scan_predictions', 0)
+                    
+                    if last_scan:
+                        # Find most recent scan
+                        recent_scans = [v for v in last_scan.values() if v]
+                        if recent_scans:
+                            if last_predictions > 0:
+                                status_text = f"🤖 Auto-Learner: Active\nLast scan: {last_predictions} predictions"
+                            else:
+                                status_text = f"🤖 Auto-Learner: Active\nLast scan: {len(recent_scans)} strategies"
+                        else:
+                            status_text = "🤖 Auto-Learner: Active (Waiting for first scan...)"
+                    else:
+                        status_text = "🤖 Auto-Learner: Active (Starting in 1 hour...)"
+                
+                self.auto_learner_status_label.config(
+                    text=status_text,
+                    fg=theme['success']
+                )
+            else:
+                self.auto_learner_status_label.config(
+                    text="🤖 Auto-Learner: Stopped",
+                    fg=theme['text_secondary']
+                )
+        
+        # Update test button state
+        self._update_test_button_state()
+        
+        # Update Megamind status
+        self._update_megamind_status()
+    
+    def _update_megamind_status(self):
+        """Update the Megamind learning status display"""
+        theme = self.theme_manager.get_theme()
+        stats = self.learning_tracker.get_statistics()
+        
+        # Create a compact status display
+        status_lines = []
+        
+        # Data sources summary
+        total_events = (stats['data_sources']['manual_analyses'] + 
+                       stats['data_sources']['auto_scans'] + 
+                       stats['data_sources']['background_trainings'])
+        
+        if total_events > 0:
+            status_lines.append(f"📊 Data Sources: {total_events} events")
+            status_lines.append(f"   • Manual: {stats['data_sources']['manual_analyses']}")
+            status_lines.append(f"   • Auto-scans: {stats['data_sources']['auto_scans']}")
+            status_lines.append(f"   • Training: {stats['data_sources']['background_trainings']}")
+        
+        # Knowledge summary
+        if stats['knowledge']['total_training_samples'] > 0:
+            status_lines.append(f"💡 Knowledge: {stats['knowledge']['total_training_samples']:,} samples")
+            status_lines.append(f"   • Stocks: {stats['data_sources']['unique_stocks']}")
+            status_lines.append(f"   • Predictions: {stats['knowledge']['total_predictions_made']:,}")
+            status_lines.append(f"   • Verified: {stats['knowledge']['total_predictions_verified']:,}")
+        
+        # Learning rate
+        if stats['learning_rate'] > 0:
+            status_lines.append(f"⚡ Learning Rate: {stats['learning_rate']:.1f}/day")
+        
+        if status_lines:
+            status_text = "\n".join(status_lines)
+        else:
+            status_text = "🧠 Ready to learn...\nFeed me data!"
+        
+        self.megamind_status_label.config(text=status_text, fg=theme['text_secondary'])
+    
+    def _update_test_button_state(self):
+        """Update test button enabled state"""
+        theme = self.theme_manager.get_theme()
+        strategy = self.current_strategy
+        
+        from secure_ml_storage import SecureMLStorage
+        storage = SecureMLStorage(self.data_dir)
+        ml_model_file = f"ml_model_{strategy}.pkl"
+        ml_trained = storage.model_exists(ml_model_file)
+        
+        if ml_trained:
+            self.test_model_btn.config(state='normal')
+        else:
+            self.test_model_btn.config(state='disabled')
+    
+    def _show_improvement_notification(self, strategy: str, old_acc: float, new_acc: float):
+        """Show notification when accuracy improves"""
+        improvement = new_acc - old_acc
+        message = f"🎉 AI Improvement Detected!\n\n"
+        message += f"Strategy: {strategy.title()}\n"
+        message += f"Accuracy improved: {old_acc:.1f}% → {new_acc:.1f}%\n"
+        message += f"Improvement: +{improvement:.1f}%\n\n"
+        message += f"The AI is learning from your predictions!"
+        
+        messagebox.showinfo("AI Learning Progress", message)
+    
+    def _show_detailed_stats(self):
+        """Show detailed performance statistics dialog"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("AI Performance Statistics")
+        dialog.geometry("700x600")
+        dialog.transient(self.root)
+        
+        theme = self.theme_manager.get_theme()
+        dialog.config(bg=theme['bg'])
+        
+        # Header
+        header = tk.Label(
+            dialog,
+            text="📊 AI Performance Statistics",
+            bg=theme['bg'],
+            fg=theme['accent'],
+            font=('Segoe UI', 16, 'bold')
+        )
+        header.pack(pady=20)
+        
+        # Strategy selection
+        strategy_frame = tk.Frame(dialog, bg=theme['bg'])
+        strategy_frame.pack(pady=10)
+        
+        tk.Label(
+            strategy_frame,
+            text="Strategy:",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10)
+        ).pack(side=tk.LEFT, padx=10)
+        
+        strategy_var = tk.StringVar(value=self.current_strategy)
+        strategy_combo = ttk.Combobox(
+            strategy_frame,
+            textvariable=strategy_var,
+            values=["trading", "mixed", "investing"],
+            state='readonly',
+            width=15
+        )
+        strategy_combo.pack(side=tk.LEFT, padx=10)
+        
+        # Stats display area
+        stats_frame = tk.Frame(dialog, bg=theme['bg'])
+        stats_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
+        
+        # Create notebook for tabs
+        notebook = ttk.Notebook(stats_frame)
+        notebook.pack(fill=tk.BOTH, expand=True, pady=10)
+        
+        # Stats tab
+        stats_tab = tk.Frame(notebook, bg=theme['bg'])
+        notebook.add(stats_tab, text="Statistics")
+        
+        stats_text = scrolledtext.ScrolledText(
+            stats_tab,
+            height=15,
+            bg=theme['frame_bg'],
+            fg=theme['fg'],
+            font=('Consolas', 9),
+            wrap=tk.WORD
+        )
+        stats_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Performance graph tab
+        graph_tab = tk.Frame(notebook, bg=theme['bg'])
+        notebook.add(graph_tab, text="Performance Trend")
+        
+        graph_canvas_frame = tk.Frame(graph_tab, bg=theme['bg'])
+        graph_canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        def update_stats():
+            strategy = strategy_var.get()
+            hybrid_predictor = self.hybrid_predictors.get(strategy)
+            
+            if not hybrid_predictor:
+                stats_text.delete(1.0, tk.END)
+                stats_text.insert(tk.END, "No data available for this strategy.")
+                return
+            
+            # Get all performance data
+            rule_perf = hybrid_predictor._get_recent_performance('weight_based')
+            ml_perf = hybrid_predictor._get_recent_performance('ml_based')
+            hybrid_perf = hybrid_predictor._get_recent_performance('hybrid')
+            
+            # Get verified predictions
+            verified = self.predictions_tracker.get_verified_predictions()
+            strategy_verified = [p for p in verified if p.get('strategy') == strategy]
+            
+            # Get weight info
+            from adaptive_weight_adjuster import AdaptiveWeightAdjuster
+            weight_adjuster = AdaptiveWeightAdjuster(self.data_dir, strategy)
+            weights = weight_adjuster.get_weights()
+            
+            # Build stats text
+            stats = f"{'='*60}\n"
+            stats += f"AI PERFORMANCE STATISTICS - {strategy.upper()}\n"
+            stats += f"{'='*60}\n\n"
+            
+            stats += f"VERIFIED PREDICTIONS:\n"
+            stats += f"  Total Verified: {len(strategy_verified)}\n"
+            stats += f"  Active Predictions: {len([p for p in self.predictions_tracker.get_active_predictions() if p.get('strategy') == strategy])}\n\n"
+            
+            stats += f"ACCURACY METRICS (Last 50 Predictions):\n"
+            if hybrid_perf and hybrid_perf.get('total', 0) > 0:
+                stats += f"  🤖 Hybrid System: {hybrid_perf['accuracy']:.1f}% ({hybrid_perf['correct']}/{hybrid_perf['total']})\n"
+            else:
+                stats += f"  🤖 Hybrid System: No data yet\n"
+            
+            if rule_perf and rule_perf.get('total', 0) > 0:
+                stats += f"  📊 Rule-based: {rule_perf['accuracy']:.1f}% ({rule_perf['correct']}/{rule_perf['total']})\n"
+            else:
+                stats += f"  📊 Rule-based: No data yet\n"
+            
+            if ml_perf and ml_perf.get('total', 0) > 0:
+                stats += f"  🧠 ML Model: {ml_perf['accuracy']:.1f}% ({ml_perf['correct']}/{ml_perf['total']})\n"
+            else:
+                stats += f"  🧠 ML Model: Not trained or no data\n"
+            
+            stats += f"\n{'='*60}\n"
+            stats += f"LEARNED WEIGHTS (Rule-based):\n"
+            stats += f"{'='*60}\n"
+            
+            # Show top weights
+            sorted_weights = sorted(weights.items(), key=lambda x: abs(x[1]) if isinstance(x[1], (int, float)) else 0, reverse=True)
+            for key, value in sorted_weights[:10]:  # Top 10
+                if isinstance(value, (int, float)):
+                    stats += f"  {key}: {value:.3f}\n"
+            
+            stats += f"\n{'='*60}\n"
+            stats += f"ENSEMBLE WEIGHTS:\n"
+            stats += f"{'='*60}\n"
+            ensemble_weights = hybrid_predictor.ensemble_weights
+            stats += f"  Rule-based: {ensemble_weights.get('rule', 0.5)*100:.0f}%\n"
+            stats += f"  ML-based: {ensemble_weights.get('ml', 0.5)*100:.0f}%\n"
+            
+            # Check ML model status
+            from secure_ml_storage import SecureMLStorage
+            storage = SecureMLStorage(self.data_dir)
+            ml_model_file = f"ml_model_{strategy}.pkl"
+            if storage.model_exists(ml_model_file):
+                stats += f"\n  ML Model: ✓ Trained\n"
+                model_info = storage.get_model_info(ml_model_file)
+                if model_info:
+                    stats += f"  Model Size: {model_info.get('size', 0) / 1024:.1f} KB\n"
+            else:
+                stats += f"\n  ML Model: Not Trained\n"
+            
+            stats += f"\n{'='*60}\n"
+            stats += f"LEARNING PROGRESS:\n"
+            stats += f"{'='*60}\n"
+            
+            if len(strategy_verified) < 50:
+                stats += f"  Status: Early Learning ({len(strategy_verified)}/50 predictions)\n"
+                stats += f"  Progress: {len(strategy_verified)/50*100:.0f}%\n"
+            elif len(strategy_verified) < 200:
+                stats += f"  Status: Active Learning ({len(strategy_verified)}/200 predictions)\n"
+                stats += f"  Progress: {len(strategy_verified)/200*100:.0f}%\n"
+            else:
+                stats += f"  Status: Advanced Learning ({len(strategy_verified)}+ predictions)\n"
+                stats += f"  Progress: 100%+\n"
+            
+            stats_text.delete(1.0, tk.END)
+            stats_text.insert(tk.END, stats)
+            
+            # Update performance graph
+            _update_performance_graph(strategy)
+        
+        def _update_performance_graph(strategy):
+            """Update performance trend graph"""
+            # Clear previous graph
+            for widget in graph_canvas_frame.winfo_children():
+                widget.destroy()
+            
+            hybrid_predictor = self.hybrid_predictors.get(strategy)
+            if not hybrid_predictor:
+                return
+            
+            # Get performance history
+            rule_history = hybrid_predictor.performance_history.get('weight_based', [])
+            ml_history = hybrid_predictor.performance_history.get('ml_based', [])
+            hybrid_history = hybrid_predictor.performance_history.get('hybrid', [])
+            
+            if not hybrid_history:
+                no_data_label = tk.Label(
+                    graph_canvas_frame,
+                    text="No performance data yet.\nMake predictions and verify them to see trends!",
+                    bg=theme['bg'],
+                    fg=theme['text_secondary'],
+                    font=('Segoe UI', 11)
+                )
+                no_data_label.pack(expand=True)
+                return
+            
+            # Calculate rolling accuracy (last 20 predictions)
+            window_size = 20
+            hybrid_accuracies = []
+            rule_accuracies = []
+            ml_accuracies = []
+            
+            for i in range(len(hybrid_history)):
+                start_idx = max(0, i - window_size + 1)
+                window = hybrid_history[start_idx:i+1]
+                if window:
+                    correct = sum(1 for h in window if h.get('was_correct') is True)
+                    accuracy = (correct / len(window)) * 100
+                    hybrid_accuracies.append(accuracy)
+            
+            for i in range(len(rule_history)):
+                start_idx = max(0, i - window_size + 1)
+                window = rule_history[start_idx:i+1]
+                if window:
+                    correct = sum(1 for h in window if h.get('was_correct') is True)
+                    accuracy = (correct / len(window)) * 100
+                    rule_accuracies.append(accuracy)
+            
+            for i in range(len(ml_history)):
+                start_idx = max(0, i - window_size + 1)
+                window = ml_history[start_idx:i+1]
+                if window:
+                    correct = sum(1 for h in window if h.get('was_correct') is True)
+                    accuracy = (correct / len(window)) * 100
+                    ml_accuracies.append(accuracy)
+            
+            # Create graph
+            fig = Figure(figsize=(8, 4), dpi=100)
+            ax = fig.add_subplot(111)
+            
+            if hybrid_accuracies:
+                ax.plot(hybrid_accuracies, label='Hybrid', linewidth=2, color='#2196F3')
+            if rule_accuracies:
+                ax.plot(rule_accuracies, label='Rule-based', linewidth=1.5, color='#4CAF50', alpha=0.7)
+            if ml_accuracies:
+                ax.plot(ml_accuracies, label='ML Model', linewidth=1.5, color='#FF9800', alpha=0.7)
+            
+            ax.set_xlabel('Prediction Number', fontsize=10)
+            ax.set_ylabel('Accuracy (%)', fontsize=10)
+            ax.set_title(f'Performance Trend - {strategy.title()} Strategy', fontsize=12, fontweight='bold')
+            ax.legend(loc='best')
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim([0, 100])
+            
+            # Apply theme
+            if theme.get('bg') == '#000000' or theme.get('bg') == '#121212':
+                fig.patch.set_facecolor('#121212')
+                ax.set_facecolor('#1E1E1E')
+                ax.tick_params(colors='white')
+                ax.xaxis.label.set_color('white')
+                ax.yaxis.label.set_color('white')
+                ax.title.set_color('white')
+            
+            canvas = FigureCanvasTkAgg(fig, graph_canvas_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # Update stats when strategy changes
+        strategy_combo.bind('<<ComboboxSelected>>', lambda e: update_stats())
+        
+        # Initial update
+        update_stats()
+        
+        # Close button
+        close_btn = ModernButton(
+            dialog,
+            "Close",
+            command=dialog.destroy,
+            theme=theme
+        )
+        close_btn.pack(pady=10)
+    
+    def _show_training_dialog(self):
+        """Show ML training dialog"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Train AI Model")
+        dialog.geometry("600x500")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        theme = self.theme_manager.get_theme()
+        dialog.config(bg=theme['bg'])
+        
+        # Header
+        header = tk.Label(
+            dialog,
+            text="🤖 Train Machine Learning Model",
+            bg=theme['bg'],
+            fg=theme['accent'],
+            font=('Segoe UI', 16, 'bold')
+        )
+        header.pack(pady=20)
+        
+        # Strategy selection
+        strategy_frame = tk.Frame(dialog, bg=theme['bg'])
+        strategy_frame.pack(pady=10)
+        
+        tk.Label(
+            strategy_frame,
+            text="Strategy:",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10)
+        ).pack(side=tk.LEFT, padx=10)
+        
+        strategy_var = tk.StringVar(value=self.current_strategy)
+        strategy_combo = ttk.Combobox(
+            strategy_frame,
+            textvariable=strategy_var,
+            values=["trading", "mixed", "investing"],
+            state='readonly',
+            width=15
+        )
+        strategy_combo.pack(side=tk.LEFT, padx=10)
+        
+        # Stock symbols input
+        symbols_frame = tk.Frame(dialog, bg=theme['bg'])
+        symbols_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        tk.Label(
+            symbols_frame,
+            text="Stock Symbols (comma-separated):",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10)
+        ).pack(anchor=tk.W)
+        
+        symbols_entry = tk.Entry(
+            symbols_frame,
+            font=('Segoe UI', 10),
+            bg=theme['entry_bg'],
+            fg=theme['entry_fg'],
+            width=50
+        )
+        symbols_entry.pack(fill=tk.X, pady=5)
+        # Load last used symbols for this strategy
+        last_symbols = self.preferences.get_training_symbols(strategy_var.get())
+        symbols_entry.insert(0, last_symbols)
+        
+        # Preset symbols button
+        preset_frame = tk.Frame(symbols_frame, bg=theme['bg'])
+        preset_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        def load_preset_symbols():
+            """Load diverse preset symbols for better training"""
+            # Diverse portfolio: Tech, Finance, Healthcare, Consumer, Industrial, Energy
+            preset = "AAPL,MSFT,GOOGL,NVDA,AMD,JPM,BAC,GS,JNJ,PFE,UNH,AMZN,WMT,HD,BA,CAT,XOM,CVX,TSLA,META"
+            symbols_entry.delete(0, tk.END)
+            symbols_entry.insert(0, preset)
+            status_text.insert(tk.END, "✅ Loaded 20 diverse symbols (Tech, Finance, Healthcare, Consumer, Industrial, Energy)\n")
+            status_text.see(tk.END)
+        
+        preset_btn = tk.Button(
+            preset_frame,
+            text="📊 Load Diverse Portfolio (20 symbols)",
+            command=load_preset_symbols,
+            bg=theme['button_bg'],
+            fg=theme['button_fg'],
+            font=('Segoe UI', 9),
+            relief=tk.FLAT,
+            cursor='hand2'
+        )
+        preset_btn.pack(side=tk.LEFT)
+        
+        # Info label
+        info_preset = tk.Label(
+            preset_frame,
+            text="💡 Using diverse symbols improves model generalization",
+            bg=theme['bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 8),
+            justify=tk.LEFT
+        )
+        info_preset.pack(side=tk.LEFT, padx=(10, 0))
+        
+        # Date range
+        date_frame = tk.Frame(dialog, bg=theme['bg'])
+        date_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        tk.Label(
+            date_frame,
+            text="Training Period:",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10)
+        ).pack(anchor=tk.W)
+        
+        date_inner = tk.Frame(date_frame, bg=theme['bg'])
+        date_inner.pack(fill=tk.X, pady=5)
+        
+        tk.Label(date_inner, text="Start:", bg=theme['bg'], fg=theme['fg']).pack(side=tk.LEFT, padx=5)
+        start_entry = tk.Entry(date_inner, width=12, bg=theme['entry_bg'], fg=theme['entry_fg'])
+        start_entry.pack(side=tk.LEFT, padx=5)
+        start_entry.insert(0, "2010-01-01")  # 14 years for better generalization (includes 2008 recovery)
+        
+        tk.Label(date_inner, text="End:", bg=theme['bg'], fg=theme['fg']).pack(side=tk.LEFT, padx=5)
+        end_entry = tk.Entry(date_inner, width=12, bg=theme['entry_bg'], fg=theme['entry_fg'])
+        end_entry.pack(side=tk.LEFT, padx=5)
+        end_entry.insert(0, "2023-12-31")  # End before current year for out-of-sample testing
+        
+        # Add helpful info label
+        info_label = tk.Label(
+            date_frame,
+            text="💡 Recommended: 2010-2023 (14 years) includes bull, bear, and recovery markets.\n"
+                 "Use 2024-2025 as out-of-sample testing period. Longer ranges = better patterns.",
+            bg=theme['bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 8),
+            justify=tk.LEFT
+        )
+        info_label.pack(anchor=tk.W, pady=(5, 0))
+        
+        # Retrain from verified predictions option
+        retrain_frame = tk.Frame(dialog, bg=theme['bg'])
+        retrain_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        retrain_var = tk.BooleanVar(value=False)
+        retrain_check = tk.Checkbutton(
+            retrain_frame,
+            text="🔄 Also retrain ML model from verified predictions (if available)",
+            variable=retrain_var,
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 9),
+            selectcolor=theme['frame_bg'],
+            activebackground=theme['bg'],
+            activeforeground=theme['fg']
+        )
+        retrain_check.pack(anchor=tk.W)
+        
+        retrain_info = tk.Label(
+            retrain_frame,
+            text="💡 This will combine historical training with your verified predictions for better accuracy",
+            bg=theme['bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 8),
+            justify=tk.LEFT
+        )
+        retrain_info.pack(anchor=tk.W, pady=(5, 0))
+        
+        # Status text
+        status_text = scrolledtext.ScrolledText(
+            dialog,
+            height=10,
+            bg=theme['frame_bg'],
+            fg=theme['fg'],
+            font=('Consolas', 9)
+        )
+        status_text.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
+        
+        # Buttons
+        btn_frame = tk.Frame(dialog, bg=theme['bg'])
+        btn_frame.pack(pady=10)
+        
+        def start_training():
+            symbols = [s.strip().upper() for s in symbols_entry.get().split(',')]
+            start_date = start_entry.get()
+            end_date = end_entry.get()
+            strategy = strategy_var.get()
+            retrain_from_verified = retrain_var.get()
+            
+            # Save symbols for next time
+            symbols_str = ','.join(symbols)
+            self.preferences.set_training_symbols(strategy, symbols_str)
+            
+            status_text.delete(1.0, tk.END)
+            status_text.insert(tk.END, f"Starting training for {strategy} strategy...\n")
+            status_text.insert(tk.END, f"Symbols: {', '.join(symbols)}\n")
+            status_text.insert(tk.END, f"Period: {start_date} to {end_date}\n")
+            if retrain_from_verified:
+                status_text.insert(tk.END, f"🔄 Will also retrain from verified predictions\n")
+            status_text.insert(tk.END, "\n")
+            status_text.update()
+            
+            # Run training in background
+            def train():
+                try:
+                    # First, train on historical data
+                    result = self.training_manager.train_on_symbols(
+                        symbols, start_date, end_date, strategy,
+                        progress_callback=lambda msg: dialog.after(0, lambda: status_text.insert(tk.END, msg + "\n") or status_text.see(tk.END))
+                    )
+                    
+                    if 'error' in result:
+                        dialog.after(0, lambda: status_text.insert(tk.END, f"\n✗ Error: {result['error']}\n"))
+                    else:
+                        dialog.after(0, lambda: status_text.insert(
+                            tk.END,
+                            f"\n✓ Historical Training Complete!\n"
+                            f"Test Accuracy: {result.get('test_accuracy', 0)*100:.1f}%\n"
+                            f"Training Samples: {result.get('total_samples', 0)}\n"
+                            f"Cross-Validation: {result.get('cv_mean', 0)*100:.1f}% ± {result.get('cv_std', 0)*100:.1f}%\n"
+                        ))
+                        
+                        # If requested, also retrain from verified predictions
+                        if retrain_from_verified:
+                            dialog.after(0, lambda: status_text.insert(tk.END, "\n🔄 Retraining from verified predictions...\n"))
+                            status_text.update()
+                            
+                            try:
+                                from training_pipeline import MLTrainingPipeline
+                                pipeline = MLTrainingPipeline(self.data_fetcher, self.data_dir)
+                                verified_result = pipeline.train_on_verified_predictions(
+                                    self.predictions_tracker,
+                                    strategy,
+                                    retrain_ml=True
+                                )
+                                
+                                if 'error' in verified_result:
+                                    dialog.after(0, lambda: status_text.insert(tk.END, f"⚠️ Verified predictions: {verified_result['error']}\n"))
+                                else:
+                                    verified_msg = f"\n✅ Verified Predictions Training Complete!\n"
+                                    verified_msg += f"Verified Predictions Used: {verified_result.get('verified_predictions_used', 0)}\n"
+                                    if verified_result.get('ml_retrained'):
+                                        verified_msg += f"ML Retrained: ✅\n"
+                                        verified_msg += f"ML Train Accuracy: {verified_result.get('ml_train_accuracy', 0):.1f}%\n"
+                                        verified_msg += f"ML Test Accuracy: {verified_result.get('ml_test_accuracy', 0):.1f}%\n"
+                                        verified_msg += f"Training Samples: {verified_result.get('training_samples_used', 0)}\n"
+                                    else:
+                                        verified_msg += f"ML Retrained: ❌ ({verified_result.get('ml_error', 'N/A')})\n"
+                                    dialog.after(0, lambda: status_text.insert(tk.END, verified_msg))
+                            except Exception as e:
+                                error_msg = str(e)
+                                dialog.after(0, lambda msg=error_msg: status_text.insert(tk.END, f"⚠️ Error retraining from verified: {msg}\n"))
+                        
+                        dialog.after(0, self._update_ml_status)
+                except Exception as e:
+                    error_msg = str(e)  # Capture error message in local variable
+                    dialog.after(0, lambda msg=error_msg: status_text.insert(tk.END, f"\n✗ Error: {msg}\n"))
+            
+            thread = threading.Thread(target=train)
+            thread.daemon = True
+            thread.start()
+        
+        train_btn = ModernButton(
+            btn_frame,
+            "Start Training",
+            command=start_training,
+            theme=theme
+        )
+        train_btn.pack(side=tk.LEFT, padx=5)
+        
+        close_btn = ModernButton(
+            btn_frame,
+            "Close",
+            command=dialog.destroy,
+            theme=theme
+        )
+        close_btn.pack(side=tk.LEFT, padx=5)
+    
+    def _show_auto_learner_settings(self):
+        """Show auto-learner settings dialog"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Auto-Learner Settings")
+        dialog.geometry("500x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        theme = self.theme_manager.get_theme()
+        dialog.config(bg=theme['bg'])
+        
+        # Header
+        header = tk.Label(
+            dialog,
+            text="⚙️ Auto-Learner Settings",
+            bg=theme['bg'],
+            fg=theme['accent'],
+            font=('Segoe UI', 16, 'bold')
+        )
+        header.pack(pady=20)
+        
+        # Explanation
+        explanation = tk.Label(
+            dialog,
+            text="Configure how often the app automatically scans stocks and learns.",
+            bg=theme['bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 9),
+            wraplength=450,
+            justify=tk.LEFT
+        )
+        explanation.pack(pady=(0, 20), padx=20)
+        
+        # Scan interval setting
+        interval_frame = tk.Frame(dialog, bg=theme['bg'])
+        interval_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        tk.Label(
+            interval_frame,
+            text="Scan Interval:",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10, 'bold')
+        ).pack(anchor=tk.W)
+        
+        info_text = (
+            "How often to automatically scan stocks.\n\n"
+            "• 1-2 hours: Very frequent (faster learning, more API calls)\n"
+            "• 3-6 hours: Balanced (recommended, good learning speed)\n"
+            "• 12-24 hours: Conservative (slower learning, fewer API calls)\n\n"
+            "Note: You can always use 'Scan Now' for immediate scans."
+        )
+        
+        tk.Label(
+            interval_frame,
+            text=info_text,
+            bg=theme['bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 8),
+            justify=tk.LEFT,
+            wraplength=450
+        ).pack(anchor=tk.W, pady=(5, 10))
+        
+        interval_inner = tk.Frame(interval_frame, bg=theme['bg'])
+        interval_inner.pack(fill=tk.X)
+        
+        tk.Label(interval_inner, text="Every:", bg=theme['bg'], fg=theme['fg']).pack(side=tk.LEFT, padx=5)
+        
+        interval_var = tk.IntVar()
+        if hasattr(self, 'auto_learner'):
+            interval_var.set(self.auto_learner.scan_interval_hours)
+        else:
+            interval_var.set(6)
+        
+        interval_spinbox = tk.Spinbox(
+            interval_inner,
+            from_=1,
+            to=24,
+            textvariable=interval_var,
+            width=5,
+            bg=theme['entry_bg'],
+            fg=theme['entry_fg'],
+            font=('Segoe UI', 10)
+        )
+        interval_spinbox.pack(side=tk.LEFT, padx=5)
+        
+        tk.Label(interval_inner, text="hours", bg=theme['bg'], fg=theme['fg']).pack(side=tk.LEFT, padx=5)
+        
+        # Predictions per scan
+        predictions_frame = tk.Frame(dialog, bg=theme['bg'])
+        predictions_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        tk.Label(
+            predictions_frame,
+            text="Predictions Per Scan:",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10, 'bold')
+        ).pack(anchor=tk.W)
+        
+        tk.Label(
+            predictions_frame,
+            text="How many predictions to make per strategy during each scan.",
+            bg=theme['bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 8),
+            justify=tk.LEFT
+        ).pack(anchor=tk.W, pady=(5, 10))
+        
+        predictions_inner = tk.Frame(predictions_frame, bg=theme['bg'])
+        predictions_inner.pack(fill=tk.X)
+        
+        predictions_var = tk.IntVar()
+        if hasattr(self, 'auto_learner'):
+            predictions_var.set(self.auto_learner.predictions_per_scan)
+        else:
+            predictions_var.set(5)
+        
+        predictions_spinbox = tk.Spinbox(
+            predictions_inner,
+            from_=1,
+            to=20,
+            textvariable=predictions_var,
+            width=5,
+            bg=theme['entry_bg'],
+            fg=theme['entry_fg'],
+            font=('Segoe UI', 10)
+        )
+        predictions_spinbox.pack(side=tk.LEFT, padx=5)
+        
+        tk.Label(predictions_inner, text="per strategy", bg=theme['bg'], fg=theme['fg']).pack(side=tk.LEFT, padx=5)
+        
+        # Save button
+        def save_settings():
+            if hasattr(self, 'auto_learner'):
+                scan_interval = interval_var.get()
+                predictions = predictions_var.get()
+                
+                # Update auto-learner config
+                self.auto_learner.update_config(
+                    scan_interval_hours=scan_interval,
+                    predictions_per_scan=predictions
+                )
+                
+                # Save to preferences
+                self.preferences.set('auto_learner_scan_interval_hours', scan_interval)
+                self.preferences.set('auto_learner_predictions_per_scan', predictions)
+                self.preferences.set('auto_learner_min_confidence', self.auto_learner.min_confidence)
+                logger.info(f"Saved auto-learner settings: interval={scan_interval}h, predictions={predictions}")
+                
+                messagebox.showinfo("Settings Saved", 
+                    f"Auto-learner will now scan every {scan_interval} hours\n"
+                    f"and make {predictions} predictions per strategy.\n\n"
+                    f"Settings have been saved and will persist.")
+                dialog.destroy()
+                self._update_ml_status()
+            else:
+                messagebox.showwarning("Error", "Auto-learner not initialized")
+        
+        btn_frame = tk.Frame(dialog, bg=theme['bg'])
+        btn_frame.pack(pady=20)
+        
+        save_btn = ModernButton(btn_frame, "Save Settings", command=save_settings, theme=theme)
+        save_btn.pack(side=tk.LEFT, padx=5)
+        
+        cancel_btn = ModernButton(btn_frame, "Cancel", command=dialog.destroy, theme=theme)
+        cancel_btn.pack(side=tk.LEFT, padx=5)
+    
+    def _trigger_manual_scan(self):
+        """Trigger immediate market scan for faster learning"""
+        if not hasattr(self, 'auto_learner'):
+            messagebox.showwarning("Auto-Learner", "Auto-learner not initialized")
+            return
+        
+        # Check if already scanning
+        status = self.auto_learner.get_status()
+        if status['is_scanning']:
+            messagebox.showinfo("Scanning", "Market scan already in progress. Please wait...")
+            return
+        
+        # Trigger scan
+        success = self.auto_learner.scan_now()
+        if success:
+            messagebox.showinfo(
+                "Scan Started", 
+                "🔍 Market scan started!\n\n"
+                "The app will:\n"
+                "• Scan popular stocks\n"
+                "• Make predictions automatically\n"
+                "• Save predictions for verification\n\n"
+                "Check the status below for progress."
+            )
+            # Update status immediately
+            self._update_ml_status()
+        else:
+            messagebox.showwarning("Scan Failed", "Could not start scan. Please try again.")
+    
+    def _show_test_dialog(self):
+        """Show model testing dialog"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Test ML Model")
+        dialog.geometry("600x500")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        theme = self.theme_manager.get_theme()
+        dialog.config(bg=theme['bg'])
+        
+        # Header
+        header = tk.Label(
+            dialog,
+            text="🧪 Test ML Model Performance",
+            bg=theme['bg'],
+            fg=theme['accent'],
+            font=('Segoe UI', 16, 'bold')
+        )
+        header.pack(pady=20)
+        
+        # Strategy selection
+        strategy_frame = tk.Frame(dialog, bg=theme['bg'])
+        strategy_frame.pack(pady=10)
+        
+        tk.Label(
+            strategy_frame,
+            text="Strategy:",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10)
+        ).pack(side=tk.LEFT, padx=10)
+        
+        strategy_var = tk.StringVar(value=self.current_strategy)
+        strategy_combo = ttk.Combobox(
+            strategy_frame,
+            textvariable=strategy_var,
+            values=["trading", "mixed", "investing"],
+            state='readonly',
+            width=15
+        )
+        strategy_combo.pack(side=tk.LEFT, padx=10)
+        
+        # Update symbols when strategy changes (define before symbols_entry)
+        def on_strategy_change_test(event=None):
+            strategy = strategy_var.get()
+            last_symbols = self.preferences.get_test_symbols(strategy)
+            if 'symbols_entry' in locals():
+                symbols_entry.delete(0, tk.END)
+                symbols_entry.insert(0, last_symbols)
+        
+        strategy_combo.bind('<<ComboboxSelected>>', on_strategy_change_test)
+        
+        # Test period
+        period_frame = tk.Frame(dialog, bg=theme['bg'])
+        period_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        tk.Label(
+            period_frame,
+            text="Test Period (Out-of-Sample):",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10)
+        ).pack(anchor=tk.W)
+        
+        date_inner = tk.Frame(period_frame, bg=theme['bg'])
+        date_inner.pack(fill=tk.X, pady=5)
+        
+        tk.Label(date_inner, text="Start:", bg=theme['bg'], fg=theme['fg']).pack(side=tk.LEFT, padx=5)
+        start_entry = tk.Entry(date_inner, width=12, bg=theme['entry_bg'], fg=theme['entry_fg'])
+        start_entry.pack(side=tk.LEFT, padx=5)
+        start_entry.insert(0, "2024-01-01")
+        
+        tk.Label(date_inner, text="End:", bg=theme['bg'], fg=theme['fg']).pack(side=tk.LEFT, padx=5)
+        end_entry = tk.Entry(date_inner, width=12, bg=theme['entry_bg'], fg=theme['entry_fg'])
+        end_entry.pack(side=tk.LEFT, padx=5)
+        end_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+        
+        # Info label
+        info_label = tk.Label(
+            period_frame,
+            text="💡 Test on data NOT used for training (e.g., 2024-2025)",
+            bg=theme['bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 8)
+        )
+        info_label.pack(anchor=tk.W, pady=(5, 0))
+        
+        # Stock symbols input
+        symbols_frame = tk.Frame(dialog, bg=theme['bg'])
+        symbols_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        tk.Label(
+            symbols_frame,
+            text="Stock Symbols (comma-separated):",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10)
+        ).pack(anchor=tk.W)
+        
+        symbols_entry = tk.Entry(
+            symbols_frame,
+            font=('Segoe UI', 10),
+            bg=theme['entry_bg'],
+            fg=theme['entry_fg'],
+            width=50
+        )
+        symbols_entry.pack(fill=tk.X, pady=5)
+        symbols_entry.insert(0, "AAPL,MSFT,GOOGL,AMZN,TSLA")
+        
+        # Status text
+        status_text = scrolledtext.ScrolledText(
+            dialog,
+            height=10,
+            bg=theme['frame_bg'],
+            fg=theme['fg'],
+            font=('Consolas', 9)
+        )
+        status_text.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
+        
+        # Buttons
+        btn_frame = tk.Frame(dialog, bg=theme['bg'])
+        btn_frame.pack(pady=10)
+        
+        def start_test():
+            symbols = [s.strip().upper() for s in symbols_entry.get().split(',')]
+            start_date = start_entry.get()
+            end_date = end_entry.get()
+            strategy = strategy_var.get()
+            
+            # Save symbols for next time
+            symbols_str = ','.join(symbols)
+            self.preferences.set_test_symbols(strategy, symbols_str)
+            
+            status_text.delete(1.0, tk.END)
+            status_text.insert(tk.END, f"Starting test for {strategy} strategy...\n")
+            status_text.insert(tk.END, f"Test Period: {start_date} to {end_date}\n")
+            status_text.insert(tk.END, f"Symbols: {', '.join(symbols)}\n\n")
+            status_text.update()
+            
+            # Run test in background
+            def test():
+                try:
+                    result = self.model_tester.test_model(
+                        strategy, symbols, start_date, end_date,
+                        progress_callback=lambda msg: dialog.after(0, lambda: status_text.insert(tk.END, msg + "\n") or status_text.see(tk.END))
+                    )
+                    
+                    if 'error' in result:
+                        dialog.after(0, lambda: status_text.insert(tk.END, f"\n✗ Error: {result['error']}\n"))
+                    else:
+                        # Show results in status
+                        dialog.after(0, lambda: status_text.insert(
+                            tk.END,
+                            f"\n{'='*50}\n"
+                            f"TEST RESULTS\n"
+                            f"{'='*50}\n\n"
+                            f"Test Accuracy: {result['test_accuracy']:.1f}%\n"
+                            f"Training Accuracy: {result['training_accuracy']:.1f}%\n"
+                            f"Difference: {result['accuracy_difference']:+.1f}%\n\n"
+                            f"Status: {result['overfitting_message']}\n"
+                            f"Test Samples: {result['total_samples']}\n"
+                            f"Correct: {result['correct']}\n\n"
+                            f"Per-Action Accuracy:\n"
+                            f"  BUY: {result['buy_accuracy']:.1f}% ({result['buy_count']} predictions)\n"
+                            f"  SELL: {result['sell_accuracy']:.1f}% ({result['sell_count']} predictions)\n"
+                            f"  HOLD: {result['hold_accuracy']:.1f}% ({result['hold_count']} predictions)\n"
+                        ))
+                        
+                        # Show detailed results dialog
+                        dialog.after(0, lambda: self._show_test_results(result))
+                except Exception as e:
+                    error_msg = str(e)  # Capture error message in local variable
+                    dialog.after(0, lambda msg=error_msg: status_text.insert(tk.END, f"\n✗ Error: {msg}\n"))
+            
+            thread = threading.Thread(target=test)
+            thread.daemon = True
+            thread.start()
+        
+        test_btn = ModernButton(
+            btn_frame,
+            "Start Test",
+            command=start_test,
+            theme=theme
+        )
+        test_btn.pack(side=tk.LEFT, padx=5)
+        
+        close_btn = ModernButton(
+            btn_frame,
+            "Close",
+            command=dialog.destroy,
+            theme=theme
+        )
+        close_btn.pack(side=tk.LEFT, padx=5)
+    
+    def _show_test_results(self, test_result: dict):
+        """Show detailed test results dialog"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Test Results")
+        dialog.geometry("700x600")
+        dialog.transient(self.root)
+        # Allow closing via window manager (X button)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        
+        theme = self.theme_manager.get_theme()
+        dialog.config(bg=theme['bg'])
+        
+        # Header
+        header = tk.Label(
+            dialog,
+            text="📊 Model Test Results",
+            bg=theme['bg'],
+            fg=theme['accent'],
+            font=('Segoe UI', 16, 'bold')
+        )
+        header.pack(pady=20)
+        
+        # Results summary
+        summary_frame = tk.Frame(dialog, bg=theme['bg'])
+        summary_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        # Training vs Test comparison
+        train_acc = test_result.get('training_accuracy', 0)
+        test_acc = test_result.get('test_accuracy', 0)
+        diff = test_result.get('accuracy_difference', 0)
+        status = test_result.get('overfitting_status', 'unknown')
+        
+        # Color based on status
+        if status == "good":
+            status_color = theme['success']
+            status_icon = "✅"
+        elif status == "poor":
+            status_color = theme['error']
+            status_icon = "⚠️"
+        else:
+            status_color = theme['warning']
+            status_icon = "⚡"
+        
+        comparison_text = f"{status_icon} {test_result.get('overfitting_message', '')}\n\n"
+        comparison_text += f"Training Accuracy: {train_acc:.1f}%\n"
+        comparison_text += f"Test Accuracy:      {test_acc:.1f}%\n"
+        comparison_text += f"Difference:        {diff:+.1f}%"
+        
+        comparison_label = tk.Label(
+            summary_frame,
+            text=comparison_text,
+            bg=theme['card_bg'],
+            fg=status_color,
+            font=('Segoe UI', 12, 'bold'),
+            justify=tk.LEFT,
+            padx=20,
+            pady=15,
+            relief=tk.RAISED,
+            bd=2
+        )
+        comparison_label.pack(fill=tk.X)
+        
+        # Detailed stats
+        stats_frame = tk.Frame(dialog, bg=theme['bg'])
+        stats_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
+        
+        stats_text = scrolledtext.ScrolledText(
+            stats_frame,
+            height=15,
+            bg=theme['frame_bg'],
+            fg=theme['fg'],
+            font=('Consolas', 9),
+            wrap=tk.WORD
+        )
+        stats_text.pack(fill=tk.BOTH, expand=True)
+        
+        # Build stats
+        stats = f"{'='*60}\n"
+        stats += f"TEST RESULTS - {test_result['strategy'].upper()}\n"
+        stats += f"{'='*60}\n\n"
+        
+        stats += f"TEST PERIOD:\n"
+        stats += f"  {test_result.get('test_period', 'N/A')}\n"
+        stats += f"  Symbols: {', '.join(test_result.get('symbols_tested', []))}\n\n"
+        
+        stats += f"ACCURACY COMPARISON:\n"
+        stats += f"  Training: {train_acc:.1f}%\n"
+        stats += f"  Test:     {test_acc:.1f}%\n"
+        stats += f"  Difference: {diff:+.1f}%\n\n"
+        
+        stats += f"INTERPRETATION:\n"
+        if abs(diff) < 5:
+            stats += f"  ✅ Model generalizes well\n"
+            stats += f"  ✅ Small gap indicates good fit\n"
+            stats += f"  ✅ Can trust predictions\n"
+        elif diff < -10:
+            stats += f"  ⚠️ Possible overfitting\n"
+            stats += f"  ⚠️ Large gap suggests memorization\n"
+            stats += f"  ⚠️ Consider retraining with regularization\n"
+        else:
+            stats += f"  ⚡ Model performance acceptable\n"
+            stats += f"  ⚡ Some gap is normal\n"
+        
+        stats += f"\n{'='*60}\n"
+        stats += f"DETAILED METRICS:\n"
+        stats += f"{'='*60}\n\n"
+        
+        stats += f"Total Test Samples: {test_result.get('total_samples', 0)}\n"
+        stats += f"Correct Predictions: {test_result.get('correct', 0)}\n"
+        stats += f"Test Accuracy: {test_acc:.1f}%\n\n"
+        
+        stats += f"PER-ACTION ACCURACY:\n"
+        stats += f"  BUY:  {test_result.get('buy_accuracy', 0):.1f}% ({test_result.get('buy_count', 0)} predictions)\n"
+        stats += f"  SELL: {test_result.get('sell_accuracy', 0):.1f}% ({test_result.get('sell_count', 0)} predictions)\n"
+        stats += f"  HOLD: {test_result.get('hold_accuracy', 0):.1f}% ({test_result.get('hold_count', 0)} predictions)\n"
+        
+        stats_text.insert(tk.END, stats)
+        stats_text.config(state='disabled')
+        
+        # Close button
+        close_btn = ModernButton(
+            dialog,
+            "Close",
+            command=dialog.destroy,
+            theme=theme
+        )
+        close_btn.pack(pady=10)
+    
+    def _run_backtest(self):
+        """Run backtest manually with strategy selection"""
+        if self.backtester.is_testing:
+            messagebox.showinfo("Backtest", "Backtest already in progress. Please wait...")
+            return
+        
+        # Show strategy selection dialog
+        selected_strategies = self._show_backtest_strategy_selection()
+        if not selected_strategies:
+            return  # User cancelled
+        
+        # Run in background
+        def run():
+            success = self.backtester.run_test_now(selected_strategies=selected_strategies)
+            if success:
+                strategies_str = ", ".join([s.capitalize() for s in selected_strategies])
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Backtest Started",
+                    f"🧪 Backtest started!\n\n"
+                    f"Testing strategies: {strategies_str}\n\n"
+                    "The algorithm will test itself on random historical points.\n"
+                    "Results will be available in 'View Backtest Results'."
+                ))
+            else:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "Backtest", "Backtest already in progress."
+                ))
+        
+        thread = threading.Thread(target=run)
+        thread.daemon = True
+        thread.start()
+    
+    def _show_backtest_strategy_selection(self):
+        """Show dialog to select strategies for backtesting"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Select Strategies for Backtesting")
+        dialog.geometry("400x250")
+        dialog.transient(self.root)
+        dialog.grab_set()  # Make dialog modal
+        dialog.protocol("WM_DELETE_WINDOW", lambda: dialog.destroy())
+        
+        theme = self.theme_manager.get_theme()
+        dialog.config(bg=theme['bg'])
+        
+        # Header
+        header = tk.Label(
+            dialog,
+            text="Select Strategies to Test",
+            bg=theme['bg'],
+            fg=theme['accent'],
+            font=('Segoe UI', 14, 'bold')
+        )
+        header.pack(pady=20)
+        
+        # Strategy checkboxes
+        strategy_frame = tk.Frame(dialog, bg=theme['bg'])
+        strategy_frame.pack(pady=10, padx=20)
+        
+        # Load saved preferences
+        saved_strategies = self.preferences.get_backtest_strategies()
+        if not saved_strategies:
+            saved_strategies = ['trading', 'mixed', 'investing']  # Default: all
+        
+        strategy_vars = {}
+        strategies = [
+            ('trading', 'Trading (Short-term)'),
+            ('mixed', 'Mixed (Medium-term)'),
+            ('investing', 'Investing (Long-term)')
+        ]
+        
+        for strategy_key, strategy_label in strategies:
+            var = tk.BooleanVar(value=strategy_key in saved_strategies)
+            strategy_vars[strategy_key] = var
+            
+            checkbox = tk.Checkbutton(
+                strategy_frame,
+                text=strategy_label,
+                variable=var,
+                bg=theme['bg'],
+                fg=theme['fg'],
+                selectcolor=theme['accent'],
+                activebackground=theme['bg'],
+                activeforeground=theme['fg'],
+                font=('Segoe UI', 11)
+            )
+            checkbox.pack(anchor=tk.W, pady=5)
+        
+        # Buttons
+        btn_frame = tk.Frame(dialog, bg=theme['bg'])
+        btn_frame.pack(pady=20)
+        
+        selected_strategies = []
+        
+        def on_ok():
+            nonlocal selected_strategies
+            selected_strategies = [key for key, var in strategy_vars.items() if var.get()]
+            if not selected_strategies:
+                messagebox.showwarning("No Selection", "Please select at least one strategy.")
+                return
+            
+            # Save preferences
+            self.preferences.set_backtest_strategies(selected_strategies)
+            dialog.destroy()
+        
+        def on_cancel():
+            dialog.destroy()
+        
+        ModernButton(btn_frame, "OK", command=on_ok, theme=theme).pack(side=tk.LEFT, padx=5)
+        ModernButton(btn_frame, "Cancel", command=on_cancel, theme=theme).pack(side=tk.LEFT, padx=5)
+        
+        # Wait for dialog to close
+        dialog.wait_window()
+        
+        return selected_strategies if selected_strategies else None
+    
+    def _show_backtest_results(self):
+        """Show backtest results dialog"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Backtest Results")
+        dialog.geometry("800x700")
+        dialog.transient(self.root)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        
+        theme = self.theme_manager.get_theme()
+        dialog.config(bg=theme['bg'])
+        
+        # Header
+        header = tk.Label(
+            dialog,
+            text="🧪 Continuous Backtest Results",
+            bg=theme['bg'],
+            fg=theme['accent'],
+            font=('Segoe UI', 16, 'bold')
+        )
+        header.pack(pady=20)
+        
+        # Get statistics
+        stats = self.backtester.get_statistics()
+        
+        # Summary frame
+        summary_frame = tk.Frame(dialog, bg=theme['bg'])
+        summary_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        summary_text = f"📊 OVERALL PERFORMANCE:\n"
+        summary_text += f"{'='*60}\n"
+        summary_text += f"Total Tests: {stats['total_tests']:,}\n"
+        summary_text += f"Correct: {stats['correct']:,}\n"
+        summary_text += f"Incorrect: {stats['incorrect']:,}\n"
+        summary_text += f"Overall Accuracy: {stats['overall_accuracy']:.1f}%\n"
+        
+        if stats.get('last_test_date'):
+            try:
+                last_test = datetime.fromisoformat(stats['last_test_date'])
+                summary_text += f"Last Test: {last_test.strftime('%Y-%m-%d %H:%M')}\n"
+            except:
+                pass
+        
+        summary_text += f"\n📈 STRATEGY BREAKDOWN:\n"
+        summary_text += f"{'='*60}\n"
+        for strategy, results in stats['strategy_results'].items():
+            summary_text += f"\n{strategy.upper()}:\n"
+            summary_text += f"  Tests: {results['total']}\n"
+            summary_text += f"  Correct: {results['correct']}\n"
+            summary_text += f"  Accuracy: {results['accuracy']:.1f}%\n"
+        
+        summary_label = tk.Label(
+            summary_frame,
+            text=summary_text,
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Consolas', 10),
+            justify=tk.LEFT,
+            anchor='w'
+        )
+        summary_label.pack(fill=tk.X)
+        
+        # Recent results
+        recent_frame = tk.Frame(dialog, bg=theme['bg'])
+        recent_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
+        
+        tk.Label(
+            recent_frame,
+            text="📋 Recent Test Results:",
+            bg=theme['bg'],
+            fg=theme['accent'],
+            font=('Segoe UI', 12, 'bold')
+        ).pack(anchor=tk.W, pady=(0, 5))
+        
+        recent_results = self.backtester.get_recent_results(limit=20)
+        
+        results_text = scrolledtext.ScrolledText(
+            recent_frame,
+            height=15,
+            bg=theme['frame_bg'],
+            fg=theme['fg'],
+            font=('Consolas', 9),
+            wrap=tk.WORD
+        )
+        results_text.pack(fill=tk.BOTH, expand=True)
+        
+        if recent_results:
+            for result in reversed(recent_results[-20:]):  # Show last 20
+                symbol = result.get('symbol', 'N/A')
+                test_date = result.get('test_date', 'N/A')
+                strategy = result.get('strategy', 'N/A')
+                was_correct = result.get('was_correct', False)
+                actual_change = result.get('actual_change_pct', 0)
+                predicted_action = result.get('predicted_action', 'N/A')
+                confidence = result.get('confidence', 0)
+                
+                status = "✅" if was_correct else "❌"
+                results_text.insert(tk.END, 
+                    f"{status} {symbol} ({strategy}) - {test_date[:10]}\n"
+                    f"   Action: {predicted_action} | Change: {actual_change:+.2f}% | "
+                    f"Confidence: {confidence:.1f}%\n\n"
+                )
+        else:
+            results_text.insert(tk.END, "No backtest results yet. Run a backtest to see results here.")
+        
+        results_text.config(state='disabled')
+        
+        # Buttons
+        btn_frame = tk.Frame(dialog, bg=theme['bg'])
+        btn_frame.pack(pady=10)
+        
+        run_btn = ModernButton(
+            btn_frame,
+            "🧪 Run Backtest Now",
+            command=lambda: (self._run_backtest(), dialog.destroy()),
+            theme=theme
+        )
+        run_btn.pack(side=tk.LEFT, padx=5)
+        
+        close_btn = ModernButton(
+            btn_frame,
+            "Close",
+            command=dialog.destroy,
+            theme=theme
+        )
+        close_btn.pack(side=tk.LEFT, padx=5)
 
 
 def main():
