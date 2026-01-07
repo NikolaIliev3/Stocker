@@ -18,16 +18,38 @@ import logging
 
 from secure_ml_storage import SecureMLStorage
 
+# Import enhanced features if available
+try:
+    from enhanced_features import EnhancedFeatureExtractor as EnhancedExtractor
+    HAS_ENHANCED_FEATURES = True
+except ImportError:
+    HAS_ENHANCED_FEATURES = False
+    logger = logging.getLogger(__name__)
+    logger.debug("Enhanced features module not available")
+
 logger = logging.getLogger(__name__)
 
 
 class FeatureExtractor:
     """Extracts ML features from stock data and indicators"""
     
+    def __init__(self, data_fetcher=None):
+        """Initialize feature extractor with optional data fetcher for enhanced features"""
+        self.data_fetcher = data_fetcher
+        if HAS_ENHANCED_FEATURES and data_fetcher:
+            try:
+                self.enhanced_extractor = EnhancedExtractor(data_fetcher)
+            except Exception as e:
+                logger.warning(f"Could not initialize enhanced extractor: {e}")
+                self.enhanced_extractor = None
+        else:
+            self.enhanced_extractor = None
+    
     def extract_features(self, stock_data: dict, history_data: dict, 
                         financials_data: dict = None, indicators: dict = None,
                         market_regime: dict = None, timeframe_analysis: dict = None,
-                        relative_strength: dict = None, support_resistance: dict = None) -> np.ndarray:
+                        relative_strength: dict = None, support_resistance: dict = None,
+                        news_data: list = None) -> np.ndarray:
         """Extract comprehensive feature vector for ML model with enhanced features"""
         features = []
         
@@ -157,6 +179,22 @@ class FeatureExtractor:
         features.append(current_price)
         
         # ===== ENHANCED FEATURES =====
+        # Extract additional enhanced features if available
+        if self.enhanced_extractor:
+            try:
+                enhanced_features = self.enhanced_extractor.extract_all_enhanced_features(
+                    stock_data, history_data, news_data
+                )
+                # Add enhanced features to feature vector
+                for key, value in enhanced_features.items():
+                    if isinstance(value, (int, float)):
+                        features.append(float(value))
+                    elif isinstance(value, bool):
+                        features.append(1.0 if value else 0.0)
+                    else:
+                        features.append(0.0)
+            except Exception as e:
+                logger.debug(f"Could not extract enhanced features: {e}")
         
         # 1. Market Regime Indicator (3 features: bull, bear, sideways as one-hot encoded)
         if market_regime:
@@ -407,12 +445,23 @@ class StockPredictionML:
                 self.train_accuracy = 0
                 self.test_accuracy = 0
     
-    def train(self, training_samples: List[Dict], test_size: float = 0.2) -> Dict:
+    def train(self, training_samples: List[Dict], test_size: float = 0.2, random_seed: int = None) -> Dict:
         """Train ML model on historical data"""
         if len(training_samples) < 100:
             return {"error": f"Insufficient training samples: {len(training_samples)} < 100"}
         
-        logger.info(f"Training ML model on {len(training_samples)} samples...")
+        # Force retraining by resetting model components
+        logger.info("Resetting model for fresh training...")
+        self.model = None
+        self.scaler = StandardScaler()  # Reset scaler
+        self.label_encoder = LabelEncoder()  # Reset encoder
+        
+        # Use variable random seed if not provided (based on current time)
+        if random_seed is None:
+            import time
+            random_seed = int(time.time() * 1000) % 10000  # Use milliseconds for seed
+        
+        logger.info(f"Training ML model on {len(training_samples)} samples with random_seed={random_seed}...")
         
         # Prepare data
         X = np.array([s['features'] for s in training_samples])
@@ -461,7 +510,7 @@ class StockPredictionML:
         
         # Split data
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y_encoded, test_size=test_size, random_state=42, stratify=y_encoded
+            X, y_encoded, test_size=test_size, random_state=random_seed, stratify=y_encoded
         )
         
         # ===== FEATURE SELECTION =====
@@ -474,7 +523,7 @@ class StockPredictionML:
             min_samples_leaf=5,
             max_features='sqrt',
             class_weight='balanced',
-            random_state=42,
+            random_state=random_seed,
             n_jobs=-1
         )
         
@@ -552,7 +601,7 @@ class StockPredictionML:
             min_samples_leaf=10,  # Increased from 5
             max_features='sqrt',  # Limit features per split
             class_weight='balanced',
-            random_state=42,
+            random_state=random_seed,
             n_jobs=-1
         )
         
@@ -563,14 +612,14 @@ class StockPredictionML:
             min_samples_split=20,  # Added regularization
             min_samples_leaf=10,  # Added regularization
             subsample=0.8,  # Use 80% of samples per tree (prevents overfitting)
-            random_state=42
+            random_state=random_seed
         )
         
         lr = LogisticRegression(
             max_iter=1000,
             C=0.1,  # Added regularization (lower C = more regularization)
             class_weight='balanced',
-            random_state=42
+            random_state=random_seed
             # L2 regularization is the default, no need to specify penalty='l2'
         )
         

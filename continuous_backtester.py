@@ -16,6 +16,15 @@ import threading
 from data_fetcher import StockDataFetcher
 from hybrid_predictor import HybridStockPredictor
 
+# Import walk-forward backtester if available
+try:
+    from walk_forward_backtester import WalkForwardBacktester
+    HAS_WALK_FORWARD = True
+except ImportError:
+    HAS_WALK_FORWARD = False
+    logger = logging.getLogger(__name__)
+    logger.debug("Walk-forward backtester not available")
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +58,17 @@ class ContinuousBacktester:
         # Track which strategies were tested in the last run (for report filtering)
         self.last_tested_strategies = []
         
+        # Initialize walk-forward backtester if available
+        if HAS_WALK_FORWARD:
+            try:
+                self.walk_forward_backtester = WalkForwardBacktester(data_dir)
+                logger.info("Walk-forward backtester initialized")
+            except Exception as e:
+                logger.warning(f"Could not initialize walk-forward backtester: {e}")
+                self.walk_forward_backtester = None
+        else:
+            self.walk_forward_backtester = None
+        
         # Popular stocks to test
         self.test_symbols = [
             'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'NFLX',
@@ -67,10 +87,15 @@ class ContinuousBacktester:
         if self.results_file.exists():
             try:
                 with open(self.results_file, 'r') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    # Ensure strategy_results exists and only contains tested strategies
+                    if 'strategy_results' not in data:
+                        data['strategy_results'] = {}
+                    return data
             except Exception as e:
                 logger.error(f"Error loading backtest results: {e}")
         
+        # Default: empty strategy_results (will be populated as strategies are tested)
         return {
             'total_tests': 0,
             'correct_predictions': 0,
@@ -78,15 +103,16 @@ class ContinuousBacktester:
             'accuracy_history': [],
             'test_details': [],
             'last_test_date': None,
-            'strategy_results': {
-                'trading': {'total': 0, 'correct': 0, 'accuracy': 0},
-                'mixed': {'total': 0, 'correct': 0, 'accuracy': 0},
-                'investing': {'total': 0, 'correct': 0, 'accuracy': 0}
-            }
+            'strategy_results': {}  # Empty - will be populated only for tested strategies
         }
     
-    def save_results(self):
-        """Save backtest results"""
+    def save_results(self, tested_strategies: List[str] = None):
+        """Save backtest results
+        
+        Args:
+            tested_strategies: List of strategies that were actually tested.
+                              If provided, only these strategies will be saved in strategy_results.
+        """
         try:
             # Keep only last 1000 test details
             if len(self.results['test_details']) > 1000:
@@ -95,6 +121,15 @@ class ContinuousBacktester:
             # Keep only last 100 accuracy history entries
             if len(self.results['accuracy_history']) > 100:
                 self.results['accuracy_history'] = self.results['accuracy_history'][-100:]
+            
+            # Filter strategy_results to only include tested strategies
+            if tested_strategies is not None:
+                # Only keep results for strategies that were actually tested
+                filtered_strategy_results = {}
+                for strategy in tested_strategies:
+                    if strategy in self.results['strategy_results']:
+                        filtered_strategy_results[strategy] = self.results['strategy_results'][strategy]
+                self.results['strategy_results'] = filtered_strategy_results
             
             with open(self.results_file, 'w') as f:
                 json.dump(self.results, f, indent=2)
@@ -277,9 +312,14 @@ class ContinuousBacktester:
                         if skipped == 1 or skipped % 10 == 0:  # Log first skip and every 10th
                             logger.debug(f"Skipped {skipped} tests so far for {strategy} (attempting to find valid points...)")
                 
-                # Update results
+                # Update results (only if tests were run)
                 if tests_run > 0:
                     logger.info(f"Found {tests_run} valid test points for {strategy} (skipped {skipped} invalid points)")
+                    # Initialize strategy_results entry if it doesn't exist
+                    if strategy not in self.results['strategy_results']:
+                        self.results['strategy_results'][strategy] = {
+                            'total': 0, 'correct': 0, 'accuracy': 0
+                        }
                     strategy_results = self.results['strategy_results'][strategy]
                     strategy_results['total'] += tests_run
                     strategy_results['correct'] += correct
@@ -322,7 +362,8 @@ class ContinuousBacktester:
                 })
             
             self.results['last_test_date'] = datetime.now().isoformat()
-            self.save_results()
+            # Only save results for strategies that were actually tested
+            self.save_results(tested_strategies=tested_strategies)
             
             # Calculate summary
             total_tests_after = sum(r['total'] for r in self.results['strategy_results'].values())
@@ -671,7 +712,9 @@ class ContinuousBacktester:
                     'last_updated': datetime.now().isoformat()
                 }
             
-            self.save_results()
+            # Preserve only strategies that exist in strategy_results (were actually tested)
+            tested_strategies = list(self.results['strategy_results'].keys())
+            self.save_results(tested_strategies=tested_strategies)
             
         except Exception as e:
             logger.error(f"Error learning from backtest results: {e}", exc_info=True)

@@ -2,14 +2,27 @@
 Data fetching module for Stocker App
 Handles secure communication with backend proxy
 Falls back to direct yfinance if backend is unavailable
+Integrated with data provider abstraction and data quality checks
 """
 import requests
 import logging
 from security import get_secure_session, DataValidator, SecurityError
-from config import BACKEND_API_URL
+from config import BACKEND_API_URL, APP_DATA_DIR
 import json
 import pandas as pd
 from datetime import datetime, timedelta
+from pathlib import Path
+
+# Import new modules
+try:
+    from data_provider_abstraction import MultiDataProvider, YahooFinanceProvider
+    from data_quality import DataQualityChecker
+    from error_handler import ErrorHandler, safe_call
+    HAS_NEW_MODULES = True
+except ImportError as e:
+    logger = logging.getLogger(__name__)
+    logger.warning(f"New modules not available: {e}")
+    HAS_NEW_MODULES = False
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +36,20 @@ class StockDataFetcher:
         self._backend_available = None  # Cache backend availability check
         self._last_backend_check = 0  # Timestamp of last check
         self._backend_check_interval = 30  # Recheck every 30 seconds
+        
+        # Initialize new modules if available
+        if HAS_NEW_MODULES:
+            try:
+                self.data_provider = MultiDataProvider([YahooFinanceProvider()])
+                self.quality_checker = DataQualityChecker()
+                logger.info("Data provider abstraction and quality checker initialized")
+            except Exception as e:
+                logger.warning(f"Could not initialize new modules: {e}")
+                self.data_provider = None
+                self.quality_checker = None
+        else:
+            self.data_provider = None
+            self.quality_checker = None
     
     def _check_backend_available(self) -> bool:
         """Check if backend server is available"""
@@ -131,13 +158,51 @@ class StockDataFetcher:
             logger.error(f"Error fetching data directly from yfinance: {e}")
             raise
     
-    def fetch_stock_data(self, symbol: str, force_refresh: bool = False) -> dict:
+    def fetch_stock_data(self, symbol: str, force_refresh: bool = False, 
+                        check_quality: bool = True) -> dict:
         """Fetch current stock data for a symbol
         
         Args:
             symbol: Stock symbol to fetch
             force_refresh: If True, bypasses cache to get fresh data
+            check_quality: If True, perform data quality checks
         """
+        # Try using data provider abstraction if available
+        if self.data_provider:
+            try:
+                provider_data = self.data_provider.fetch_stock_data(symbol)
+                if provider_data:
+                    # Convert to expected format
+                    data = {
+                        "symbol": symbol.upper(),
+                        "price": provider_data.get('currentPrice', 0),
+                        "info": provider_data.get('info', {})
+                    }
+                    
+                    # Get history for quality check
+                    history = self.data_provider.fetch_history(symbol)
+                    if history and 'data' in history:
+                        data['history'] = history['data']
+                    
+                    # Perform quality check if requested
+                    if check_quality and self.quality_checker and history:
+                        quality_report = self.quality_checker.check_stock_data_quality(
+                            data, history
+                        )
+                        data['quality_report'] = quality_report
+                        
+                        # Auto-clean if quality is poor
+                        if quality_report.get('overall_score', 100) < 60:
+                            logger.warning(f"Data quality low ({quality_report['overall_score']:.1f}), cleaning...")
+                            cleaned = self.quality_checker.clean_data(history, quality_report)
+                            if cleaned.get('cleaned'):
+                                data['history'] = cleaned['data']
+                                logger.info(f"Cleaned {cleaned.get('rows_removed', 0)} invalid rows")
+                    
+                    return data
+            except Exception as e:
+                logger.debug(f"Data provider failed, falling back to backend: {e}")
+        
         # Try backend first if available
         if self._check_backend_available():
             try:
@@ -156,6 +221,15 @@ class StockDataFetcher:
                 # Validate data integrity
                 if not DataValidator.validate_stock_data(data):
                     raise SecurityError("Invalid stock data received from server")
+                
+                # Perform quality check if requested
+                if check_quality and self.quality_checker:
+                    history_data = self.fetch_stock_history(symbol)
+                    if history_data and 'data' in history_data:
+                        quality_report = self.quality_checker.check_stock_data_quality(
+                            data, history_data
+                        )
+                        data['quality_report'] = quality_report
                 
                 return data
             

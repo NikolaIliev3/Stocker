@@ -14,6 +14,7 @@ Pillow==10.0.0
 pywin32==306
 scikit-learn==1.3.0
 joblib==1.3.0
+scipy==1.11.0
 
 # Optional: For dependency vulnerability scanning
 # safety>=2.3.0

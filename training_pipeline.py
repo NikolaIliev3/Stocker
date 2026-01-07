@@ -408,7 +408,8 @@ class MLTrainingPipeline:
         self.data_fetcher = data_fetcher
         self.data_dir = data_dir
         self.app = app  # Optional app reference for notifications
-        self.feature_extractor = FeatureExtractor()
+        # Initialize FeatureExtractor with data_fetcher to enable enhanced features
+        self.feature_extractor = FeatureExtractor(data_fetcher=data_fetcher)
         self.data_generator = TrainingDataGenerator(data_fetcher, self.feature_extractor)
     
     def train_on_symbols(self, symbols: List[str], start_date: str, end_date: str,

@@ -47,6 +47,17 @@ from trend_change_predictor import TrendChangePredictor
 from ai_researcher import SeekerAI
 from config import SEEKER_AI_ENABLED
 
+# Import new modules
+try:
+    from alert_system import AlertSystem
+    from error_handler import ErrorHandler, safe_call
+    from walk_forward_backtester import WalkForwardBacktester
+    HAS_NEW_MODULES = True
+except ImportError as e:
+    logger = logging.getLogger(__name__)
+    logger.warning(f"New modules not available: {e}")
+    HAS_NEW_MODULES = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -147,6 +158,20 @@ class StockerApp:
         
         self.learning_tracker = LearningTracker(APP_DATA_DIR)  # Track all learning sources
         self.backtester = ContinuousBacktester(self, APP_DATA_DIR)  # Continuous backtesting system
+        
+        # Initialize new modules if available
+        if HAS_NEW_MODULES:
+            try:
+                self.alert_system = AlertSystem(APP_DATA_DIR)
+                self.walk_forward_backtester = WalkForwardBacktester(APP_DATA_DIR)
+                logger.info("Alert system and walk-forward backtester initialized")
+            except Exception as e:
+                logger.warning(f"Could not initialize new modules: {e}")
+                self.alert_system = None
+                self.walk_forward_backtester = None
+        else:
+            self.alert_system = None
+            self.walk_forward_backtester = None
         self.stock_monitor = StockMonitor(APP_DATA_DIR)  # Monitor stocks for BUY signals
         self.momentum_monitor = MomentumMonitor(APP_DATA_DIR)  # Monitor momentum and trend changes
         self.trend_change_predictor = TrendChangePredictor(data_dir=APP_DATA_DIR)  # Predict trend changes
@@ -1898,6 +1923,26 @@ class StockerApp:
         placeholder += "• Recent news articles"
         self.seeker_ai_text.insert('1.0', placeholder)
         
+        # Risk Management tab
+        self.risk_management_frame = tk.Frame(self.notebook, bg=theme['frame_bg'])
+        self.notebook.add(self.risk_management_frame, text="🛡️ Risk Management")
+        self._create_risk_management_tab()
+        
+        # Advanced Analytics tab
+        self.advanced_analytics_frame = tk.Frame(self.notebook, bg=theme['frame_bg'])
+        self.notebook.add(self.advanced_analytics_frame, text="📊 Advanced Analytics")
+        self._create_advanced_analytics_tab()
+        
+        # Walk-Forward Backtesting tab
+        self.walk_forward_frame = tk.Frame(self.notebook, bg=theme['frame_bg'])
+        self.notebook.add(self.walk_forward_frame, text="🔄 Walk-Forward")
+        self._create_walk_forward_tab()
+        
+        # Alert System tab
+        self.alerts_frame = tk.Frame(self.notebook, bg=theme['frame_bg'])
+        self.notebook.add(self.alerts_frame, text="🔔 Alerts")
+        self._create_alerts_tab()
+        
         # Bind mousewheel to potential text for smooth scrolling
         def on_potential_scroll(event):
             delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
@@ -2963,6 +3008,426 @@ class StockerApp:
         if hasattr(self, 'firing_results_text'):
             self.firing_results_text.insert(tk.END, text)
             self.firing_results_text.see(tk.END)
+    
+    def _create_risk_management_tab(self):
+        """Create the Risk Management tab"""
+        theme = self.theme_manager.get_theme()
+        
+        # Header
+        header_frame = tk.Frame(self.risk_management_frame, bg=theme['bg'])
+        header_frame.pack(fill=tk.X, pady=(0, 15), padx=15)
+        
+        title_label = tk.Label(header_frame, text="🛡️ Risk Management", 
+                              font=('Segoe UI', 14, 'bold'), bg=theme['bg'], fg=theme['fg'])
+        title_label.pack(side=tk.LEFT)
+        
+        # Container with scroll
+        container = tk.Frame(self.risk_management_frame, bg=theme['bg'])
+        container.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        
+        canvas = tk.Canvas(container, bg=theme['bg'], highlightthickness=0)
+        scrollbar = ModernScrollbar(container, command=canvas.yview, theme=theme)
+        scrollable_frame = tk.Frame(canvas, bg=theme['bg'])
+        
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Position sizing card
+        position_card = ModernCard(scrollable_frame, "Position Sizing Calculator", theme=theme, padding=15)
+        position_card.pack(fill=tk.X, pady=(0, 15))
+        
+        pos_frame = tk.Frame(position_card, bg=theme['card_bg'])
+        pos_frame.pack(fill=tk.X, padx=15, pady=15)
+        
+        # Input fields
+        tk.Label(pos_frame, text="Entry Price:", bg=theme['card_bg'], fg=theme['fg']).grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.rm_entry_price = tk.Entry(pos_frame, width=15)
+        self.rm_entry_price.grid(row=0, column=1, pady=5, padx=5)
+        
+        tk.Label(pos_frame, text="Stop Loss:", bg=theme['card_bg'], fg=theme['fg']).grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.rm_stop_loss = tk.Entry(pos_frame, width=15)
+        self.rm_stop_loss.grid(row=1, column=1, pady=5, padx=5)
+        
+        tk.Label(pos_frame, text="Confidence (%):", bg=theme['card_bg'], fg=theme['fg']).grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.rm_confidence = tk.Entry(pos_frame, width=15)
+        self.rm_confidence.insert(0, "80")
+        self.rm_confidence.grid(row=2, column=1, pady=5, padx=5)
+        
+        tk.Label(pos_frame, text="Method:", bg=theme['card_bg'], fg=theme['fg']).grid(row=3, column=0, sticky=tk.W, pady=5)
+        self.rm_method = ttk.Combobox(pos_frame, values=['fixed_fraction', 'kelly', 'optimal_f'], width=12, state='readonly')
+        self.rm_method.set('fixed_fraction')
+        self.rm_method.grid(row=3, column=1, pady=5, padx=5)
+        
+        calc_btn = ModernButton(pos_frame, text="Calculate Position Size", 
+                               command=self._calculate_position_size_ui, theme=theme)
+        calc_btn.grid(row=4, column=0, columnspan=2, pady=10)
+        
+        # Results
+        self.rm_position_results = scrolledtext.ScrolledText(pos_frame, height=8, wrap=tk.WORD,
+                                                             bg=theme['card_bg'], fg=theme['fg'],
+                                                             font=('Consolas', 9))
+        self.rm_position_results.grid(row=5, column=0, columnspan=2, pady=5, sticky=tk.EW)
+        
+        # Stop Loss Recommendations card
+        stoploss_card = ModernCard(scrollable_frame, "Stop Loss Recommendations", theme=theme, padding=15)
+        stoploss_card.pack(fill=tk.X, pady=(0, 15))
+        
+        sl_frame = tk.Frame(stoploss_card, bg=theme['card_bg'])
+        sl_frame.pack(fill=tk.X, padx=15, pady=15)
+        
+        tk.Label(sl_frame, text="Current Price:", bg=theme['card_bg'], fg=theme['fg']).grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.rm_current_price = tk.Entry(sl_frame, width=15)
+        self.rm_current_price.grid(row=0, column=1, pady=5, padx=5)
+        
+        tk.Label(sl_frame, text="Volatility (ATR):", bg=theme['card_bg'], fg=theme['fg']).grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.rm_volatility = tk.Entry(sl_frame, width=15)
+        self.rm_volatility.grid(row=1, column=1, pady=5, padx=5)
+        
+        tk.Label(sl_frame, text="Method:", bg=theme['card_bg'], fg=theme['fg']).grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.rm_sl_method = ttk.Combobox(sl_frame, values=['atr', 'percentage', 'support', 'trailing'], width=12, state='readonly')
+        self.rm_sl_method.set('atr')
+        self.rm_sl_method.grid(row=2, column=1, pady=5, padx=5)
+        
+        calc_sl_btn = ModernButton(sl_frame, text="Get Stop Loss", 
+                                   command=self._calculate_stop_loss_ui, theme=theme)
+        calc_sl_btn.grid(row=3, column=0, columnspan=2, pady=10)
+        
+        self.rm_stoploss_results = scrolledtext.ScrolledText(sl_frame, height=6, wrap=tk.WORD,
+                                                             bg=theme['card_bg'], fg=theme['fg'],
+                                                             font=('Consolas', 9))
+        self.rm_stoploss_results.grid(row=4, column=0, columnspan=2, pady=5, sticky=tk.EW)
+        
+        # Portfolio Risk Metrics card
+        risk_card = ModernCard(scrollable_frame, "Portfolio Risk Metrics", theme=theme, padding=15)
+        risk_card.pack(fill=tk.X, pady=(0, 15))
+        
+        risk_frame = tk.Frame(risk_card, bg=theme['card_bg'])
+        risk_frame.pack(fill=tk.X, padx=15, pady=15)
+        
+        calc_risk_btn = ModernButton(risk_frame, text="Calculate Portfolio Risk", 
+                                     command=self._calculate_portfolio_risk_ui, theme=theme)
+        calc_risk_btn.pack(pady=10)
+        
+        self.rm_portfolio_results = scrolledtext.ScrolledText(risk_frame, height=10, wrap=tk.WORD,
+                                                              bg=theme['card_bg'], fg=theme['fg'],
+                                                              font=('Consolas', 9))
+        self.rm_portfolio_results.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Update scroll region on mousewheel
+        def on_rm_scroll(event):
+            delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
+            if isinstance(delta, (int, float)):
+                scroll_amount = int(-1 * (delta / 120)) * 3
+                canvas.yview_scroll(scroll_amount, "units")
+        canvas.bind("<MouseWheel>", on_rm_scroll)
+        scrollable_frame.bind("<MouseWheel>", on_rm_scroll)
+    
+    def _create_advanced_analytics_tab(self):
+        """Create the Advanced Analytics tab"""
+        theme = self.theme_manager.get_theme()
+        
+        # Header
+        header_frame = tk.Frame(self.advanced_analytics_frame, bg=theme['bg'])
+        header_frame.pack(fill=tk.X, pady=(0, 15), padx=15)
+        
+        title_label = tk.Label(header_frame, text="📊 Advanced Analytics", 
+                              font=('Segoe UI', 14, 'bold'), bg=theme['bg'], fg=theme['fg'])
+        title_label.pack(side=tk.LEFT)
+        
+        # Container with scroll
+        container = tk.Frame(self.advanced_analytics_frame, bg=theme['bg'])
+        container.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        
+        canvas = tk.Canvas(container, bg=theme['bg'], highlightthickness=0)
+        scrollbar = ModernScrollbar(container, command=canvas.yview, theme=theme)
+        scrollable_frame = tk.Frame(canvas, bg=theme['bg'])
+        
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Correlation Analysis card
+        corr_card = ModernCard(scrollable_frame, "Correlation Analysis", theme=theme, padding=15)
+        corr_card.pack(fill=tk.X, pady=(0, 15))
+        
+        corr_frame = tk.Frame(corr_card, bg=theme['card_bg'])
+        corr_frame.pack(fill=tk.X, padx=15, pady=15)
+        
+        tk.Label(corr_frame, text="Stock Symbols (comma-separated):", bg=theme['card_bg'], fg=theme['fg']).pack(anchor=tk.W, pady=5)
+        self.aa_symbols_entry = tk.Entry(corr_frame, width=50)
+        self.aa_symbols_entry.insert(0, "AAPL,MSFT,GOOGL,AMZN")
+        self.aa_symbols_entry.pack(fill=tk.X, pady=5)
+        
+        calc_corr_btn = ModernButton(corr_frame, text="Calculate Correlation", 
+                                     command=self._calculate_correlation_ui, theme=theme)
+        calc_corr_btn.pack(pady=10)
+        
+        self.aa_correlation_results = scrolledtext.ScrolledText(corr_frame, height=8, wrap=tk.WORD,
+                                                                bg=theme['card_bg'], fg=theme['fg'],
+                                                                font=('Consolas', 9))
+        self.aa_correlation_results.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Portfolio Optimization card
+        opt_card = ModernCard(scrollable_frame, "Portfolio Optimization", theme=theme, padding=15)
+        opt_card.pack(fill=tk.X, pady=(0, 15))
+        
+        opt_frame = tk.Frame(opt_card, bg=theme['card_bg'])
+        opt_frame.pack(fill=tk.X, padx=15, pady=15)
+        
+        tk.Label(opt_frame, text="Stock Symbols (comma-separated):", bg=theme['card_bg'], fg=theme['fg']).pack(anchor=tk.W, pady=5)
+        self.aa_opt_symbols_entry = tk.Entry(opt_frame, width=50)
+        self.aa_opt_symbols_entry.insert(0, "AAPL,MSFT,GOOGL")
+        self.aa_opt_symbols_entry.pack(fill=tk.X, pady=5)
+        
+        tk.Label(opt_frame, text="Optimization Method:", bg=theme['card_bg'], fg=theme['fg']).pack(anchor=tk.W, pady=5)
+        self.aa_opt_method = ttk.Combobox(opt_frame, values=['sharpe', 'min_variance', 'max_return'], width=15, state='readonly')
+        self.aa_opt_method.set('sharpe')
+        self.aa_opt_method.pack(anchor=tk.W, pady=5)
+        
+        calc_opt_btn = ModernButton(opt_frame, text="Optimize Portfolio", 
+                                    command=self._optimize_portfolio_ui, theme=theme)
+        calc_opt_btn.pack(pady=10)
+        
+        self.aa_optimization_results = scrolledtext.ScrolledText(opt_frame, height=8, wrap=tk.WORD,
+                                                                 bg=theme['card_bg'], fg=theme['fg'],
+                                                                 font=('Consolas', 9))
+        self.aa_optimization_results.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Monte Carlo Simulation card
+        mc_card = ModernCard(scrollable_frame, "Monte Carlo Simulation", theme=theme, padding=15)
+        mc_card.pack(fill=tk.X, pady=(0, 15))
+        
+        mc_frame = tk.Frame(mc_card, bg=theme['card_bg'])
+        mc_frame.pack(fill=tk.X, padx=15, pady=15)
+        
+        mc_input_frame = tk.Frame(mc_frame, bg=theme['card_bg'])
+        mc_input_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(mc_input_frame, text="Initial Price:", bg=theme['card_bg'], fg=theme['fg']).grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.aa_mc_price = tk.Entry(mc_input_frame, width=15)
+        self.aa_mc_price.grid(row=0, column=1, pady=5, padx=5)
+        
+        tk.Label(mc_input_frame, text="Expected Return (daily):", bg=theme['card_bg'], fg=theme['fg']).grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.aa_mc_return = tk.Entry(mc_input_frame, width=15)
+        self.aa_mc_return.insert(0, "0.001")
+        self.aa_mc_return.grid(row=1, column=1, pady=5, padx=5)
+        
+        tk.Label(mc_input_frame, text="Volatility (daily):", bg=theme['card_bg'], fg=theme['fg']).grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.aa_mc_vol = tk.Entry(mc_input_frame, width=15)
+        self.aa_mc_vol.insert(0, "0.02")
+        self.aa_mc_vol.grid(row=2, column=1, pady=5, padx=5)
+        
+        tk.Label(mc_input_frame, text="Days:", bg=theme['card_bg'], fg=theme['fg']).grid(row=3, column=0, sticky=tk.W, pady=5)
+        self.aa_mc_days = tk.Entry(mc_input_frame, width=15)
+        self.aa_mc_days.insert(0, "252")
+        self.aa_mc_days.grid(row=3, column=1, pady=5, padx=5)
+        
+        calc_mc_btn = ModernButton(mc_frame, text="Run Simulation", 
+                                   command=self._run_monte_carlo_ui, theme=theme)
+        calc_mc_btn.pack(pady=10)
+        
+        self.aa_mc_results = scrolledtext.ScrolledText(mc_frame, height=8, wrap=tk.WORD,
+                                                       bg=theme['card_bg'], fg=theme['fg'],
+                                                       font=('Consolas', 9))
+        self.aa_mc_results.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Update scroll region on mousewheel
+        def on_aa_scroll(event):
+            delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
+            if isinstance(delta, (int, float)):
+                scroll_amount = int(-1 * (delta / 120)) * 3
+                canvas.yview_scroll(scroll_amount, "units")
+        canvas.bind("<MouseWheel>", on_aa_scroll)
+        scrollable_frame.bind("<MouseWheel>", on_aa_scroll)
+    
+    def _create_walk_forward_tab(self):
+        """Create the Walk-Forward Backtesting tab"""
+        theme = self.theme_manager.get_theme()
+        
+        # Header
+        header_frame = tk.Frame(self.walk_forward_frame, bg=theme['bg'])
+        header_frame.pack(fill=tk.X, pady=(0, 15), padx=15)
+        
+        title_label = tk.Label(header_frame, text="🔄 Walk-Forward Backtesting", 
+                              font=('Segoe UI', 14, 'bold'), bg=theme['bg'], fg=theme['fg'])
+        title_label.pack(side=tk.LEFT)
+        
+        # Info
+        info_label = tk.Label(self.walk_forward_frame, 
+                             text="Walk-forward backtesting prevents overfitting by training on historical data\n"
+                                  "and testing on forward data, then moving the window forward.",
+                             font=('Segoe UI', 9), bg=theme['bg'], fg=theme['text_secondary'],
+                             justify=tk.LEFT)
+        info_label.pack(fill=tk.X, pady=(0, 15), padx=15)
+        
+        # Container
+        container = tk.Frame(self.walk_forward_frame, bg=theme['bg'])
+        container.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        
+        # Parameters card
+        params_card = ModernCard(container, "Parameters", theme=theme, padding=15)
+        params_card.pack(fill=tk.X, pady=(0, 15))
+        
+        params_frame = tk.Frame(params_card, bg=theme['card_bg'])
+        params_frame.pack(fill=tk.X, padx=15, pady=15)
+        
+        tk.Label(params_frame, text="Train Window (days):", bg=theme['card_bg'], fg=theme['fg']).grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.wf_train_window = tk.Entry(params_frame, width=15)
+        self.wf_train_window.insert(0, "252")
+        self.wf_train_window.grid(row=0, column=1, pady=5, padx=5)
+        
+        tk.Label(params_frame, text="Test Window (days):", bg=theme['card_bg'], fg=theme['fg']).grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.wf_test_window = tk.Entry(params_frame, width=15)
+        self.wf_test_window.insert(0, "63")
+        self.wf_test_window.grid(row=1, column=1, pady=5, padx=5)
+        
+        tk.Label(params_frame, text="Step Size (days):", bg=theme['card_bg'], fg=theme['fg']).grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.wf_step_size = tk.Entry(params_frame, width=15)
+        self.wf_step_size.insert(0, "21")
+        self.wf_step_size.grid(row=2, column=1, pady=5, padx=5)
+        
+        # Multi-stock option
+        self.wf_multi_stock = tk.BooleanVar(value=False)
+        multi_stock_check = tk.Checkbutton(
+            params_frame,
+            text="Test Multiple Stocks (More Robust)",
+            variable=self.wf_multi_stock,
+            bg=theme['card_bg'],
+            fg=theme['fg'],
+            selectcolor=theme['card_bg'],
+            activebackground=theme['card_bg'],
+            activeforeground=theme['fg']
+        )
+        multi_stock_check.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=5)
+        
+        multi_stock_frame = tk.Frame(params_frame, bg=theme['card_bg'])
+        multi_stock_frame.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=5)
+        tk.Label(multi_stock_frame, text="Max stocks:", bg=theme['card_bg'], fg=theme['fg']).pack(side=tk.LEFT, padx=(20, 5))
+        self.wf_max_stocks = tk.Entry(multi_stock_frame, width=10)
+        self.wf_max_stocks.insert(0, "10")
+        self.wf_max_stocks.pack(side=tk.LEFT)
+        
+        run_wf_btn = ModernButton(params_frame, text="Run Walk-Forward Test", 
+                                  command=self._run_walk_forward_ui, theme=theme)
+        run_wf_btn.grid(row=5, column=0, columnspan=2, pady=10)
+        
+        # Retraining recommendation display (initially hidden)
+        self.wf_retrain_frame = tk.Frame(params_card, bg=theme['card_bg'])
+        self.wf_retrain_label = tk.Label(self.wf_retrain_frame, 
+                                        text="", 
+                                        font=('Segoe UI', 10, 'bold'),
+                                        bg=theme['card_bg'],
+                                        fg=theme['fg'],
+                                        wraplength=500,
+                                        justify=tk.LEFT)
+        self.wf_retrain_label.pack(fill=tk.X, padx=15, pady=10)
+        
+        # Results
+        self.wf_results = scrolledtext.ScrolledText(container, height=20, wrap=tk.WORD,
+                                                    bg=theme['frame_bg'], fg=theme['fg'],
+                                                    font=('Consolas', 9))
+        self.wf_results.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.wf_results.insert('1.0', "Walk-forward backtesting results will appear here.\n\n"
+                                      "This method helps validate that your strategy works on unseen data\n"
+                                      "and prevents overfitting to historical patterns.")
+        self.wf_results.config(state='disabled')
+    
+    def _create_alerts_tab(self):
+        """Create the Alert System tab"""
+        theme = self.theme_manager.get_theme()
+        
+        # Header
+        header_frame = tk.Frame(self.alerts_frame, bg=theme['bg'])
+        header_frame.pack(fill=tk.X, pady=(0, 15), padx=15)
+        
+        title_frame = tk.Frame(header_frame, bg=theme['bg'])
+        title_frame.pack(side=tk.LEFT)
+        
+        title_label = tk.Label(title_frame, text="🔔 Alert System", 
+                              font=('Segoe UI', 14, 'bold'), bg=theme['bg'], fg=theme['fg'])
+        title_label.pack(side=tk.LEFT)
+        
+        unread_count = 0
+        if self.alert_system:
+            unread_count = len(self.alert_system.get_unread_alerts())
+            if unread_count > 0:
+                count_label = tk.Label(title_frame, text=f" ({unread_count} unread)", 
+                                      font=('Segoe UI', 10), bg=theme['bg'], fg=theme['accent'])
+                count_label.pack(side=tk.LEFT, padx=(5, 0))
+        
+        refresh_btn = ModernButton(header_frame, text="Refresh", 
+                                   command=self._refresh_alerts, theme=theme)
+        refresh_btn.pack(side=tk.RIGHT)
+        
+        mark_all_read_btn = ModernButton(header_frame, text="Mark All Read", 
+                                         command=self._mark_all_alerts_read, theme=theme)
+        mark_all_read_btn.pack(side=tk.RIGHT, padx=(0, 5))
+        
+        # Container with scroll
+        container = tk.Frame(self.alerts_frame, bg=theme['bg'])
+        container.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        
+        canvas = tk.Canvas(container, bg=theme['bg'], highlightthickness=0)
+        scrollbar = ModernScrollbar(container, command=canvas.yview, theme=theme)
+        scrollable_frame = tk.Frame(canvas, bg=theme['bg'])
+        
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Create alerts list frame
+        self.alerts_list_frame = scrollable_frame
+        
+        # Create alert button
+        create_alert_card = ModernCard(scrollable_frame, "Create Alert", theme=theme, padding=15)
+        create_alert_card.pack(fill=tk.X, pady=(0, 15))
+        
+        create_frame = tk.Frame(create_alert_card, bg=theme['card_bg'])
+        create_frame.pack(fill=tk.X, padx=15, pady=15)
+        
+        tk.Label(create_frame, text="Alert Type:", bg=theme['card_bg'], fg=theme['fg']).grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.alert_type = ttk.Combobox(create_frame, values=['price_alert', 'prediction_alert', 'portfolio_alert'], width=20, state='readonly')
+        self.alert_type.set('price_alert')
+        self.alert_type.grid(row=0, column=1, pady=5, padx=5)
+        
+        tk.Label(create_frame, text="Symbol:", bg=theme['card_bg'], fg=theme['fg']).grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.alert_symbol = tk.Entry(create_frame, width=20)
+        self.alert_symbol.grid(row=1, column=1, pady=5, padx=5)
+        
+        tk.Label(create_frame, text="Message:", bg=theme['card_bg'], fg=theme['fg']).grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.alert_message = tk.Entry(create_frame, width=40)
+        self.alert_message.grid(row=2, column=1, pady=5, padx=5)
+        
+        tk.Label(create_frame, text="Priority:", bg=theme['card_bg'], fg=theme['fg']).grid(row=3, column=0, sticky=tk.W, pady=5)
+        self.alert_priority = ttk.Combobox(create_frame, values=['low', 'medium', 'high', 'critical'], width=20, state='readonly')
+        self.alert_priority.set('medium')
+        self.alert_priority.grid(row=3, column=1, pady=5, padx=5)
+        
+        create_alert_btn = ModernButton(create_frame, text="Create Alert", 
+                                       command=self._create_alert_ui, theme=theme)
+        create_alert_btn.grid(row=4, column=0, columnspan=2, pady=10)
+        
+        # Update scroll region on mousewheel
+        def on_alerts_scroll(event):
+            delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
+            if isinstance(delta, (int, float)):
+                scroll_amount = int(-1 * (delta / 120)) * 3
+                canvas.yview_scroll(scroll_amount, "units")
+        canvas.bind("<MouseWheel>", on_alerts_scroll)
+        scrollable_frame.bind("<MouseWheel>", on_alerts_scroll)
+        
+        # Initial display
+        self._refresh_alerts()
     
     def _create_trend_change_tab(self):
         """Create the trend change predictions tab"""
@@ -4173,6 +4638,11 @@ class StockerApp:
                 # Update predictions display
                 self._update_predictions_display()
                 
+                # Update new feature tabs
+                if self.current_data:
+                    self._update_risk_management_tab(self.current_data, analysis)
+                    self._update_advanced_analytics_tab(symbol)
+                
                 # Trigger background training on this stock's historical data
                 self._train_on_stock_background(symbol, strategy)
         
@@ -4599,6 +5069,51 @@ class StockerApp:
             
         except Exception as e:
             logger.error(f"Error displaying charts: {e}")
+    
+    def _update_risk_management_tab(self, stock_data: dict, analysis: dict):
+        """Update risk management tab with current stock data"""
+        if not HAS_NEW_MODULES or not self.portfolio.risk_manager:
+            return
+        
+        try:
+            current_price = stock_data.get('price', 0)
+            if current_price > 0:
+                # Pre-fill entry price
+                self.rm_entry_price.delete(0, tk.END)
+                self.rm_entry_price.insert(0, str(current_price))
+                self.rm_current_price.delete(0, tk.END)
+                self.rm_current_price.insert(0, str(current_price))
+                
+                # Get ATR from analysis if available
+                if 'indicators' in analysis:
+                    atr = analysis['indicators'].get('atr', 0)
+                    if atr > 0:
+                        self.rm_volatility.delete(0, tk.END)
+                        self.rm_volatility.insert(0, str(atr))
+        except Exception as e:
+            logger.debug(f"Could not update risk management tab: {e}")
+    
+    def _update_advanced_analytics_tab(self, symbol: str):
+        """Update advanced analytics tab with current symbol"""
+        if symbol:
+            # Pre-fill symbol in correlation and optimization
+            if hasattr(self, 'aa_symbols_entry'):
+                current_symbols = self.aa_symbols_entry.get()
+                if symbol.upper() not in current_symbols.upper():
+                    if current_symbols:
+                        self.aa_symbols_entry.delete(0, tk.END)
+                        self.aa_symbols_entry.insert(0, f"{current_symbols},{symbol.upper()}")
+                    else:
+                        self.aa_symbols_entry.insert(0, symbol.upper())
+            
+            if hasattr(self, 'aa_opt_symbols_entry'):
+                current_opt = self.aa_opt_symbols_entry.get()
+                if symbol.upper() not in current_opt.upper():
+                    if current_opt:
+                        self.aa_opt_symbols_entry.delete(0, tk.END)
+                        self.aa_opt_symbols_entry.insert(0, f"{current_opt},{symbol.upper()}")
+                    else:
+                        self.aa_opt_symbols_entry.insert(0, symbol.upper())
     
     def _calculate_potential(self):
         """Calculate potential win/loss for current analysis"""
@@ -6642,6 +7157,812 @@ By using this application, you acknowledge that you understand and accept these 
             theme=theme
         )
         close_btn.pack(side=tk.LEFT, padx=5)
+    
+    def _calculate_position_size_ui(self):
+        """Calculate position size using risk management"""
+        if not HAS_NEW_MODULES or not self.portfolio.risk_manager:
+            messagebox.showwarning("Not Available", "Risk management module not available")
+            return
+        
+        try:
+            entry_price = float(self.rm_entry_price.get())
+            stop_loss = float(self.rm_stop_loss.get())
+            confidence = float(self.rm_confidence.get())
+            method = self.rm_method.get()
+            
+            if entry_price <= 0 or stop_loss <= 0:
+                messagebox.showerror("Error", "Entry price and stop loss must be positive")
+                return
+            
+            result = self.portfolio.risk_manager.calculate_position_size(
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                confidence=confidence,
+                method=method
+            )
+            
+            if 'error' in result:
+                messagebox.showerror("Error", result['error'])
+                return
+            
+            output = f"Position Size Calculation ({method})\n"
+            output += "=" * 50 + "\n\n"
+            output += f"Shares: {result['shares']:.4f}\n"
+            output += f"Position Value: ${result['position_value']:.2f}\n"
+            output += f"Position %: {result['position_percentage']:.2f}%\n"
+            output += f"Risk Amount: ${result['risk_amount']:.2f}\n"
+            output += f"Risk %: {result['risk_percentage']:.2f}%\n"
+            output += f"Risk/Reward Ratio: {result.get('risk_reward_ratio', 0):.2f}\n"
+            
+            self.rm_position_results.config(state='normal')
+            self.rm_position_results.delete('1.0', tk.END)
+            self.rm_position_results.insert('1.0', output)
+            self.rm_position_results.config(state='disabled')
+        except ValueError:
+            messagebox.showerror("Error", "Please enter valid numbers")
+        except Exception as e:
+            messagebox.showerror("Error", f"Calculation failed: {e}")
+    
+    def _calculate_stop_loss_ui(self):
+        """Calculate stop loss recommendation"""
+        if not HAS_NEW_MODULES or not self.portfolio.risk_manager:
+            messagebox.showwarning("Not Available", "Risk management module not available")
+            return
+        
+        try:
+            entry_price = float(self.rm_entry_price.get() or self.rm_current_price.get())
+            current_price = float(self.rm_current_price.get() or entry_price)
+            volatility = float(self.rm_volatility.get() or "2.0")
+            method = self.rm_sl_method.get()
+            
+            if entry_price <= 0:
+                messagebox.showerror("Error", "Price must be positive")
+                return
+            
+            result = self.portfolio.risk_manager.recommend_stop_loss(
+                entry_price=entry_price,
+                current_price=current_price,
+                volatility=volatility,
+                method=method
+            )
+            
+            if 'error' in result:
+                messagebox.showerror("Error", result['error'])
+                return
+            
+            output = f"Stop Loss Recommendation ({method})\n"
+            output += "=" * 50 + "\n\n"
+            output += f"Stop Loss: ${result['stop_loss']:.2f}\n"
+            output += f"Risk Amount: ${result['risk_amount']:.2f}\n"
+            output += f"Risk %: {result['risk_percentage']:.2f}%\n\n"
+            output += f"Reasoning:\n{result.get('reasoning', 'N/A')}\n"
+            
+            self.rm_stoploss_results.config(state='normal')
+            self.rm_stoploss_results.delete('1.0', tk.END)
+            self.rm_stoploss_results.insert('1.0', output)
+            self.rm_stoploss_results.config(state='disabled')
+        except ValueError:
+            messagebox.showerror("Error", "Please enter valid numbers")
+        except Exception as e:
+            messagebox.showerror("Error", f"Calculation failed: {e}")
+    
+    def _calculate_portfolio_risk_ui(self):
+        """Calculate portfolio risk metrics"""
+        if not HAS_NEW_MODULES or not self.portfolio.risk_manager:
+            messagebox.showwarning("Not Available", "Risk management module not available")
+            return
+        
+        try:
+            stats = self.portfolio.get_statistics()
+            
+            output = "Portfolio Risk Metrics\n"
+            output += "=" * 50 + "\n\n"
+            output += f"Total Balance: ${stats['balance']:,.2f}\n"
+            output += f"Total Return: {stats['total_return']:.2f}%\n"
+            output += f"Win Rate: {stats['win_rate']:.2f}%\n"
+            
+            if 'var_95' in stats:
+                output += f"\nValue at Risk (95%): {stats['var_95']:.2f}%\n"
+            
+            if 'drawdown' in stats:
+                dd = stats['drawdown']
+                output += f"\nMaximum Drawdown: {dd.get('max_drawdown_percentage', 0):.2f}%\n"
+                output += f"Average Drawdown: {dd.get('average_drawdown_percentage', 0):.2f}%\n"
+            
+            # Calculate portfolio risk if we have trades
+            if self.portfolio.trades:
+                positions = []
+                for trade in self.portfolio.trades[-10:]:  # Last 10 trades
+                    positions.append({
+                        'symbol': trade.get('symbol', 'UNKNOWN'),
+                        'value': trade.get('budget_used', 0),
+                        'volatility': 0.20  # Estimate
+                    })
+                
+                if positions:
+                    risk_result = self.portfolio.risk_manager.calculate_portfolio_risk(positions)
+                    if 'error' not in risk_result:
+                        output += f"\nPortfolio Risk Analysis:\n"
+                        output += f"  Portfolio Volatility: {risk_result['portfolio_volatility']:.4f}\n"
+                        output += f"  Concentration Index: {risk_result['concentration_index']:.4f}\n"
+                        output += f"  Diversification Score: {risk_result['diversification_score']:.4f}\n"
+                        output += f"  Risk Level: {risk_result['risk_level']}\n"
+            
+            self.rm_portfolio_results.config(state='normal')
+            self.rm_portfolio_results.delete('1.0', tk.END)
+            self.rm_portfolio_results.insert('1.0', output)
+            self.rm_portfolio_results.config(state='disabled')
+        except Exception as e:
+            messagebox.showerror("Error", f"Calculation failed: {e}")
+    
+    def _calculate_correlation_ui(self):
+        """Calculate correlation between stocks"""
+        if not HAS_NEW_MODULES or not self.portfolio.analytics:
+            messagebox.showwarning("Not Available", "Advanced analytics module not available")
+            return
+        
+        try:
+            symbols_str = self.aa_symbols_entry.get()
+            symbols = [s.strip().upper() for s in symbols_str.split(',') if s.strip()]
+            
+            if len(symbols) < 2:
+                messagebox.showerror("Error", "Please enter at least 2 stock symbols")
+                return
+            
+            # Fetch returns data
+            returns_data = {}
+            for symbol in symbols:
+                try:
+                    history = self.data_fetcher.fetch_stock_history(symbol, period='1y')
+                    if history and 'data' in history:
+                        import pandas as pd
+                        df = pd.DataFrame(history['data'])
+                        if 'close' in df.columns:
+                            returns = df['close'].pct_change().dropna()
+                            returns_data[symbol] = returns
+                except Exception as e:
+                    logger.debug(f"Could not fetch data for {symbol}: {e}")
+            
+            if len(returns_data) < 2:
+                messagebox.showerror("Error", "Could not fetch data for enough symbols")
+                return
+            
+            result = self.portfolio.analytics.calculate_correlation_matrix(
+                symbols=list(returns_data.keys()),
+                returns_data=returns_data
+            )
+            
+            if 'error' in result:
+                messagebox.showerror("Error", result['error'])
+                return
+            
+            output = f"Correlation Analysis\n"
+            output += "=" * 50 + "\n\n"
+            output += f"Highest Correlation: {result['max_correlation']['value']:.4f}\n"
+            output += f"  Between: {', '.join(result['max_correlation']['symbols'])}\n\n"
+            output += f"Lowest Correlation: {result['min_correlation']['value']:.4f}\n"
+            output += f"  Between: {', '.join(result['min_correlation']['symbols'])}\n\n"
+            output += f"Average Correlation: {result['average_correlation']:.4f}\n"
+            
+            self.aa_correlation_results.config(state='normal')
+            self.aa_correlation_results.delete('1.0', tk.END)
+            self.aa_correlation_results.insert('1.0', output)
+            self.aa_correlation_results.config(state='disabled')
+        except Exception as e:
+            messagebox.showerror("Error", f"Calculation failed: {e}")
+    
+    def _optimize_portfolio_ui(self):
+        """Optimize portfolio weights"""
+        if not HAS_NEW_MODULES or not self.portfolio.analytics:
+            messagebox.showwarning("Not Available", "Advanced analytics module not available")
+            return
+        
+        try:
+            symbols_str = self.aa_opt_symbols_entry.get()
+            symbols = [s.strip().upper() for s in symbols_str.split(',') if s.strip()]
+            method = self.aa_opt_method.get()
+            
+            if len(symbols) < 2:
+                messagebox.showerror("Error", "Please enter at least 2 stock symbols")
+                return
+            
+            # Fetch returns data
+            returns_data = {}
+            for symbol in symbols:
+                try:
+                    history = self.data_fetcher.fetch_stock_history(symbol, period='1y')
+                    if history and 'data' in history:
+                        import pandas as pd
+                        df = pd.DataFrame(history['data'])
+                        if 'close' in df.columns:
+                            returns = df['close'].pct_change().dropna()
+                            returns_data[symbol] = returns
+                except Exception as e:
+                    logger.debug(f"Could not fetch data for {symbol}: {e}")
+            
+            if len(returns_data) < 2:
+                messagebox.showerror("Error", "Could not fetch data for enough symbols")
+                return
+            
+            result = self.portfolio.analytics.optimize_portfolio(
+                symbols=list(returns_data.keys()),
+                returns_data=returns_data,
+                method=method
+            )
+            
+            if 'error' in result:
+                messagebox.showerror("Error", result['error'])
+                return
+            
+            output = f"Portfolio Optimization ({method})\n"
+            output += "=" * 50 + "\n\n"
+            output += "Optimal Weights:\n"
+            for symbol, weight in result['optimal_weights'].items():
+                output += f"  {symbol}: {weight*100:.2f}%\n"
+            output += f"\nExpected Return: {result['expected_return']*100:.2f}%\n"
+            output += f"Expected Volatility: {result['expected_volatility']*100:.2f}%\n"
+            output += f"Sharpe Ratio: {result['sharpe_ratio']:.4f}\n"
+            
+            self.aa_optimization_results.config(state='normal')
+            self.aa_optimization_results.delete('1.0', tk.END)
+            self.aa_optimization_results.insert('1.0', output)
+            self.aa_optimization_results.config(state='disabled')
+        except Exception as e:
+            messagebox.showerror("Error", f"Optimization failed: {e}")
+    
+    def _run_monte_carlo_ui(self):
+        """Run Monte Carlo simulation"""
+        if not HAS_NEW_MODULES or not self.portfolio.analytics:
+            messagebox.showwarning("Not Available", "Advanced analytics module not available")
+            return
+        
+        try:
+            initial_price = float(self.aa_mc_price.get())
+            expected_return = float(self.aa_mc_return.get())
+            volatility = float(self.aa_mc_vol.get())
+            days = int(self.aa_mc_days.get())
+            
+            if initial_price <= 0:
+                messagebox.showerror("Error", "Initial price must be positive")
+                return
+            
+            result = self.portfolio.analytics.monte_carlo_simulation(
+                initial_price=initial_price,
+                expected_return=expected_return,
+                volatility=volatility,
+                days=days
+            )
+            
+            if 'error' in result:
+                messagebox.showerror("Error", result['error'])
+                return
+            
+            output = f"Monte Carlo Simulation Results\n"
+            output += "=" * 50 + "\n\n"
+            output += f"Initial Price: ${result['initial_price']:.2f}\n"
+            output += f"Simulations: {result['simulations']:,}\n"
+            output += f"Days: {result['days']}\n\n"
+            output += f"Mean Final Price: ${result['mean_final_price']:.2f}\n"
+            output += f"Median Final Price: ${result['median_final_price']:.2f}\n"
+            output += f"Expected Final Price: ${result['expected_final_price']:.2f}\n\n"
+            output += f"95% Confidence Interval:\n"
+            output += f"  Lower: ${result['confidence_interval']['lower']:.2f}\n"
+            output += f"  Upper: ${result['confidence_interval']['upper']:.2f}\n\n"
+            output += f"Probability of Profit: {result['probability_profit']*100:.2f}%\n"
+            
+            self.aa_mc_results.config(state='normal')
+            self.aa_mc_results.delete('1.0', tk.END)
+            self.aa_mc_results.insert('1.0', output)
+            self.aa_mc_results.config(state='disabled')
+        except ValueError:
+            messagebox.showerror("Error", "Please enter valid numbers")
+        except Exception as e:
+            messagebox.showerror("Error", f"Simulation failed: {e}")
+    
+    def _run_walk_forward_ui(self):
+        """Run walk-forward backtest"""
+        if not HAS_NEW_MODULES or not self.walk_forward_backtester:
+            messagebox.showwarning("Not Available", "Walk-forward backtester not available")
+            return
+        
+        try:
+            train_window = int(self.wf_train_window.get())
+            test_window = int(self.wf_test_window.get())
+            step_size = int(self.wf_step_size.get())
+            multi_stock = self.wf_multi_stock.get() if hasattr(self, 'wf_multi_stock') else False
+            
+            # Get current strategy
+            strategy = self.strategy_var.get() if hasattr(self, 'strategy_var') else 'trading'
+            hybrid_predictor = self.hybrid_predictors.get(strategy)
+            
+            if not hybrid_predictor:
+                messagebox.showerror("Error", f"No predictor available for strategy: {strategy}")
+                return
+            
+            # Multi-stock mode
+            if multi_stock:
+                max_stocks = int(self.wf_max_stocks.get()) if hasattr(self, 'wf_max_stocks') and self.wf_max_stocks.get() else 10
+                symbols = MarketScanner.POPULAR_STOCKS[:max_stocks]
+                
+                # Update UI to show progress
+                self.wf_results.config(state='normal')
+                self.wf_results.delete('1.0', tk.END)
+                self.wf_results.insert('1.0', "Running MULTI-STOCK walk-forward backtest...\n\n"
+                                              f"Stocks to test: {len(symbols)}\n"
+                                              f"Strategy: {strategy.title()}\n"
+                                              f"Train window: {train_window} days\n"
+                                              f"Test window: {test_window} days\n"
+                                              f"Step size: {step_size} days\n\n"
+                                              f"Testing: {', '.join(symbols[:5])}{'...' if len(symbols) > 5 else ''}\n\n"
+                                              "This may take several minutes...")
+                self.wf_results.config(state='disabled')
+                self.root.update()
+                
+                # Run multi-stock walk-forward test
+                result = self.walk_forward_backtester.run_multi_stock_walk_forward_test(
+                    symbols=symbols,
+                    predictor=hybrid_predictor,
+                    strategy=strategy,
+                    data_fetcher=self.data_fetcher,
+                    train_window_days=train_window,
+                    test_window_days=test_window,
+                    step_size_days=step_size,
+                    lookforward_days=10,
+                    max_stocks=max_stocks
+                )
+                
+                if 'error' in result:
+                    messagebox.showerror("Error", result['error'])
+                    self.wf_results.config(state='normal')
+                    self.wf_results.delete('1.0', tk.END)
+                    self.wf_results.insert('1.0', f"Error: {result['error']}")
+                    self.wf_results.config(state='disabled')
+                    return
+                
+                # Display multi-stock results
+                aggregate_results = result.get('aggregate_results', {})
+                per_stock_results = result.get('per_stock_results', [])
+                retrain_rec = aggregate_results.get('retrain_recommendation', {})
+                
+                output = f"MULTI-STOCK Walk-Forward Backtest Results\n"
+                output += "=" * 60 + "\n\n"
+                output += f"Stocks Tested: {result.get('stocks_tested', 0)}\n"
+                output += f"Strategy: {strategy.title()}\n"
+                output += f"Symbols: {', '.join(result.get('symbols', []))}\n\n"
+                
+                # Display retraining recommendation prominently
+                if retrain_rec:
+                    rec_emoji = retrain_rec.get('recommendation_emoji', '⚪')
+                    rec_text = retrain_rec.get('recommendation_text', 'UNKNOWN')
+                    priority = retrain_rec.get('priority', 'none')
+                    reasons = retrain_rec.get('reasons', [])
+                    positive_indicators = retrain_rec.get('positive_indicators', [])
+                    confidence = retrain_rec.get('confidence', 0)
+                    
+                    # Update visual indicator in UI
+                    self.wf_retrain_frame.pack(fill=tk.X, pady=(10, 0))
+                    theme = self.theme_manager.get_theme()
+                    
+                    if rec_text == "RETRAIN NOW":
+                        bg_color = '#ffebee'
+                        fg_color = '#c62828'
+                        action_text = "Run 'python retrain_models.py' to retrain models"
+                    elif rec_text == "CONSIDER RETRAINING":
+                        bg_color = '#fff3e0'
+                        fg_color = '#e65100'
+                        action_text = "Consider retraining models for better performance"
+                    else:
+                        bg_color = '#e8f5e9'
+                        fg_color = '#2e7d32'
+                        action_text = "Models performing well - no retraining needed"
+                    
+                    self.wf_retrain_frame.config(bg=bg_color)
+                    recommendation_display = f"{rec_emoji} {rec_text} ({priority.upper()} priority, {confidence}% confidence)\n"
+                    if reasons:
+                        recommendation_display += f"Reasons: {', '.join(reasons[:2])}"
+                        if len(reasons) > 2:
+                            recommendation_display += f" (+{len(reasons)-2} more)"
+                    recommendation_display += f"\n💡 {action_text}"
+                    
+                    self.wf_retrain_label.config(text=recommendation_display, bg=bg_color, fg=fg_color)
+                    
+                    output += f"{'='*60}\n"
+                    output += f"🧠 RETRAINING RECOMMENDATION (Multi-Stock Aggregate)\n"
+                    output += f"{'='*60}\n"
+                    output += f"\n{rec_emoji} {rec_text}\n"
+                    output += f"Priority: {priority.upper()}\n"
+                    output += f"Confidence: {confidence}%\n\n"
+                    
+                    if reasons:
+                        output += "⚠️ Reasons to Retrain:\n"
+                        for i, reason in enumerate(reasons, 1):
+                            output += f"  {i}. {reason}\n"
+                        output += "\n"
+                    
+                    if positive_indicators:
+                        output += "✅ Positive Indicators:\n"
+                        for i, indicator in enumerate(positive_indicators, 1):
+                            output += f"  {i}. {indicator}\n"
+                        output += "\n"
+                    
+                    if rec_text == "RETRAIN NOW":
+                        output += "💡 ACTION REQUIRED:\n"
+                        output += "  Run 'python retrain_models.py' or use ML Training in the app\n"
+                        output += "  Models need immediate retraining to improve accuracy\n\n"
+                    elif rec_text == "CONSIDER RETRAINING":
+                        output += "💡 RECOMMENDATION:\n"
+                        output += "  Consider retraining models to improve performance\n"
+                        output += "  Current performance is acceptable but could be better\n\n"
+                    else:
+                        output += "✅ STATUS:\n"
+                        output += "  Models are performing well - no retraining needed\n"
+                        output += "  Continue monitoring with regular walk-forward tests\n\n"
+                    
+                    output += f"{'='*60}\n\n"
+                else:
+                    self.wf_retrain_frame.pack_forget()
+                
+                # Aggregate metrics
+                if aggregate_results:
+                    output += "Aggregate Results (Across All Stocks):\n"
+                    output += "-" * 60 + "\n"
+                    output += f"Average Accuracy: {aggregate_results.get('aggregate_accuracy', 0)*100:.2f}%\n"
+                    output += f"Std Deviation: {aggregate_results.get('aggregate_std', 0)*100:.2f}%\n"
+                    output += f"Min Accuracy: {aggregate_results.get('aggregate_min', 0)*100:.2f}%\n"
+                    output += f"Max Accuracy: {aggregate_results.get('aggregate_max', 0)*100:.2f}%\n"
+                    output += f"Average Return: {aggregate_results.get('aggregate_return', 0)*100:.2f}%\n"
+                    output += f"Average Sharpe Ratio: {aggregate_results.get('aggregate_sharpe', 0):.2f}\n\n"
+                    
+                    output += f"Retraining Breakdown:\n"
+                    output += f"  🔴 RETRAIN NOW: {aggregate_results.get('retrain_now_count', 0)} stocks\n"
+                    output += f"  🟡 CONSIDER RETRAINING: {aggregate_results.get('consider_retrain_count', 0)} stocks\n"
+                    output += f"  🟢 NO RETRAIN NEEDED: {aggregate_results.get('no_retrain_count', 0)} stocks\n\n"
+                
+                # Per-stock summary
+                if per_stock_results:
+                    output += "Per-Stock Summary:\n"
+                    output += "-" * 60 + "\n"
+                    for stock_result in per_stock_results[:20]:  # Show first 20
+                        symbol = stock_result.get('symbol', 'UNKNOWN')
+                        agg = stock_result.get('result', {}).get('aggregated', {})
+                        acc = agg.get('overall_accuracy', 0) * 100
+                        rec = agg.get('retrain_recommendation', {}).get('recommendation_text', 'UNKNOWN')
+                        output += f"{symbol}: {acc:.1f}% accuracy - {rec}\n"
+                    
+                    if len(per_stock_results) > 20:
+                        output += f"\n... and {len(per_stock_results) - 20} more stocks\n"
+                
+                self.wf_results.config(state='normal')
+                self.wf_results.delete('1.0', tk.END)
+                self.wf_results.insert('1.0', output)
+                self.wf_results.config(state='disabled')
+                return
+            
+            # Single-stock mode (existing code)
+            if not self.current_symbol or not self.current_data:
+                messagebox.showwarning("No Data", "Please analyze a stock first")
+                return
+            
+            # Update UI to show progress
+            self.wf_results.config(state='normal')
+            self.wf_results.delete('1.0', tk.END)
+            self.wf_results.insert('1.0', "Running walk-forward backtest...\n\n"
+                                          f"Symbol: {self.current_symbol}\n"
+                                          f"Strategy: {strategy.title()}\n"
+                                          f"Train window: {train_window} days\n"
+                                          f"Test window: {test_window} days\n"
+                                          f"Step size: {step_size} days\n\n"
+                                          "Fetching historical data...")
+            self.wf_results.config(state='disabled')
+            self.root.update()
+            
+            # Get history data (need enough for walk-forward)
+            period_days = train_window + test_window + 100  # Extra buffer
+            if period_days <= 365:
+                period = '1y'
+            elif period_days <= 730:
+                period = '2y'
+            else:
+                period = '5y'
+            
+            history_data = self.data_fetcher.fetch_stock_history(self.current_symbol, period=period)
+            if not history_data or 'data' not in history_data:
+                messagebox.showerror("Error", "Could not fetch historical data. Need at least {} days of data.".format(train_window + test_window))
+                return
+            
+            # Check if we have enough data
+            if len(history_data['data']) < train_window + test_window:
+                messagebox.showerror("Error", 
+                    f"Insufficient data. Have {len(history_data['data'])} days, "
+                    f"need at least {train_window + test_window} days.")
+                return
+            
+            # Update UI
+            self.wf_results.config(state='normal')
+            self.wf_results.delete('1.0', tk.END)
+            self.wf_results.insert('1.0', "Running walk-forward backtest...\n\n"
+                                          f"Symbol: {self.current_symbol}\n"
+                                          f"Strategy: {strategy.title()}\n"
+                                          f"Data points: {len(history_data['data'])}\n\n"
+                                          "Generating predictions for each window...")
+            self.wf_results.config(state='disabled')
+            self.root.update()
+            
+            # Run walk-forward test with predictor
+            result = self.walk_forward_backtester.run_walk_forward_test(
+                history_data=history_data,
+                predictor=hybrid_predictor,
+                symbol=self.current_symbol,
+                strategy=strategy,
+                train_window_days=train_window,
+                test_window_days=test_window,
+                step_size_days=step_size,
+                lookforward_days=10
+            )
+            
+            if 'error' in result:
+                messagebox.showerror("Error", result['error'])
+                self.wf_results.config(state='normal')
+                self.wf_results.delete('1.0', tk.END)
+                self.wf_results.insert('1.0', f"Error: {result['error']}")
+                self.wf_results.config(state='disabled')
+                return
+            
+            # Display results
+            aggregated = result.get('aggregated', {})
+            window_results = result.get('window_results', [])
+            retrain_rec = aggregated.get('retrain_recommendation', {})
+            
+            output = f"Walk-Forward Backtest Results\n"
+            output += "=" * 60 + "\n\n"
+            output += f"Symbol: {self.current_symbol}\n"
+            output += f"Strategy: {strategy.title()}\n"
+            output += f"Windows Tested: {result.get('windows_tested', 0)}\n\n"
+            
+            # Display retraining recommendation prominently
+            if retrain_rec:
+                rec_emoji = retrain_rec.get('recommendation_emoji', '⚪')
+                rec_text = retrain_rec.get('recommendation_text', 'UNKNOWN')
+                priority = retrain_rec.get('priority', 'none')
+                reasons = retrain_rec.get('reasons', [])
+                positive_indicators = retrain_rec.get('positive_indicators', [])
+                confidence = retrain_rec.get('confidence', 0)
+                
+                # Update visual indicator in UI
+                self.wf_retrain_frame.pack(fill=tk.X, pady=(10, 0))
+                theme = self.theme_manager.get_theme()
+                
+                if rec_text == "RETRAIN NOW":
+                    bg_color = '#ffebee'  # Light red
+                    fg_color = '#c62828'  # Dark red
+                    action_text = "Run 'python retrain_models.py' to retrain models"
+                elif rec_text == "CONSIDER RETRAINING":
+                    bg_color = '#fff3e0'  # Light orange
+                    fg_color = '#e65100'  # Dark orange
+                    action_text = "Consider retraining models for better performance"
+                else:
+                    bg_color = '#e8f5e9'  # Light green
+                    fg_color = '#2e7d32'  # Dark green
+                    action_text = "Models performing well - no retraining needed"
+                
+                self.wf_retrain_frame.config(bg=bg_color)
+                recommendation_display = f"{rec_emoji} {rec_text} ({priority.upper()} priority, {confidence}% confidence)\n"
+                if reasons:
+                    recommendation_display += f"Reasons: {', '.join(reasons[:2])}"
+                    if len(reasons) > 2:
+                        recommendation_display += f" (+{len(reasons)-2} more)"
+                recommendation_display += f"\n💡 {action_text}"
+                
+                self.wf_retrain_label.config(text=recommendation_display, bg=bg_color, fg=fg_color)
+                
+                output += f"{'='*60}\n"
+                output += f"🧠 RETRAINING RECOMMENDATION\n"
+                output += f"{'='*60}\n"
+                output += f"\n{rec_emoji} {rec_text}\n"
+                output += f"Priority: {priority.upper()}\n"
+                output += f"Confidence: {confidence}%\n\n"
+                
+                if reasons:
+                    output += "⚠️ Reasons to Retrain:\n"
+                    for i, reason in enumerate(reasons, 1):
+                        output += f"  {i}. {reason}\n"
+                    output += "\n"
+                
+                if positive_indicators:
+                    output += "✅ Positive Indicators:\n"
+                    for i, indicator in enumerate(positive_indicators, 1):
+                        output += f"  {i}. {indicator}\n"
+                    output += "\n"
+                
+                if rec_text == "RETRAIN NOW":
+                    output += "💡 ACTION REQUIRED:\n"
+                    output += "  Run 'python retrain_models.py' or use ML Training in the app\n"
+                    output += "  Models need immediate retraining to improve accuracy\n\n"
+                elif rec_text == "CONSIDER RETRAINING":
+                    output += "💡 RECOMMENDATION:\n"
+                    output += "  Consider retraining models to improve performance\n"
+                    output += "  Current performance is acceptable but could be better\n\n"
+                else:
+                    output += "✅ STATUS:\n"
+                    output += "  Models are performing well - no retraining needed\n"
+                    output += "  Continue monitoring with regular walk-forward tests\n\n"
+                
+                output += f"{'='*60}\n\n"
+            else:
+                # Hide recommendation frame if no recommendation
+                self.wf_retrain_frame.pack_forget()
+            
+            if aggregated:
+                output += "Overall Results:\n"
+                output += "-" * 60 + "\n"
+                output += f"Overall Accuracy: {aggregated.get('overall_accuracy', 0)*100:.2f}%\n"
+                output += f"Mean Accuracy: {aggregated.get('mean_accuracy', 0)*100:.2f}%\n"
+                output += f"Std Accuracy: {aggregated.get('std_accuracy', 0)*100:.2f}%\n"
+                output += f"Min Accuracy: {aggregated.get('min_accuracy', 0)*100:.2f}%\n"
+                output += f"Max Accuracy: {aggregated.get('max_accuracy', 0)*100:.2f}%\n"
+                output += f"Mean Return: {aggregated.get('mean_return', 0)*100:.2f}%\n"
+                output += f"Sharpe Ratio: {aggregated.get('sharpe_ratio', 0):.2f}\n\n"
+            
+            if window_results:
+                output += "Window Details:\n"
+                output += "-" * 60 + "\n"
+                for wr in window_results[:10]:  # Show first 10 windows
+                    output += f"Window {wr.get('window_num', 0)}:\n"
+                    output += f"  Train: {wr.get('train_period', ('', ''))[0]} to {wr.get('train_period', ('', ''))[1]}\n"
+                    output += f"  Test: {wr.get('test_period', ('', ''))[0]} to {wr.get('test_period', ('', ''))[1]}\n"
+                    output += f"  Predictions: {wr.get('predictions_tested', 0)}\n"
+                    output += f"  Accuracy: {wr.get('accuracy', 0)*100:.2f}% ({wr.get('correct', 0)}/{wr.get('correct', 0) + wr.get('incorrect', 0)})\n"
+                    output += f"  Avg Return: {wr.get('avg_return', 0)*100:.2f}%\n\n"
+                
+                if len(window_results) > 10:
+                    output += f"... and {len(window_results) - 10} more windows\n"
+            
+            self.wf_results.config(state='normal')
+            self.wf_results.delete('1.0', tk.END)
+            self.wf_results.insert('1.0', output)
+            self.wf_results.config(state='disabled')
+            
+        except ValueError:
+            messagebox.showerror("Error", "Please enter valid numbers")
+        except Exception as e:
+            logger.error(f"Walk-forward backtest error: {e}", exc_info=True)
+            messagebox.showerror("Error", f"Backtest failed: {e}")
+            self.wf_results.config(state='normal')
+            self.wf_results.delete('1.0', tk.END)
+            self.wf_results.insert('1.0', f"Error: {str(e)}")
+            self.wf_results.config(state='disabled')
+    
+    def _create_alert_ui(self):
+        """Create a new alert"""
+        if not HAS_NEW_MODULES or not self.alert_system:
+            messagebox.showwarning("Not Available", "Alert system not available")
+            return
+        
+        try:
+            alert_type = self.alert_type.get()
+            symbol = self.alert_symbol.get().strip().upper()
+            message = self.alert_message.get().strip()
+            priority = self.alert_priority.get()
+            
+            if not message:
+                messagebox.showerror("Error", "Please enter an alert message")
+                return
+            
+            if alert_type == 'price_alert' and not symbol:
+                messagebox.showerror("Error", "Please enter a symbol for price alert")
+                return
+            
+            # Create alert
+            if alert_type == 'price_alert' and symbol:
+                try:
+                    stock_data = self.data_fetcher.fetch_stock_data(symbol)
+                    current_price = stock_data.get('price', 0)
+                    target_price = current_price * 1.05  # 5% above
+                    self.alert_system.create_price_alert(symbol, current_price, target_price, 'above')
+                except:
+                    self.alert_system.add_alert(alert_type, message, priority)
+            else:
+                self.alert_system.add_alert(alert_type, message, priority, {'symbol': symbol})
+            
+            # Clear inputs
+            self.alert_symbol.delete(0, tk.END)
+            self.alert_message.delete(0, tk.END)
+            
+            # Refresh display
+            self._refresh_alerts()
+            messagebox.showinfo("Success", "Alert created successfully!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create alert: {e}")
+    
+    def _refresh_alerts(self):
+        """Refresh alerts display"""
+        if not HAS_NEW_MODULES or not self.alert_system:
+            return
+        
+        # Clear existing alerts
+        for widget in self.alerts_list_frame.winfo_children():
+            if isinstance(widget, ModernCard):
+                widget.destroy()
+        
+        # Get alerts
+        alerts = self.alert_system.alerts
+        unread_alerts = [a for a in alerts if not a.read]
+        
+        if not alerts:
+            no_alerts_label = tk.Label(self.alerts_list_frame, 
+                                     text="No alerts yet. Create one above!",
+                                     font=('Segoe UI', 10), bg=self.theme_manager.get_theme()['bg'],
+                                     fg=self.theme_manager.get_theme()['text_secondary'])
+            no_alerts_label.pack(pady=20)
+            return
+        
+        # Display alerts (most recent first)
+        theme = self.theme_manager.get_theme()
+        for alert in reversed(alerts[-20:]):  # Show last 20
+            alert_card = ModernCard(self.alerts_list_frame, "", theme=theme, padding=10)
+            alert_card.pack(fill=tk.X, pady=(0, 10))
+            
+            card_frame = tk.Frame(alert_card, bg=theme['card_bg'])
+            card_frame.pack(fill=tk.X, padx=10, pady=10)
+            
+            # Header
+            header = tk.Frame(card_frame, bg=theme['card_bg'])
+            header.pack(fill=tk.X)
+            
+            priority_colors = {'low': '#4CAF50', 'medium': '#FF9800', 'high': '#F44336', 'critical': '#D32F2F'}
+            priority_color = priority_colors.get(alert.priority, theme['fg'])
+            
+            priority_label = tk.Label(header, text=alert.priority.upper(), 
+                                     font=('Segoe UI', 9, 'bold'), bg=theme['card_bg'], fg=priority_color)
+            priority_label.pack(side=tk.LEFT)
+            
+            if not alert.read:
+                unread_label = tk.Label(header, text="● NEW", 
+                                       font=('Segoe UI', 9, 'bold'), bg=theme['card_bg'], fg=theme['accent'])
+                unread_label.pack(side=tk.LEFT, padx=(10, 0))
+            
+            time_label = tk.Label(header, text=alert.timestamp.strftime('%Y-%m-%d %H:%M'), 
+                                 font=('Segoe UI', 8), bg=theme['card_bg'], fg=theme['text_secondary'])
+            time_label.pack(side=tk.RIGHT)
+            
+            # Message
+            msg_label = tk.Label(card_frame, text=alert.message, 
+                               font=('Segoe UI', 10), bg=theme['card_bg'], fg=theme['fg'],
+                               wraplength=600, justify=tk.LEFT)
+            msg_label.pack(anchor=tk.W, pady=(5, 0))
+            
+            # Buttons
+            btn_frame = tk.Frame(card_frame, bg=theme['card_bg'])
+            btn_frame.pack(fill=tk.X, pady=(10, 0))
+            
+            if not alert.read:
+                mark_read_btn = ModernButton(btn_frame, text="Mark Read", 
+                                           command=lambda a=alert: self._mark_alert_read(a),
+                                           theme=theme)
+                mark_read_btn.pack(side=tk.LEFT, padx=(0, 5))
+            
+            delete_btn = ModernButton(btn_frame, text="Delete", 
+                                     command=lambda a=alert: self._delete_alert(a),
+                                     theme=theme)
+            delete_btn.pack(side=tk.LEFT)
+    
+    def _mark_alert_read(self, alert):
+        """Mark alert as read"""
+        if self.alert_system:
+            self.alert_system.mark_as_read(alert)
+            self._refresh_alerts()
+    
+    def _mark_all_alerts_read(self):
+        """Mark all alerts as read"""
+        if self.alert_system:
+            self.alert_system.mark_all_as_read()
+            self._refresh_alerts()
+    
+    def _delete_alert(self, alert):
+        """Delete an alert"""
+        if self.alert_system:
+            self.alert_system.delete_alert(alert)
+            self._refresh_alerts()
 
 
 def main():
