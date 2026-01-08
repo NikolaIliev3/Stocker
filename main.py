@@ -159,6 +159,16 @@ class StockerApp:
         self.learning_tracker = LearningTracker(APP_DATA_DIR)  # Track all learning sources
         self.backtester = ContinuousBacktester(self, APP_DATA_DIR)  # Continuous backtesting system
         
+        # Initialize ML Scheduler
+        try:
+            from ml_scheduler import MLScheduler
+            self.ml_scheduler = MLScheduler(self, APP_DATA_DIR)
+            self.ml_scheduler.start()
+            logger.info("ML Scheduler initialized and started")
+        except Exception as e:
+            logger.warning(f"Could not initialize ML Scheduler: {e}")
+            self.ml_scheduler = None
+        
         # Initialize new modules if available
         if HAS_NEW_MODULES:
             try:
@@ -239,7 +249,8 @@ class StockerApp:
         self.root.after(10000, self.auto_learner.start)  # Start after 10 seconds
         
         # Start continuous backtesting (tests algorithm on random historical points)
-        self.root.after(20000, self.backtester.start)  # Start after 20 seconds
+        # DISABLED: Backtesting now runs manually via "Run Backtest" button
+        # self.root.after(20000, self.backtester.start)  # Start after 20 seconds
         
         # Start stock monitoring for BUY signals (check every 30 minutes)
         self.root.after(30000, self._start_stock_monitoring)  # Start after 30 seconds
@@ -2676,7 +2687,7 @@ class StockerApp:
         bullets_label.pack(anchor=tk.W, pady=(0, 5))
         
         self.bullets_text = scrolledtext.ScrolledText(bullets_frame, 
-                                                      wrap=tk.WORD, height=15,
+                                                      wrap=tk.WORD, height=12,  # Reduced height to make room for button
                                                       font=('Consolas', 10),
                                                       bg=theme['entry_bg'], fg=theme['entry_fg'],
                                                       relief=tk.FLAT, bd=2,
@@ -2715,22 +2726,25 @@ class StockerApp:
                                   font=('Segoe UI', 10))
             radio.pack(side=tk.LEFT, padx=5)
         
-        # Fire button
+        # Fire button - make it more prominent
         fire_btn_frame = tk.Frame(chamber_card.content_frame, bg=theme['card_bg'])
-        fire_btn_frame.pack(fill=tk.X)
+        fire_btn_frame.pack(fill=tk.X, pady=(15, 0))  # Added padding to make it more visible
         
-        self.fire_btn = ModernButton(fire_btn_frame, "🔥 FIRE", 
+        # Create a more prominent fire button
+        self.fire_btn = ModernButton(fire_btn_frame, "FIRE", 
                                      command=self._fire_bullets,
                                      theme=theme,
-                                     font=('Segoe UI', 14, 'bold'))
-        self.fire_btn.pack(side=tk.LEFT, padx=(0, 10))
+                                     font=('Segoe UI', 16, 'bold'))
+        # Make button larger by configuring after creation
+        self.fire_btn.config(padx=40, pady=15)
+        self.fire_btn.pack(side=tk.LEFT, padx=(0, 15), pady=5)
         
         # Status label
         self.gun_status_label = tk.Label(fire_btn_frame,
                                         text="Ready to fire",
                                         bg=theme['card_bg'], fg=theme['text_secondary'],
-                                        font=('Segoe UI', 10))
-        self.gun_status_label.pack(side=tk.LEFT, padx=(10, 0))
+                                        font=('Segoe UI', 11))
+        self.gun_status_label.pack(side=tk.LEFT, padx=(15, 0), pady=5)
         
         # Store reference
         self.gun_frame = gun_frame
@@ -2944,13 +2958,15 @@ class StockerApp:
                     # Generate trend change predictions (if trading or mixed strategy)
                     if strategy in ['trading', 'mixed']:
                         try:
-                            # Get trading analysis for indicators
-                            if strategy == "trading":
-                                trading_analysis = analysis
-                            else:  # mixed
-                                trading_analysis = self.trading_analyzer.analyze(stock_data, history_data)
+                            # Always get trading analysis directly for indicators and price_action
+                            # The hybrid predictor's analysis might not include all fields we need
+                            trading_analysis = self.trading_analyzer.analyze(stock_data, history_data)
                             
-                            if 'indicators' in trading_analysis and 'price_action' in trading_analysis:
+                            # Check if we have the required data
+                            has_indicators = 'indicators' in trading_analysis and trading_analysis.get('indicators')
+                            has_price_action = 'price_action' in trading_analysis and trading_analysis.get('price_action')
+                            
+                            if has_indicators and has_price_action:
                                 trend_predictions = self.trend_change_predictor.predict_trend_changes(
                                     symbol,
                                     history_data,
@@ -2958,32 +2974,48 @@ class StockerApp:
                                     trading_analysis['price_action']
                                 )
                                 
-                                # Store trend change predictions
-                                for pred in trend_predictions:
-                                    stored_pred = self.trend_change_tracker.add_prediction(
-                                        symbol=pred['symbol'],
-                                        current_trend=pred['current_trend'],
-                                        predicted_change=pred['predicted_change'],
-                                        estimated_days=pred['estimated_days'],
-                                        estimated_date=pred['estimated_date'],
-                                        confidence=pred['confidence'],
-                                        reasoning=pred['reasoning'],
-                                        key_indicators=pred.get('key_indicators', {})
-                                    )
-                                    
-                                    # Record in learning tracker
-                                    self.learning_tracker.record_trend_change_prediction(
-                                        symbol=pred['symbol'],
-                                        predicted_change=pred['predicted_change'],
-                                        estimated_days=pred['estimated_days'],
-                                        confidence=pred['confidence']
-                                    )
-                                    
-                                    trend_predictions_created += 1
-                                    self.root.after(0, self._append_firing_result,
-                                                  f"  📊 Trend change prediction #{stored_pred['id']}\n")
+                                if trend_predictions and len(trend_predictions) > 0:
+                                    # Store trend change predictions
+                                    for pred in trend_predictions:
+                                        stored_pred = self.trend_change_tracker.add_prediction(
+                                            symbol=pred['symbol'],
+                                            current_trend=pred['current_trend'],
+                                            predicted_change=pred['predicted_change'],
+                                            estimated_days=pred['estimated_days'],
+                                            estimated_date=pred['estimated_date'],
+                                            confidence=pred['confidence'],
+                                            reasoning=pred['reasoning'],
+                                            key_indicators=pred.get('key_indicators', {})
+                                        )
+                                        
+                                        # Record in learning tracker
+                                        self.learning_tracker.record_trend_change_prediction(
+                                            symbol=pred['symbol'],
+                                            predicted_change=pred['predicted_change'],
+                                            estimated_days=pred['estimated_days'],
+                                            confidence=pred['confidence']
+                                        )
+                                        
+                                        trend_predictions_created += 1
+                                        self.root.after(0, self._append_firing_result,
+                                                      f"  📊 Trend change prediction #{stored_pred['id']}: {pred['predicted_change']} ({pred['confidence']:.1f}%)\n")
+                                else:
+                                    # No trend predictions generated (might be normal - not all stocks have trend changes)
+                                    logger.debug(f"No trend change predictions generated for {symbol} (may be normal)")
+                            else:
+                                # Missing required data
+                                missing = []
+                                if not has_indicators:
+                                    missing.append("indicators")
+                                if not has_price_action:
+                                    missing.append("price_action")
+                                logger.warning(f"Missing data for trend predictions ({symbol}): {', '.join(missing)}")
+                                self.root.after(0, self._append_firing_result,
+                                              f"  ⚠️ Trend prediction skipped for {symbol}: Missing {', '.join(missing)}\n")
                         except Exception as e:
-                            logger.debug(f"Could not generate trend change predictions for {symbol}: {e}")
+                            logger.warning(f"Could not generate trend change predictions for {symbol}: {e}")
+                            self.root.after(0, self._append_firing_result,
+                                          f"  ⚠️ Trend prediction skipped for {symbol}: {str(e)[:50]}\n")
                     
                 except Exception as e:
                     error_msg = f"{symbol}: {str(e)}"
@@ -6344,30 +6376,38 @@ By using this application, you acknowledge that you understand and accept these 
             status_text.insert(tk.END, "Training runs in the background and won't block the UI.\n\n")
             status_text.update()
             
+            # Helper function to safely update status text (handles destroyed widgets)
+            def safe_insert(text):
+                """Safely insert text into status_text, ignoring errors if widget is destroyed"""
+                try:
+                    if dialog.winfo_exists():
+                        status_text.insert(tk.END, text + "\n")
+                        status_text.see(tk.END)
+                except (tk.TclError, AttributeError):
+                    pass  # Widget was destroyed, ignore
+            
             # Run training in background
             def train():
                 try:
                     # First, train on historical data
                     result = self.training_manager.train_on_symbols(
                         symbols, start_date, end_date, strategy,
-                        progress_callback=lambda msg: dialog.after(0, lambda: status_text.insert(tk.END, msg + "\n") or status_text.see(tk.END))
+                        progress_callback=lambda msg: dialog.after(0, lambda: safe_insert(msg))
                     )
                     
                     if 'error' in result:
-                        dialog.after(0, lambda: status_text.insert(tk.END, f"\n✗ Error: {result['error']}\n"))
+                        dialog.after(0, lambda: safe_insert(f"\n✗ Error: {result['error']}"))
                     else:
-                        dialog.after(0, lambda: status_text.insert(
-                            tk.END,
+                        dialog.after(0, lambda: safe_insert(
                             f"\n✓ Historical Training Complete!\n"
                             f"Test Accuracy: {result.get('test_accuracy', 0)*100:.1f}%\n"
                             f"Training Samples: {result.get('total_samples', 0)}\n"
-                            f"Cross-Validation: {result.get('cv_mean', 0)*100:.1f}% ± {result.get('cv_std', 0)*100:.1f}%\n"
+                            f"Cross-Validation: {result.get('cv_mean', 0)*100:.1f}% ± {result.get('cv_std', 0)*100:.1f}%"
                         ))
                         
                         # If requested, also retrain from verified predictions
                         if retrain_from_verified:
-                            dialog.after(0, lambda: status_text.insert(tk.END, "\n🔄 Retraining from verified predictions...\n"))
-                            status_text.update()
+                            dialog.after(0, lambda: safe_insert("\n🔄 Retraining from verified predictions..."))
                             
                             try:
                                 from training_pipeline import MLTrainingPipeline
@@ -6379,7 +6419,7 @@ By using this application, you acknowledge that you understand and accept these 
                                 )
                                 
                                 if 'error' in verified_result:
-                                    dialog.after(0, lambda: status_text.insert(tk.END, f"⚠️ Verified predictions: {verified_result['error']}\n"))
+                                    dialog.after(0, lambda: safe_insert(f"⚠️ Verified predictions: {verified_result['error']}"))
                                 else:
                                     verified_msg = f"\n✅ Verified Predictions Training Complete!\n"
                                     verified_msg += f"Verified Predictions Used: {verified_result.get('verified_predictions_used', 0)}\n"
@@ -6390,15 +6430,15 @@ By using this application, you acknowledge that you understand and accept these 
                                         verified_msg += f"Training Samples: {verified_result.get('training_samples_used', 0)}\n"
                                     else:
                                         verified_msg += f"ML Retrained: ❌ ({verified_result.get('ml_error', 'N/A')})\n"
-                                    dialog.after(0, lambda: status_text.insert(tk.END, verified_msg))
+                                    dialog.after(0, lambda: safe_insert(verified_msg))
                             except Exception as e:
                                 error_msg = str(e)
-                                dialog.after(0, lambda msg=error_msg: status_text.insert(tk.END, f"⚠️ Error retraining from verified: {msg}\n"))
+                                dialog.after(0, lambda msg=error_msg: safe_insert(f"⚠️ Error retraining from verified: {msg}"))
                         
                         dialog.after(0, self._update_ml_status)
                 except Exception as e:
                     error_msg = str(e)  # Capture error message in local variable
-                    dialog.after(0, lambda msg=error_msg: status_text.insert(tk.END, f"\n✗ Error: {msg}\n"))
+                    dialog.after(0, lambda msg=error_msg: safe_insert(f"\n✗ Error: {msg}"))
             
             thread = threading.Thread(target=train)
             thread.daemon = True
@@ -6947,29 +6987,19 @@ By using this application, you acknowledge that you understand and accept these 
             return
         
         # Show strategy selection dialog
-        result = self._show_backtest_strategy_selection()
-        if not result:
+        selected_strategies = self._show_backtest_strategy_selection()
+        if not selected_strategies:
             return  # User cancelled
-        
-        selected_strategies, test_count = result
-        
-        # Temporarily update backtester config
-        original_tests = self.backtester.tests_per_run
-        self.backtester.tests_per_run = test_count
         
         # Run in background
         def run():
             success = self.backtester.run_test_now(selected_strategies=selected_strategies)
-            # Restore original setting
-            self.backtester.tests_per_run = original_tests
-            
             if success:
                 strategies_str = ", ".join([s.capitalize() for s in selected_strategies])
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Backtest Started",
                     f"🧪 Backtest started!\n\n"
-                    f"Testing strategies: {strategies_str}\n"
-                    f"Test points per strategy: {test_count}\n\n"
+                    f"Testing strategies: {strategies_str}\n\n"
                     "The algorithm will test itself on random historical points.\n"
                     "Results will be available in 'View Backtest Results'."
                 ))
@@ -6986,7 +7016,7 @@ By using this application, you acknowledge that you understand and accept these 
         """Show dialog to select strategies for backtesting"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Select Strategies for Backtesting")
-        dialog.geometry("450x450")
+        dialog.geometry("400x250")
         dialog.transient(self.root)
         dialog.grab_set()  # Make dialog modal
         dialog.protocol("WM_DELETE_WINDOW", lambda: dialog.destroy())
@@ -6997,7 +7027,7 @@ By using this application, you acknowledge that you understand and accept these 
         # Header
         header = tk.Label(
             dialog,
-            text="🧪 Configure Backtest",
+            text="Select Strategies to Test",
             bg=theme['bg'],
             fg=theme['accent'],
             font=('Segoe UI', 14, 'bold')
@@ -7008,18 +7038,10 @@ By using this application, you acknowledge that you understand and accept these 
         strategy_frame = tk.Frame(dialog, bg=theme['bg'])
         strategy_frame.pack(pady=10, padx=20)
         
-        tk.Label(
-            strategy_frame,
-            text="Select strategies to test:",
-            bg=theme['bg'],
-            fg=theme['fg'],
-            font=('Segoe UI', 10, 'bold')
-        ).pack(anchor=tk.W, pady=(0, 10))
-        
         # Load saved preferences
         saved_strategies = self.preferences.get_backtest_strategies()
         if not saved_strategies:
-            saved_strategies = ['trading']  # Default: trading only
+            saved_strategies = ['trading', 'mixed', 'investing']  # Default: all
         
         strategy_vars = {}
         strategies = [
@@ -7045,104 +7067,19 @@ By using this application, you acknowledge that you understand and accept these 
             )
             checkbox.pack(anchor=tk.W, pady=5)
         
-        # Test points configuration
-        config_frame = tk.Frame(dialog, bg=theme['bg'])
-        config_frame.pack(pady=15, padx=20, fill=tk.X)
-        
-        tk.Label(
-            config_frame,
-            text="Number of test points per strategy:",
-            bg=theme['bg'],
-            fg=theme['fg'],
-            font=('Segoe UI', 10, 'bold')
-        ).pack(anchor='w', pady=(10, 5))
-        
-        from config import BACKTEST_TESTS_PER_RUN
-        tests_var = tk.IntVar(value=BACKTEST_TESTS_PER_RUN)
-        
-        tests_frame = tk.Frame(config_frame, bg=theme['bg'])
-        tests_frame.pack(anchor='w', pady=5)
-        
-        tests_entry = tk.Entry(
-            tests_frame,
-            textvariable=tests_var,
-            bg=theme['entry_bg'],
-            fg=theme['entry_fg'],
-            font=('Segoe UI', 11),
-            width=10
-        )
-        tests_entry.pack(side=tk.LEFT, padx=(0, 10))
-        
-        # Add quick preset buttons
-        preset_frame = tk.Frame(config_frame, bg=theme['bg'])
-        preset_frame.pack(anchor='w', pady=8)
-        
-        tk.Label(
-            preset_frame,
-            text="Quick presets: ",
-            bg=theme['bg'],
-            fg=theme['fg'],
-            font=('Segoe UI', 9)
-        ).pack(side=tk.LEFT)
-        
-        for preset_name, preset_value in [("Quick (30)", 30), ("Standard (100)", 100), ("Thorough (200)", 200)]:
-            btn = tk.Button(
-                preset_frame,
-                text=preset_name,
-                command=lambda v=preset_value: tests_var.set(v),
-                bg=theme['accent'],
-                fg='white',
-                font=('Segoe UI', 9),
-                relief=tk.FLAT,
-                cursor='hand2',
-                padx=8,
-                pady=4
-            )
-            btn.pack(side=tk.LEFT, padx=3)
-        
-        # Info label
-        info_label = tk.Label(
-            config_frame,
-            text="💡 Recommendation:\n"
-                 "• Quick (30): ~2-5 min - for fast checks\n"
-                 "• Standard (100): ~10-15 min - good balance (RECOMMENDED)\n"
-                 "• Thorough (200): ~20-30 min - high confidence",
-            bg=theme['bg'],
-            fg=theme['fg_secondary'],
-            font=('Segoe UI', 8),
-            justify=tk.LEFT
-        )
-        info_label.pack(anchor='w', pady=(8, 0))
-        
         # Buttons
         btn_frame = tk.Frame(dialog, bg=theme['bg'])
         btn_frame.pack(pady=20)
         
         selected_strategies = []
-        selected_tests = [BACKTEST_TESTS_PER_RUN]  # Use list to capture value
         
         def on_ok():
             nonlocal selected_strategies
-            strategies = [key for key, var in strategy_vars.items() if var.get()]
-            if not strategies:
+            selected_strategies = [key for key, var in strategy_vars.items() if var.get()]
+            if not selected_strategies:
                 messagebox.showwarning("No Selection", "Please select at least one strategy.")
                 return
             
-            # Validate test count
-            try:
-                test_count = tests_var.get()
-                if test_count < 10:
-                    messagebox.showwarning("Invalid Input", "Please enter at least 10 tests.")
-                    return
-                if test_count > 1000:
-                    messagebox.showwarning("Invalid Input", "Maximum 1000 tests per strategy.")
-                    return
-                selected_tests[0] = test_count
-            except:
-                messagebox.showwarning("Invalid Input", "Please enter a valid number.")
-                return
-            
-            selected_strategies = strategies
             # Save preferences
             self.preferences.set_backtest_strategies(selected_strategies)
             dialog.destroy()
@@ -7150,13 +7087,13 @@ By using this application, you acknowledge that you understand and accept these 
         def on_cancel():
             dialog.destroy()
         
-        ModernButton(btn_frame, "Start Backtest", command=on_ok, theme=theme).pack(side=tk.LEFT, padx=5)
+        ModernButton(btn_frame, "OK", command=on_ok, theme=theme).pack(side=tk.LEFT, padx=5)
         ModernButton(btn_frame, "Cancel", command=on_cancel, theme=theme).pack(side=tk.LEFT, padx=5)
         
         # Wait for dialog to close
         dialog.wait_window()
         
-        return (selected_strategies, selected_tests[0]) if selected_strategies else None
+        return selected_strategies if selected_strategies else None
     
     def _show_backtest_results(self):
         """Show backtest results dialog"""

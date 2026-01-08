@@ -1002,8 +1002,9 @@ class StockPredictionML:
                     binary_labels.append('UP')  # SELL signal = price went up (inverted logic)
                 # Skip HOLD
             
-            if len(binary_mask) < 100:
-                return {"error": f"Not enough binary samples after filtering HOLD: {len(binary_mask)} < 100"}
+            # Reduced minimum from 100 to 30 for incremental training scenarios (backtest results)
+            if len(binary_mask) < 30:
+                return {"error": f"Not enough binary samples after filtering HOLD: {len(binary_mask)} < 30"}
             
             X = X[binary_mask]
             y = np.array(binary_labels)

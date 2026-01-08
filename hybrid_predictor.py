@@ -209,15 +209,20 @@ class HybridStockPredictor:
         
         # Check if ML model has high training accuracy (from metadata)
         ml_high_accuracy = False
+        ml_test_acc = 0
         try:
             if self.ml_predictor and self.ml_predictor.metadata:
                 ml_test_acc = self.ml_predictor.metadata.get('test_accuracy', 0)
                 if ml_test_acc >= 0.60:  # 60%+ validation accuracy
                     ml_high_accuracy = True
-                    # Favor ML more when it has high accuracy
-                    ml_weight = 0.7
-                    rule_weight = 0.3
-                    logger.debug(f"ML model has high accuracy ({ml_test_acc*100:.1f}%) - favoring ML in ensemble")
+                    # When ML has high accuracy, favor it MUCH more aggressively
+                    if ml_test_acc >= 0.62:  # 62%+ = very high accuracy
+                        ml_weight = 0.85  # Strongly favor ML
+                        rule_weight = 0.15
+                    else:  # 60-62%
+                        ml_weight = 0.75
+                        rule_weight = 0.25
+                    logger.info(f"🎯 ML model has high accuracy ({ml_test_acc*100:.1f}%) - strongly favoring ML (weight: {ml_weight:.2f})")
         except:
             pass
         
@@ -238,31 +243,60 @@ class HybridStockPredictor:
                         rule_weight = 0.3
                         ml_weight = 0.7
         
-        # Adjust based on confidence
-        rule_confidence = rule_pred.get('confidence', 50)
-        ml_confidence = ml_pred.get('confidence', 50)
+        # When ML has high accuracy, be more conservative about confidence adjustments
+        if ml_high_accuracy:
+            # Only make small adjustments based on confidence, don't override ML preference
+            rule_confidence = rule_pred.get('confidence', 50)
+            ml_confidence = ml_pred.get('confidence', 50)
+            
+            confidence_diff = abs(rule_confidence - ml_confidence)
+            if confidence_diff > 30:  # Only adjust if confidence difference is very large
+                if rule_confidence > ml_confidence:
+                    rule_weight += 0.05  # Small adjustment
+                    ml_weight -= 0.05
+                else:
+                    rule_weight -= 0.05
+                    ml_weight += 0.05
+            
+            # When predictions disagree and ML has high accuracy, favor ML unless rule confidence is MUCH higher
+            if rule_pred.get('action') != ml_pred.get('action'):
+                if rule_confidence > ml_confidence + 25:  # Rule must be 25%+ more confident
+                    rule_weight = 0.6
+                    ml_weight = 0.4
+                else:
+                    # Default to ML when it has high accuracy
+                    rule_weight = 0.3
+                    ml_weight = 0.7
+        else:
+            # Original logic for when ML doesn't have high accuracy
+            rule_confidence = rule_pred.get('confidence', 50)
+            ml_confidence = ml_pred.get('confidence', 50)
+            
+            confidence_diff = abs(rule_confidence - ml_confidence)
+            if confidence_diff > 20:
+                if rule_confidence > ml_confidence:
+                    rule_weight += 0.1
+                    ml_weight -= 0.1
+                else:
+                    rule_weight -= 0.1
+                    ml_weight += 0.1
+            
+            # Adjust based on agreement
+            if rule_pred.get('action') != ml_pred.get('action'):
+                if rule_confidence > ml_confidence:
+                    rule_weight = 0.7
+                    ml_weight = 0.3
+                else:
+                    rule_weight = 0.3
+                    ml_weight = 0.7
         
-        confidence_diff = abs(rule_confidence - ml_confidence)
-        if confidence_diff > 20:
-            if rule_confidence > ml_confidence:
-                rule_weight += 0.1
-                ml_weight -= 0.1
-            else:
-                rule_weight -= 0.1
-                ml_weight += 0.1
-        
-        # Adjust based on agreement
-        if rule_pred.get('action') != ml_pred.get('action'):
-            if rule_confidence > ml_confidence:
-                rule_weight = 0.7
-                ml_weight = 0.3
-            else:
-                rule_weight = 0.3
-                ml_weight = 0.7
-        
-        # Clamp weights
-        rule_weight = max(0.2, min(0.8, rule_weight))
-        ml_weight = 1.0 - rule_weight
+        # Clamp weights (but preserve ML preference when it has high accuracy)
+        if ml_high_accuracy:
+            rule_weight = max(0.1, min(0.4, rule_weight))  # Keep rule weight low
+            ml_weight = 1.0 - rule_weight
+        else:
+            rule_weight = max(0.2, min(0.8, rule_weight))
+            ml_weight = 1.0 - rule_weight
         
         return {'rule': rule_weight, 'ml': ml_weight}
     

@@ -15,7 +15,6 @@ import threading
 
 from data_fetcher import StockDataFetcher
 from hybrid_predictor import HybridStockPredictor
-from config import BACKTEST_TESTS_PER_RUN
 
 # Import walk-forward backtester if available
 try:
@@ -42,8 +41,8 @@ class ContinuousBacktester:
         
         # Configuration
         self.test_interval_hours = 24  # Run backtests daily
-        self.tests_per_run = BACKTEST_TESTS_PER_RUN  # Configurable in config.py
-        self.min_history_days = 100  # Need at least 100 days of history
+        self.tests_per_run = 100  # Test 100 random points per run
+        self.min_history_days = 60  # Reduced from 100 to 60 to find more valid test points
         self.lookforward_days = {
             'trading': 10,
             'mixed': 21,
@@ -227,6 +226,9 @@ class ContinuousBacktester:
             return
         
         self.is_testing = True
+        # Set is_running to True for manual test runs (so the loop doesn't exit immediately)
+        was_running = self.is_running
+        self.is_running = True
         
         # Default to all strategies if none specified
         if selected_strategies is None:
@@ -265,8 +267,8 @@ class ContinuousBacktester:
                 lookforward = self.lookforward_days[strategy]
                 logger.info(f"Testing {strategy} strategy (lookforward: {lookforward} days, need dates at least {lookforward + 30} days ago)")
                 
-                # Try 3x more attempts to find valid points
-                max_attempts = self.tests_per_run * 3
+                # Try 5x more attempts to find valid points (increased from 3x for better success rate)
+                max_attempts = self.tests_per_run * 5
                 for attempt in range(max_attempts):
                     if not self.is_running:
                         break
@@ -279,25 +281,27 @@ class ContinuousBacktester:
                     
                     # Pick random date based on strategy requirements
                     # End date: at least (lookforward + buffer) days ago to ensure we have future data
-                    end_date = datetime.now() - timedelta(days=lookforward + 30)  # Buffer for weekends/holidays
-                    # Start date: 5 years ago to have plenty of historical data
-                    start_date = datetime.now() - timedelta(days=1825)  # 5 years ago
+                    # Increased buffer to 50 days to account for weekends/holidays and data availability
+                    end_date = datetime.now() - timedelta(days=lookforward + 50)  # Buffer for weekends/holidays
+                    # Start date: 3 years ago (reduced from 5 to focus on more recent, available data)
+                    start_date = datetime.now() - timedelta(days=1095)  # 3 years ago
                     
                     # Ensure start_date < end_date
                     if start_date >= end_date:
-                        logger.warning(f"Invalid date range for {strategy}: start={start_date.date()}, end={end_date.date()}")
+                        logger.warning(f"Invalid date range for {strategy}: start={start_date.date()}, end={end_date.date()}. Lookforward={lookforward}")
                         continue
                     
                     # Random date in this range
                     days_range = (end_date - start_date).days
-                    if days_range <= 0:
+                    if days_range < 200:  # Need at least 200 days of range
+                        logger.debug(f"Date range too small for {strategy}: {days_range} days (need at least 200)")
                         continue
                     random_days = random.randint(0, days_range)
                     test_date = start_date + timedelta(days=random_days)
                     
                     # Test this point
                     result = self._test_historical_point(
-                        symbol, test_date, strategy, hybrid_predictor
+                        symbol, test_date, strategy, hybrid_predictor, tests_run
                     )
                     
                     if result:
@@ -310,8 +314,11 @@ class ContinuousBacktester:
                             logger.info(f"✅ Test {tests_run}/{self.tests_per_run}: {symbol} at {test_date.strftime('%Y-%m-%d')} - {'✓' if result['was_correct'] else '✗'}")
                     else:
                         skipped += 1
-                        if skipped == 1 or skipped % 10 == 0:  # Log first skip and every 10th
-                            logger.debug(f"Skipped {skipped} tests so far for {strategy} (attempting to find valid points...)")
+                        if skipped == 1 or skipped % 20 == 0:  # Log first skip and every 20th (less spam)
+                            logger.info(f"Skipped {skipped} tests so far for {strategy} (attempting to find valid points...)")
+                        # After many skips, log a sample of why it's failing
+                        if skipped == 50:
+                            logger.warning(f"Many skips for {strategy} - checking data availability. This might indicate data fetching issues.")
                 
                 # Update results (only if tests were run)
                 if tests_run > 0:
@@ -337,10 +344,11 @@ class ContinuousBacktester:
                         f"({correct/tests_run*100:.1f}%)"
                     )
                 else:
+                    # Log detailed failure info
                     logger.warning(
-                        f"⚠️ {strategy} backtest: No valid test points found after {skipped} attempts. "
+                        f"⚠️ {strategy} backtest: No valid test points found after {max_attempts} attempts. "
                         f"This might be due to insufficient historical data or date range issues. "
-                        f"Date range: {start_date.date()} to {end_date.date()}"
+                        f"Date range: {start_date.date()} to {end_date.date()}, Lookforward: {lookforward} days"
                     )
             
             # Update overall results (sum across all strategies)
@@ -405,16 +413,30 @@ class ContinuousBacktester:
             logger.error(f"Error in backtest: {e}", exc_info=True)
         finally:
             self.is_testing = False
+            # Restore is_running to its original state (only if it wasn't set by start())
+            # For manual runs, we set it to True temporarily, so restore it
+            if not was_running:
+                self.is_running = False
     
     def _test_historical_point(self, symbol: str, test_date: datetime, 
-                               strategy: str, hybrid_predictor: HybridStockPredictor) -> Optional[Dict]:
-        """Test algorithm on a specific historical point"""
+                               strategy: str, hybrid_predictor: HybridStockPredictor, 
+                               test_number: int = 0) -> Optional[Dict]:
+        """Test algorithm on a specific historical point
+        
+        Args:
+            symbol: Stock symbol
+            test_date: Date to test on
+            strategy: Trading strategy
+            hybrid_predictor: Hybrid predictor instance
+            test_number: Test number (for logging purposes)
+        """
         try:
             lookforward = self.lookforward_days[strategy]
             
             # Get historical data up to test_date (algorithm doesn't know future)
             end_date = test_date.strftime('%Y-%m-%d')
-            start_date = (test_date - timedelta(days=self.min_history_days + 50)).strftime('%Y-%m-%d')  # Extra buffer
+            # Reduced buffer to allow more test points (was 100+50, now 60+20)
+            start_date = (test_date - timedelta(days=self.min_history_days + 20)).strftime('%Y-%m-%d')  # Extra buffer
             
             # Fetch historical data using data_fetcher for consistency
             hist_data = self.app.data_fetcher.fetch_stock_history(symbol, start_date=start_date, end_date=end_date)
@@ -429,8 +451,10 @@ class ContinuousBacktester:
                 return None
             
             hist_list = hist_data['data']
-            if len(hist_list) < self.min_history_days:
-                logger.debug(f"Skipping {symbol} at {test_date.date()}: Insufficient history ({len(hist_list)} days, need {self.min_history_days})")
+            # Allow even less history (50 days minimum) to find more valid test points
+            min_required = max(50, self.min_history_days - 10)  # At least 50 days, or 10 less than min_history_days
+            if len(hist_list) < min_required:
+                logger.debug(f"Skipping {symbol} at {test_date.date()}: Insufficient history ({len(hist_list)} days, need {min_required})")
                 return None
             
             # Convert to DataFrame for easier manipulation
@@ -528,11 +552,26 @@ class ContinuousBacktester:
             rule_pred = analysis.get('rule_prediction', {})
             ensemble_weights = analysis.get('ensemble_weights', {})
             
-            logger.debug(f"Backtest prediction ({symbol} @ {test_date.date()}): "
-                        f"action={predicted_action}, method={method}, "
-                        f"ml={ml_pred.get('action', 'N/A')} ({ml_pred.get('confidence', 0):.1f}%), "
-                        f"rule={rule_pred.get('action', 'N/A')} ({rule_pred.get('confidence', 0):.1f}%), "
-                        f"weights=ML:{ensemble_weights.get('ml', 0):.2f}/Rule:{ensemble_weights.get('rule', 0):.2f}")
+            # Track ML vs final action for first 20 tests to diagnose accuracy gap
+            ml_action_raw = ml_pred.get('action', 'N/A')
+            rule_action = rule_pred.get('action', 'N/A')
+            ml_conf = ml_pred.get('confidence', 0)
+            rule_conf = rule_pred.get('confidence', 0)
+            
+            # Log detailed info for first 20 tests
+            if test_number < 20:
+                logger.info(f"Backtest #{test_number} ({symbol} @ {test_date.date()}): "
+                          f"FINAL={predicted_action}, ML={ml_action_raw} ({ml_conf:.1f}%), "
+                          f"RULE={rule_action} ({rule_conf:.1f}%), "
+                          f"weights=ML:{ensemble_weights.get('ml', 0):.2f}/Rule:{ensemble_weights.get('rule', 0):.2f}, "
+                          f"price_change={actual_change_pct:.2f}%")
+            else:
+                logger.debug(f"Backtest prediction ({symbol} @ {test_date.date()}): "
+                            f"action={predicted_action}, method={method}, "
+                            f"ml={ml_action_raw} ({ml_conf:.1f}%), "
+                            f"rule={rule_action} ({rule_conf:.1f}%), "
+                            f"weights=ML:{ensemble_weights.get('ml', 0):.2f}/Rule:{ensemble_weights.get('rule', 0):.2f}, "
+                            f"price_change={actual_change_pct:.2f}%")
             
             # Determine if prediction was correct
             # NOTE: Algorithm uses INVERTED logic:
@@ -549,6 +588,13 @@ class ContinuousBacktester:
             elif predicted_action == 'SELL':
                 # SELL (bullish signals) is correct if price went UP (so you can sell at profit)
                 was_correct = actual_change_pct > 0
+                # Detailed logging for SELL predictions (first 20 to diagnose the 78% failure rate)
+                if test_number < 20:
+                    logger.info(f"SELL prediction evaluation: price_change={actual_change_pct:.2f}%, "
+                              f"correct={was_correct}, ml_action={ml_pred.get('action', 'N/A')}, "
+                              f"rule_action={rule_pred.get('action', 'N/A')}, "
+                              f"ml_conf={ml_pred.get('confidence', 0):.1f}%, "
+                              f"rule_conf={rule_pred.get('confidence', 0):.1f}%")
             elif predicted_action == 'HOLD':
                 # HOLD is correct if price didn't move much (strategy-specific thresholds)
                 if strategy == "trading":
@@ -898,8 +944,17 @@ class ContinuousBacktester:
                     logger.debug(f"Error converting backtest result to training sample: {e}")
                     continue
             
+            # Log distribution of labels for diagnostics
+            if len(training_samples) > 0:
+                label_counts = {}
+                for sample in training_samples:
+                    label = sample.get('label', 'UNKNOWN')
+                    label_counts[label] = label_counts.get(label, 0) + 1
+                logger.info(f"Backtest training samples distribution: {label_counts}")
+            
             # If we have samples, try to combine with verified predictions to meet minimum requirement
-            if len(training_samples) >= 50:
+            # Reduced minimum to 30 to allow more frequent retraining from backtest results
+            if len(training_samples) >= 30:
                 logger.info(
                     f"📚 Converting {len(training_samples)} backtest results to training data for {strategy}"
                 )
@@ -938,8 +993,17 @@ class ContinuousBacktester:
                     ml_model = StockPredictionML(self.data_dir, strategy)
                     
                     if ml_model.is_trained():
-                        # Retrain with combined data
-                        result = ml_model.train(combined_samples)
+                        # Retrain with combined data using binary classification (same as original training)
+                        # Check if original model was trained with binary classification
+                        use_binary = False
+                        if ml_model.metadata and ml_model.metadata.get('use_binary_classification', False):
+                            use_binary = True
+                        
+                        result = ml_model.train(
+                            combined_samples,
+                            use_binary_classification=use_binary,  # Use same mode as original
+                            model_family='voting'  # Use voting ensemble for consistency
+                        )
                         
                         if 'error' not in result:
                             test_acc = result.get('test_accuracy', 0) * 100

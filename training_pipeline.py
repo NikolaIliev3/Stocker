@@ -538,25 +538,26 @@ class MLTrainingPipeline:
                 price_change_pct = ((actual_price - entry_price) / entry_price) * 100
                 
                 # Determine correct label based on actual outcome and strategy
+                # NOTE: Uses INVERTED logic - BUY = price went down, SELL = price went up
                 if strategy == "trading":
-                    if price_change_pct >= 3:
-                        label = "BUY"
-                    elif price_change_pct <= -3:
-                        label = "SELL"
+                    if price_change_pct <= -3:
+                        label = "BUY"  # Price went down, bearish → BUY
+                    elif price_change_pct >= 3:
+                        label = "SELL"  # Price went up, bullish → SELL
                     else:
                         label = "HOLD"
                 elif strategy == "investing":
-                    if price_change_pct >= 10:
-                        label = "BUY"
-                    elif price_change_pct <= -10:
-                        label = "AVOID"
+                    if price_change_pct <= -10:
+                        label = "BUY"  # Price went down significantly, bearish → BUY
+                    elif price_change_pct >= 10:
+                        label = "SELL"  # Price went up significantly, bullish → SELL
                     else:
                         label = "HOLD"
                 else:  # mixed
-                    if price_change_pct >= 5:
-                        label = "BUY"
-                    elif price_change_pct <= -5:
-                        label = "AVOID"
+                    if price_change_pct <= -5:
+                        label = "BUY"  # Price went down, bearish → BUY
+                    elif price_change_pct >= 5:
+                        label = "SELL"  # Price went up, bullish → SELL
                     else:
                         label = "HOLD"
                 
