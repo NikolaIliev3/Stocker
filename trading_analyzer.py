@@ -1032,46 +1032,52 @@ class TradingAnalyzer:
                 stop_loss = current_price * 0.97  # 3% stop loss for short-term
             
         elif action == "SELL":
-            # Short selling: target 2-5% down
+            # NOTE: System uses INVERTED logic - SELL = bullish (expecting price to go UP)
+            # So target should be ABOVE entry, stop loss should be BELOW entry
             support = support_resistance.get('support', None)
             resistance = support_resistance.get('resistance', None)
             support_strength = support_resistance.get('support_strength', 50)
             resistance_strength = support_resistance.get('resistance_strength', 50)
             
-            if support and support < current_price:
-                # Use volume-weighted support level
-                # If support is strong, it's more likely to hold, so target closer to it
-                if support_strength > 70:
-                    # Strong support - target slightly above it (2% above support)
-                    target_price = support * 1.02
-                else:
-                    # Weak support - can target closer to or at support
-                    target_price = support * 1.01
-                
-                # Cap at reasonable short-term target (5% down)
-                min_target = current_price * 0.95
-                target_price = max(target_price, min_target)
-            else:
-                # Calculate target based on momentum (2-5% down for short-term)
-                base_target_percent = 2.0 + (min(abs(score), 5) * 0.6)  # 2% to 5% down
-                target_price = current_price * (1 - base_target_percent / 100)
-            
-            # Stop loss for short: Use volume-weighted resistance
             if resistance and resistance > current_price:
-                # Use volume-weighted resistance as stop loss
-                # If resistance is strong, it's less likely to break, so stop closer
+                # Use actual resistance level
+                # Target should be BETWEEN current_price and resistance (above entry, below resistance)
+                price_range = resistance - current_price
                 if resistance_strength > 70:
-                    # Strong resistance - stop slightly above it (2% above resistance)
-                    stop_loss = resistance * 1.02
+                    # Strong resistance - target 95% of the way to resistance (very close to it)
+                    target_price = current_price + (price_range * 0.95)
                 else:
-                    # Weak resistance - stop further above (5% above resistance)
-                    stop_loss = resistance * 1.05
+                    # Weak resistance - target 98% of the way to resistance (almost breaking through)
+                    target_price = current_price + (price_range * 0.98)
+                
+                # Ensure target is above entry price (safety check)
+                target_price = max(target_price, current_price * 1.02)  # At least 2% above entry
+                
+                # Cap at reasonable short-term gain (12% to allow higher targets)
+                max_target = current_price * 1.12
+                target_price = min(target_price, max_target)
+            else:
+                # Calculate target based on momentum and volatility (3-10% for short-term)
+                # For SELL (bullish): use abs(score) since score is positive, higher abs(score) = higher target
+                base_target_percent = 3.0 + (min(abs(score), 5) * 1.4)  # 3% to 10%
+                target_price = current_price * (1 + base_target_percent / 100)
+            
+            # Stop loss: Use volume-weighted support if available (BELOW entry for bullish SELL)
+            if support and support < current_price:
+                # Use actual support level
+                # If support is strong, it's more likely to hold, so stop can be closer
+                if support_strength > 70:
+                    # Strong support - stop slightly below it (2% below support)
+                    stop_loss = support * 0.98
+                else:
+                    # Weak support - stop further below (5% below support)
+                    stop_loss = support * 0.95
                 
                 # Ensure it's not too far (max 3% loss from entry)
-                max_stop = current_price * 1.03
-                stop_loss = min(stop_loss, max_stop)
+                min_stop = current_price * 0.97
+                stop_loss = max(stop_loss, min_stop)
             else:
-                stop_loss = current_price * 1.03  # 3% stop loss for short
+                stop_loss = current_price * 0.97  # 3% stop loss for short-term
             
         else:  # HOLD
             entry_price = current_price

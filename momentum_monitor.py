@@ -343,4 +343,195 @@ class MomentumMonitor:
             del self.momentum_states[symbol_key]
             self.save()
             logger.debug(f"Removed momentum monitoring for: {symbol_key}")
+    
+    def detect_peaks_bottoms(self, symbol: str, price_history: list, indicators: dict) -> Dict:
+        """Detect if price is at a peak or bottom
+        
+        Args:
+            symbol: Stock symbol
+            price_history: List of price data points [{'date': str, 'close': float, 'high': float, 'low': float, 'volume': float}, ...]
+            indicators: Current technical indicators
+            
+        Returns:
+            Dict with peak/bottom detection:
+            {
+                'peak_detected': bool,
+                'bottom_detected': bool,
+                'confidence': float,
+                'reasoning': str,
+                'current_price': float,
+                'peak_price': float (if peak detected),
+                'bottom_price': float (if bottom detected)
+            }
+        """
+        import pandas as pd
+        import numpy as np
+        
+        if not price_history or len(price_history) < 20:
+            return {'peak_detected': False, 'bottom_detected': False, 'confidence': 0.0}
+        
+        try:
+            # Convert to DataFrame
+            df = pd.DataFrame(price_history)
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'])
+                df.set_index('date', inplace=True)
+            df = df.sort_index()
+            
+            # Ensure required columns exist
+            if 'close' not in df.columns or 'high' not in df.columns or 'low' not in df.columns:
+                return {'peak_detected': False, 'bottom_detected': False, 'confidence': 0.0}
+            
+            current_price = float(df['close'].iloc[-1])
+            current_high = float(df['high'].iloc[-1])
+            current_low = float(df['low'].iloc[-1])
+            
+            # Recent price window (last 10-20 days)
+            recent_window = min(20, len(df))
+            recent_prices = df['close'].tail(recent_window)
+            recent_highs = df['high'].tail(recent_window)
+            recent_lows = df['low'].tail(recent_window)
+            
+            peak_detected = False
+            bottom_detected = False
+            confidence = 0.0
+            reasoning_parts = []
+            
+            # 1. Detect actual local minima/maxima (price reversals)
+            # Find the actual lowest/highest points in recent history
+            max_high = float(recent_highs.max())
+            min_low = float(recent_lows.min())
+            
+            # Find when the min/max occurred
+            max_high_idx = recent_highs.idxmax() if len(recent_highs) > 0 else None
+            min_low_idx = recent_lows.idxmin() if len(recent_lows) > 0 else None
+            
+            # Check if we're at or very close to the actual peak/bottom
+            # A peak is detected if current price is near the max AND indicators suggest reversal
+            # A bottom is detected if current price is near the min AND indicators suggest reversal
+            is_at_peak = current_high >= max_high * 0.98  # Within 2% of peak
+            is_at_bottom = current_low <= min_low * 1.02  # Within 2% of bottom
+            
+            # Additional check: if price has moved away from the min/max, we detected it late
+            # This means the actual bottom/peak was in the recent past and we're seeing it now
+            price_moved_from_bottom = current_price > min_low * 1.03  # Price is 3%+ above the low
+            price_moved_from_peak = current_price < max_high * 0.97  # Price is 3%+ below the high
+            
+            # Peak detection signals
+            peak_signals = 0
+            if is_at_peak:
+                peak_signals += 1
+                reasoning_parts.append(f"Price reached 20-day peak at ${max_high:.2f}")
+            elif price_moved_from_peak and current_price < max_high * 0.95:
+                # Price was at peak recently and has moved down significantly (reversal detected)
+                peak_signals += 1
+                reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down")
+            
+            # Check RSI for overbought (peak)
+            rsi = indicators.get('rsi', 50)
+            if rsi >= 70:
+                peak_signals += 2  # Strong signal
+                reasoning_parts.append(f"RSI overbought ({rsi:.1f})")
+            elif rsi >= 65:
+                peak_signals += 1
+                reasoning_parts.append(f"RSI approaching overbought ({rsi:.1f})")
+            
+            # Check MFI for overbought (peak)
+            mfi = indicators.get('mfi', 50)
+            if mfi >= 80:
+                peak_signals += 2
+                reasoning_parts.append(f"MFI overbought ({mfi:.1f})")
+            elif mfi >= 75:
+                peak_signals += 1
+                reasoning_parts.append(f"MFI approaching overbought ({mfi:.1f})")
+            
+            # Check MACD divergence (price making higher highs, MACD making lower highs = peak)
+            macd_diff = indicators.get('macd_diff', 0)
+            if len(recent_prices) >= 10:
+                recent_high_prices = recent_highs.tail(10)
+                if len(recent_high_prices) >= 5:
+                    price_trend = recent_high_prices.iloc[-1] > recent_high_prices.iloc[-5]
+                    # If price is rising but MACD is falling, bearish divergence (peak forming)
+                    if price_trend and macd_diff < 0:
+                        peak_signals += 2
+                        reasoning_parts.append("Bearish MACD divergence detected")
+            
+            # Bottom detection signals
+            bottom_signals = 0
+            
+            # Check volume confirmation (if available) - do this after bottom_signals is defined
+            volume_ratio = 1.0
+            if 'volume' in df.columns:
+                recent_volumes = df['volume'].tail(recent_window)
+                if len(recent_volumes) > 0:
+                    avg_volume = recent_volumes.mean()
+                    current_volume = recent_volumes.iloc[-1]
+                    if avg_volume > 0:
+                        volume_ratio = current_volume / avg_volume
+                        if volume_ratio > 1.5:
+                            if peak_signals > 0:
+                                peak_signals += 1
+                                reasoning_parts.append("High volume confirms peak")
+                            if bottom_signals > 0:
+                                bottom_signals += 1
+                                reasoning_parts.append("High volume confirms bottom")
+            if is_at_bottom:
+                bottom_signals += 1
+                reasoning_parts.append(f"Price reached 20-day bottom at ${min_low:.2f}")
+            elif price_moved_from_bottom and current_price > min_low * 1.05:
+                # Price was at bottom recently and has moved up significantly (reversal detected)
+                bottom_signals += 1
+                reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up")
+            
+            # Check RSI for oversold (bottom)
+            if rsi <= 30:
+                bottom_signals += 2  # Strong signal
+                reasoning_parts.append(f"RSI oversold ({rsi:.1f})")
+            elif rsi <= 35:
+                bottom_signals += 1
+                reasoning_parts.append(f"RSI approaching oversold ({rsi:.1f})")
+            
+            # Check MFI for oversold (bottom)
+            if mfi <= 20:
+                bottom_signals += 2
+                reasoning_parts.append(f"MFI oversold ({mfi:.1f})")
+            elif mfi <= 25:
+                bottom_signals += 1
+                reasoning_parts.append(f"MFI approaching oversold ({mfi:.1f})")
+            
+            # Check MACD divergence (price making lower lows, MACD making higher lows = bottom)
+            if len(recent_prices) >= 10:
+                recent_low_prices = recent_lows.tail(10)
+                if len(recent_low_prices) >= 5:
+                    price_trend = recent_low_prices.iloc[-1] < recent_low_prices.iloc[-5]
+                    # If price is falling but MACD is rising, bullish divergence (bottom forming)
+                    if price_trend and macd_diff > 0:
+                        bottom_signals += 2
+                        reasoning_parts.append("Bullish MACD divergence detected")
+            
+            # Determine if peak/bottom detected (need at least 3 signals)
+            peak_detected = peak_signals >= 3
+            bottom_detected = bottom_signals >= 3
+            
+            if peak_detected:
+                confidence = min(90, 50 + (peak_signals * 10))
+            elif bottom_detected:
+                confidence = min(90, 50 + (bottom_signals * 10))
+            
+            # Return the actual peak/bottom prices (the detected minimum/maximum)
+            # These are the prices where reversal occurred, not necessarily current price
+            return {
+                'peak_detected': peak_detected,
+                'bottom_detected': bottom_detected,
+                'confidence': confidence,
+                'reasoning': '; '.join(reasoning_parts) if reasoning_parts else 'No significant signals',
+                'current_price': current_price,
+                'peak_price': max_high if peak_detected else None,  # The actual peak price detected
+                'bottom_price': min_low if bottom_detected else None,  # The actual bottom price detected
+                'reversal_detected': peak_detected or bottom_detected,  # Indicates reversal is incoming
+                'signals_count': {'peak': peak_signals, 'bottom': bottom_signals}
+            }
+        except Exception as e:
+            logger.error(f"Error detecting peaks/bottoms for {symbol}: {e}")
+            return {'peak_detected': False, 'bottom_detected': False, 'confidence': 0.0, 'reasoning': f'Error: {str(e)}'}
 

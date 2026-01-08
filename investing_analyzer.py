@@ -577,9 +577,10 @@ class InvestingAnalyzer:
                 
         elif action == "SELL":
             # SELL action (inverted: good fundamentals, stock likely to go up, so sell to take profits)
-            # Target: price decline of 10-15% over 1-2 years (pullback from high)
-            target_price = current_price * 0.90
-            stop_loss = current_price * 1.10  # 10% upside risk (price continues rising)
+            # NOTE: System uses INVERTED logic - SELL = bullish (expecting price to go UP)
+            # Target: price increase of 10-15% over 1-2 years (sell at profit)
+            target_price = current_price * 1.12  # 12% target for long-term bullish
+            stop_loss = current_price * 0.85  # 15% downside risk (price goes down instead)
             
         else:  # HOLD
             target_price = current_price

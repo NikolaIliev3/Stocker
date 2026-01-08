@@ -38,6 +38,9 @@ class LearningTracker:
                 'background_trainings': 0,
                 'trend_change_predictions': 0,
                 'verified_trend_changes': 0,
+                'peak_detections': 0,
+                'bottom_detections': 0,
+                'trend_change_detections': 0,
                 'stocks_analyzed': set(),
                 'unique_symbols': []
             },
@@ -195,6 +198,55 @@ class LearningTracker:
         })
         self.save()
         logger.info(f"✅ Learning: Trend change prediction verified ({'correct' if was_correct else 'incorrect'})")
+    
+    def record_peak_detection(self, symbol: str, price: float, confidence: float, reasoning: str):
+        """Record a peak detection event for Megamind learning"""
+        if not self.data['data_sources'].get('first_learning_date'):
+            self.data['data_sources']['first_learning_date'] = datetime.now().isoformat()
+        
+        self.data['data_sources']['peak_detections'] = self.data['data_sources'].get('peak_detections', 0) + 1
+        self._add_symbol(symbol)
+        self._add_learning_event('peak_detection', {
+            'symbol': symbol,
+            'price': price,
+            'confidence': confidence,
+            'reasoning': reasoning
+        })
+        self.save()
+        logger.info(f"🧠 Learning: Peak detection for {symbol} recorded (${price:.2f}, {confidence:.1f}% confidence)")
+    
+    def record_bottom_detection(self, symbol: str, price: float, confidence: float, reasoning: str):
+        """Record a bottom detection event for Megamind learning"""
+        if not self.data['data_sources'].get('first_learning_date'):
+            self.data['data_sources']['first_learning_date'] = datetime.now().isoformat()
+        
+        self.data['data_sources']['bottom_detections'] = self.data['data_sources'].get('bottom_detections', 0) + 1
+        self._add_symbol(symbol)
+        self._add_learning_event('bottom_detection', {
+            'symbol': symbol,
+            'price': price,
+            'confidence': confidence,
+            'reasoning': reasoning
+        })
+        self.save()
+        logger.info(f"🧠 Learning: Bottom detection for {symbol} recorded (${price:.2f}, {confidence:.1f}% confidence)")
+    
+    def record_trend_change_detection(self, symbol: str, old_trend: str, new_trend: str, price: float, confidence: float):
+        """Record a trend change detection event for Megamind learning"""
+        if not self.data['data_sources'].get('first_learning_date'):
+            self.data['data_sources']['first_learning_date'] = datetime.now().isoformat()
+        
+        self.data['data_sources']['trend_change_detections'] = self.data['data_sources'].get('trend_change_detections', 0) + 1
+        self._add_symbol(symbol)
+        self._add_learning_event('trend_change_detection', {
+            'symbol': symbol,
+            'old_trend': old_trend,
+            'new_trend': new_trend,
+            'price': price,
+            'confidence': confidence
+        })
+        self.save()
+        logger.info(f"🧠 Learning: Trend change detection for {symbol} recorded ({old_trend} → {new_trend} at ${price:.2f})")
     
     def _add_symbol(self, symbol: str):
         """Add a symbol to the learned stocks list"""

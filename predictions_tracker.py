@@ -112,10 +112,11 @@ class PredictionsTracker:
             elif current_price <= stop_loss:
                 was_correct = False
         elif action == "SELL":
-            # SELL prediction is correct if price reached target (went down) before stop loss (went up)
-            if current_price <= target_price:
+            # SELL prediction (inverted logic: bullish, expecting price to go UP)
+            # Correct if price reached target (went UP) before stop loss (went DOWN)
+            if current_price >= target_price:
                 was_correct = True
-            elif current_price >= stop_loss:
+            elif current_price <= stop_loss:
                 was_correct = False
         elif action in ["HOLD", "AVOID"]:
             # For HOLD/AVOID, we check if price moved in expected direction

@@ -258,6 +258,17 @@ class StockerApp:
         # Start momentum monitoring for predictions (check every 15 minutes)
         self.root.after(60000, self._start_momentum_monitoring)  # Start after 1 minute
         
+        # Initialize monitored stocks tracking (for peak/bottom/trend change notifications)
+        saved_monitored = self.preferences.get('monitored_stocks', [])
+        self.monitored_stocks = set(saved_monitored if isinstance(saved_monitored, list) else [])
+        
+        # Track last detected peak/bottom/trend changes to avoid duplicate notifications
+        self._last_peak_bottom = {}  # {symbol: {'type': 'peak'|'bottom', 'price': float, 'time': str}}
+        self._last_trend_change = {}  # {symbol: {'trend': str, 'time': str}}
+        
+        # Start periodic checking of monitored stocks for peaks/bottoms/trend changes
+        self.root.after(120000, self._start_monitored_stocks_checking)  # Start after 2 minutes
+        
         # Handle cleanup on window close
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         
@@ -1007,6 +1018,56 @@ class StockerApp:
         
         messagebox.showinfo(title, message)
         logger.info(f"Showed momentum change notification for {symbol}: {action} ({confidence}%)")
+    
+    def _show_peak_notification(self, symbol: str, peak_price: float, current_price: float, confidence: float, reasoning: str, timestamp: str):
+        """Show notification when peak is detected"""
+        title = "🔴 PEAK DETECTED - REVERSAL INCOMING"
+        message = f"📈 {symbol} - Highest Price Reached\n\n"
+        message += f"Time: {timestamp}\n"
+        message += f"Peak Price (Highest): ${peak_price:,.2f}\n"
+        message += f"Current Price: ${current_price:,.2f}\n"
+        
+        if current_price < peak_price:
+            price_diff = peak_price - current_price
+            price_diff_pct = ((peak_price - current_price) / peak_price) * 100
+            message += f"Price Change: -${price_diff:.2f} ({price_diff_pct:.1f}% down from peak)\n"
+            message += f"\n🔄 REVERSAL CONFIRMED: Price has already started declining!\n\n"
+        else:
+            message += f"\n⚠️ REVERSAL IMMINENT: Price at peak - expect downward movement!\n\n"
+        
+        message += f"Confidence: {confidence:.1f}%\n\n"
+        message += f"Reasoning:\n{reasoning}\n\n"
+        message += "⚠️ Price reached its highest point and is likely to reverse downward.\n"
+        message += "Consider taking profits or preparing for SELL signal.\n\n"
+        message += "🧠 Data fed to Megamind for learning!"
+        
+        messagebox.showinfo(title, message)
+        logger.info(f"Peak notification shown for {symbol}: Peak ${peak_price:.2f}, Current ${current_price:.2f}")
+    
+    def _show_bottom_notification(self, symbol: str, bottom_price: float, current_price: float, confidence: float, reasoning: str, timestamp: str):
+        """Show notification when bottom is detected"""
+        title = "🟢 BOTTOM DETECTED - REVERSAL INCOMING"
+        message = f"📉 {symbol} - Lowest Price Reached\n\n"
+        message += f"Time: {timestamp}\n"
+        message += f"Bottom Price (Lowest): ${bottom_price:,.2f}\n"
+        message += f"Current Price: ${current_price:,.2f}\n"
+        
+        if current_price > bottom_price:
+            price_diff = current_price - bottom_price
+            price_diff_pct = ((current_price - bottom_price) / bottom_price) * 100
+            message += f"Price Change: +${price_diff:.2f} ({price_diff_pct:.1f}% up from bottom)\n"
+            message += f"\n🔄 REVERSAL CONFIRMED: Price has already started rising!\n\n"
+        else:
+            message += f"\n⚠️ REVERSAL IMMINENT: Price at bottom - expect upward movement!\n\n"
+        
+        message += f"Confidence: {confidence:.1f}%\n\n"
+        message += f"Reasoning:\n{reasoning}\n\n"
+        message += "⚠️ Price reached its lowest point and is likely to reverse upward.\n"
+        message += "Consider preparing for BUY signal.\n\n"
+        message += "🧠 Data fed to Megamind for learning!"
+        
+        messagebox.showinfo(title, message)
+        logger.info(f"Bottom notification shown for {symbol}: Bottom ${bottom_price:.2f}, Current ${current_price:.2f}")
     
     def _show_momentum_change_notifications(self, momentum_changes: List[Dict]):
         """Show batched notifications for momentum/trend changes in predictions"""
@@ -2235,6 +2296,14 @@ class StockerApp:
                                         command=self._scan_market, theme=theme)
         self.scan_market_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
         
+        # Monitor trend changes button (separate row for emphasis)
+        monitor_frame = tk.Frame(stock_lookup_card.content_frame, bg=theme['card_bg'])
+        monitor_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        self.monitor_trend_btn = ModernButton(monitor_frame, "🔔 Monitor Trend Changes", 
+                                             command=self._toggle_trend_monitoring, theme=theme)
+        self.monitor_trend_btn.pack(fill=tk.X)
+        
         # Search history dropdown
         history_frame = tk.Frame(stock_lookup_card.content_frame, bg=theme['card_bg'])
         history_frame.pack(fill=tk.X)
@@ -2374,6 +2443,12 @@ class StockerApp:
                     theme=theme).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         ModernButton(btn_inner, self.localization.t('clear_old'), command=self._clear_old_predictions, 
                     theme=theme).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        
+        # Clear All button (separate row for emphasis)
+        clear_all_frame = tk.Frame(actions_card.content_frame, bg=theme['card_bg'])
+        clear_all_frame.pack(fill=tk.X, pady=(10, 0))
+        ModernButton(clear_all_frame, "🗑️ Clear All Predictions", command=self._clear_all_predictions, 
+                    theme=theme).pack(fill=tk.X)
     
     def _show_predictions_tab(self):
         """Switch to predictions tab"""
@@ -2459,29 +2534,32 @@ class StockerApp:
                     stop_loss = current_price_usd * 0.80  # 20% stop loss
         
         elif action == "SELL":
-            if current_price_usd <= target_price:
+            if current_price_usd >= target_price:
                 # Target already reached - recalculate
+                # NOTE: SELL = bullish (expecting price to go UP), so target should be ABOVE entry
+                # If current price >= target, the target was reached (price went up)
                 strategy = self.strategy_var.get()
                 if strategy == "trading":
-                    target_price = current_price_usd * 0.97  # 3% down for trading
+                    target_price = current_price_usd * 1.03  # 3% above for trading
                 elif strategy == "mixed":
-                    target_price = current_price_usd * 0.94  # 6% down for mixed
+                    target_price = current_price_usd * 1.06  # 6% above for mixed
                 else:  # investing
-                    target_price = current_price_usd * 0.88  # 12% down for investing
+                    target_price = current_price_usd * 1.12  # 12% above for investing
                 
                 messagebox.showwarning(
                     self.localization.t('warning'),
                     f"Target price was already reached. New target set: {self.localization.format_currency(target_price)}"
                 )
             
-            if stop_loss <= entry_price:
-                # Stop loss is below entry - invalid for SELL
+            if stop_loss <= 0 or stop_loss >= entry_price:
+                # Stop loss is invalid for SELL (bullish) - should be BELOW entry
+                # NOTE: SELL = bullish (expecting price to go UP), stop loss limits loss if price goes DOWN
                 if strategy == "trading":
-                    stop_loss = current_price_usd * 1.03  # 3% stop loss
+                    stop_loss = current_price_usd * 0.97  # 3% stop loss below entry
                 elif strategy == "mixed":
-                    stop_loss = current_price_usd * 1.05  # 5% stop loss
+                    stop_loss = current_price_usd * 0.95  # 5% stop loss below entry
                 else:  # investing
-                    stop_loss = current_price_usd * 1.20  # 20% stop loss
+                    stop_loss = current_price_usd * 0.80  # 20% stop loss below entry
         
         if entry_price <= 0 or target_price <= 0 or stop_loss <= 0:
             messagebox.showwarning(self.localization.t('invalid_prediction'), self.localization.t('invalid_prediction'))
@@ -2544,6 +2622,96 @@ class StockerApp:
         thread.daemon = True
         thread.start()
     
+    def _clear_all_predictions(self):
+        """Clear ALL predictions (regular and trend change) - fresh start"""
+        theme = self.theme_manager.get_theme()
+        
+        # Count predictions
+        regular_count = len(self.predictions_tracker.get_active_predictions())
+        trend_count = len(self.trend_change_tracker.get_active_predictions())
+        total_count = regular_count + trend_count
+        
+        if total_count == 0:
+            messagebox.showinfo("No Predictions", "There are no predictions to clear.")
+            return
+        
+        # Confirm deletion
+        response = messagebox.askyesno(
+            "Clear All Predictions",
+            f"This will delete ALL predictions:\n\n"
+            f"• Regular predictions: {regular_count}\n"
+            f"• Trend change predictions: {trend_count}\n\n"
+            f"Total: {total_count} prediction(s)\n\n"
+            f"Are you sure you want to continue?",
+            icon='warning'
+        )
+        
+        if not response:
+            return
+        
+        # Clear regular predictions
+        cleared_regular = 0
+        if regular_count > 0:
+            self.predictions_tracker.predictions = []
+            self.predictions_tracker.save()
+            cleared_regular = regular_count
+        
+        # Clear trend change predictions
+        cleared_trend = 0
+        if trend_count > 0:
+            self.trend_change_tracker.predictions = []
+            self.trend_change_tracker.save()
+            cleared_trend = trend_count
+        
+        # Update displays
+        self._update_predictions_display()
+        self._update_trend_change_display()
+        
+        messagebox.showinfo(
+            "Predictions Cleared",
+            f"Successfully cleared all predictions:\n\n"
+            f"• Regular predictions: {cleared_regular}\n"
+            f"• Trend change predictions: {cleared_trend}\n\n"
+            f"Total: {cleared_regular + cleared_trend} prediction(s) deleted.\n\n"
+            f"You can now make fresh predictions!"
+        )
+        
+        logger.info(f"Cleared all predictions: {cleared_regular} regular, {cleared_trend} trend change")
+    
+    def _clear_all_trend_predictions(self):
+        """Clear ALL trend change predictions"""
+        trend_count = len(self.trend_change_tracker.get_active_predictions())
+        
+        if trend_count == 0:
+            messagebox.showinfo("No Predictions", "There are no trend change predictions to clear.")
+            return
+        
+        # Confirm deletion
+        response = messagebox.askyesno(
+            "Clear All Trend Predictions",
+            f"This will delete ALL trend change predictions:\n\n"
+            f"• Trend change predictions: {trend_count}\n\n"
+            f"Are you sure you want to continue?",
+            icon='warning'
+        )
+        
+        if not response:
+            return
+        
+        # Clear trend change predictions
+        self.trend_change_tracker.predictions = []
+        self.trend_change_tracker.save()
+        
+        # Update display
+        self._update_trend_change_display()
+        
+        messagebox.showinfo(
+            "Trend Predictions Cleared",
+            f"Successfully cleared {trend_count} trend change prediction(s)."
+        )
+        
+        logger.info(f"Cleared all trend change predictions: {trend_count}")
+    
     def _clear_old_predictions(self):
         """Clear old verified predictions"""
         if messagebox.askyesno(self.localization.t('confirm'), self.localization.t('clear_all_verified')):
@@ -2555,6 +2723,232 @@ class StockerApp:
             messagebox.showinfo(self.localization.t('cleared'), 
                              self.localization.t('removed_predictions').format(count=len(verified)))
             self._update_predictions_display()
+    
+    def _toggle_trend_monitoring(self):
+        """Toggle trend monitoring for currently analyzed stock"""
+        if not self.current_symbol:
+            messagebox.showinfo("Info", "Please analyze a stock first to enable trend monitoring.")
+            return
+        
+        symbol = self.current_symbol
+        
+        if symbol in self.monitored_stocks:
+            # Disable monitoring
+            self.monitored_stocks.remove(symbol)
+            if hasattr(self, 'monitor_trend_btn'):
+                self.monitor_trend_btn.config(text="🔔 Monitor Trend Changes")
+            messagebox.showinfo("Monitoring Disabled", 
+                              f"Trend monitoring disabled for {symbol}.\n"
+                              f"You will no longer receive notifications for trend changes.")
+        else:
+            # Enable monitoring
+            self.monitored_stocks.add(symbol)
+            if hasattr(self, 'monitor_trend_btn'):
+                self.monitor_trend_btn.config(text="🔕 Stop Monitoring")
+            messagebox.showinfo("Monitoring Enabled", 
+                              f"Trend monitoring enabled for {symbol}.\n"
+                              f"You will receive notifications when:\n"
+                              f"• Price reaches peak or bottom\n"
+                              f"• Trend changes are detected\n\n"
+                              f"Checking every 5 minutes...\n\n"
+                              f"🧠 All events will feed Megamind for learning!")
+        
+        # Save to preferences
+        self.preferences.set('monitored_stocks', list(self.monitored_stocks))
+        logger.info(f"Trend monitoring {'enabled' if symbol in self.monitored_stocks else 'disabled'} for {symbol}")
+    
+    def _check_monitored_stock_for_changes(self, symbol: str):
+        """Check monitored stock for peaks, bottoms, and trend changes"""
+        try:
+            # Fetch fresh data
+            stock_data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=True)
+            history_data = self.data_fetcher.fetch_stock_history(symbol, period='3mo')
+            
+            if 'error' in stock_data or not history_data.get('data'):
+                return
+            
+            # Perform trading analysis
+            trading_analysis = self.trading_analyzer.analyze(stock_data, history_data)
+            if 'error' in trading_analysis:
+                return
+            
+            indicators = trading_analysis.get('indicators', {})
+            price_action = trading_analysis.get('price_action', {})
+            momentum_analysis = trading_analysis.get('momentum_analysis', {})
+            
+            current_price = stock_data.get('price', 0)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # 1. Check for PEAKS and BOTTOMS
+            peak_bottom_detection = self.momentum_monitor.detect_peaks_bottoms(
+                symbol,
+                history_data.get('data', []),
+                indicators
+            )
+            
+            # Track last detected peak/bottom to avoid duplicate notifications
+            last_detection = self._last_peak_bottom.get(symbol, {})
+            last_detection_time_str = last_detection.get('time', '2000-01-01T00:00:00')
+            try:
+                last_detection_time = datetime.fromisoformat(last_detection_time_str)
+                time_since_last = (datetime.now() - last_detection_time).total_seconds() / 3600  # hours
+            except:
+                time_since_last = 999  # Force notification if parsing fails
+            
+            # Show peak notification (if not shown recently - within last 24 hours)
+            if peak_bottom_detection.get('peak_detected') and \
+               (last_detection.get('type') != 'peak' or time_since_last > 24):
+                peak_price = peak_bottom_detection.get('peak_price', current_price)
+                confidence = peak_bottom_detection.get('confidence', 0)
+                reasoning = peak_bottom_detection.get('reasoning', '')
+                
+                # Feed to Megamind
+                self.learning_tracker.record_peak_detection(
+                    symbol, peak_price, confidence, reasoning
+                )
+                
+                # Show notification (pass both peak price and current price)
+                self.root.after(0, self._show_peak_notification, symbol, peak_price, current_price, confidence, reasoning, timestamp)
+                
+                # Update last detection
+                self._last_peak_bottom[symbol] = {
+                    'type': 'peak',
+                    'price': peak_price,
+                    'time': datetime.now().isoformat()
+                }
+            
+            # Show bottom notification
+            if peak_bottom_detection.get('bottom_detected') and \
+               (last_detection.get('type') != 'bottom' or time_since_last > 24):
+                bottom_price = peak_bottom_detection.get('bottom_price', current_price)
+                confidence = peak_bottom_detection.get('confidence', 0)
+                reasoning = peak_bottom_detection.get('reasoning', '')
+                
+                # Feed to Megamind
+                self.learning_tracker.record_bottom_detection(
+                    symbol, bottom_price, confidence, reasoning
+                )
+                
+                # Show notification (pass both bottom price and current price)
+                self.root.after(0, self._show_bottom_notification, symbol, bottom_price, current_price, confidence, reasoning, timestamp)
+                
+                # Update last detection
+                self._last_peak_bottom[symbol] = {
+                    'type': 'bottom',
+                    'price': bottom_price,
+                    'time': datetime.now().isoformat()
+                }
+            
+            # 2. Check for TREND CHANGES (using existing momentum monitoring)
+            momentum_changes = self.momentum_monitor.update_momentum_state(
+                symbol,
+                indicators,
+                price_action,
+                momentum_analysis
+            )
+            
+            # Track last trend change to avoid duplicates
+            last_trend = self._last_trend_change.get(symbol, {})
+            last_trend_time_str = last_trend.get('time', '2000-01-01T00:00:00')
+            try:
+                last_trend_time = datetime.fromisoformat(last_trend_time_str)
+                time_since_trend_change = (datetime.now() - last_trend_time).total_seconds() / 3600
+            except:
+                time_since_trend_change = 999  # Force notification if parsing fails
+            
+            # Show trend change notification (if significant change)
+            if momentum_changes.get('trend_reversed') or \
+               (momentum_changes.get('momentum_changed') and len(momentum_changes.get('changes', [])) > 0):
+                
+                # Only notify if trend actually changed (not just momentum shift)
+                trend_change_desc = momentum_changes.get('trend_change')
+                if trend_change_desc and (last_trend.get('trend') != trend_change_desc or time_since_trend_change > 24):
+                    old_trend = last_trend.get('trend', 'unknown')
+                    # Extract new trend from description (e.g., "Uptrend → Downtrend" -> "downtrend")
+                    if '→' in trend_change_desc:
+                        new_trend = trend_change_desc.split('→')[-1].strip().lower()
+                    else:
+                        new_trend = trend_change_desc.lower()
+                    
+                    recommendation = momentum_changes.get('recommendation', {})
+                    confidence = recommendation.get('confidence', 50)
+                    
+                    # Feed to Megamind
+                    self.learning_tracker.record_trend_change_detection(
+                        symbol, old_trend, new_trend, current_price, confidence
+                    )
+                    
+                    # Show notification
+                    self.root.after(0, self._show_trend_change_notification, symbol, momentum_changes, timestamp)
+                    
+                    # Update last trend
+                    self._last_trend_change[symbol] = {
+                        'trend': new_trend,
+                        'time': datetime.now().isoformat()
+                    }
+            
+        except Exception as e:
+            logger.error(f"Error checking monitored stock {symbol} for changes: {e}")
+    
+    def _show_trend_change_notification(self, symbol: str, changes: Dict, timestamp: str):
+        """Show notification when trend changes (enhanced version)"""
+        change_list = changes.get('changes', [])
+        is_trend_reversal = changes.get('trend_reversed', False)
+        recommendation = changes.get('recommendation', {})
+        trend_change = changes.get('trend_change')
+        
+        action = recommendation.get('action', 'HOLD')
+        confidence = recommendation.get('confidence', 50)
+        
+        if is_trend_reversal:
+            title = f"⚠️ TREND REVERSAL: {symbol}"
+        else:
+            title = f"🔄 TREND CHANGE: {symbol}"
+        
+        message = f"📊 TREND CHANGE DETECTED\n\n"
+        message += f"Stock: {symbol}\n"
+        message += f"Time: {timestamp}\n\n"
+        
+        if trend_change:
+            message += f"📈 Trend Change: {trend_change}\n\n"
+        
+        action_emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "🟡"
+        message += f"{action_emoji} New Recommendation: {action} (Confidence: {confidence}%)\n\n"
+        
+        message += "Key Changes Detected:\n"
+        for change in change_list[:5]:
+            message += f"• {change}\n"
+        
+        if len(change_list) > 5:
+            message += f"\n... and {len(change_list) - 5} more changes\n"
+        
+        message += "\n🧠 Data fed to Megamind for learning!"
+        
+        messagebox.showinfo(title, message)
+        logger.info(f"Trend change notification for {symbol} at {timestamp}: {action} ({confidence}%)")
+    
+    def _start_monitored_stocks_checking(self):
+        """Start periodic checking of monitored stocks (every 5 minutes)"""
+        check_interval_ms = 5 * 60 * 1000  # 5 minutes
+        
+        def check_monitored():
+            if not hasattr(self, 'monitored_stocks') or not self.monitored_stocks:
+                # Reschedule even if no stocks monitored (in case user enables later)
+                self.root.after(check_interval_ms, check_monitored)
+                return
+            
+            # Check each monitored stock
+            for symbol in list(self.monitored_stocks):
+                thread = threading.Thread(target=self._check_monitored_stock_for_changes, args=(symbol,))
+                thread.daemon = True
+                thread.start()
+            
+            # Schedule next check
+            self.root.after(check_interval_ms, check_monitored)
+        
+        # Start first check
+        check_monitored()
+        logger.info("Started periodic monitoring of stocks for peaks/bottoms/trend changes (every 5 minutes)")
     
     def _update_predictions_display(self):
         """Update the predictions display with modern styling"""
@@ -3445,12 +3839,12 @@ class StockerApp:
         # Create alerts list frame
         self.alerts_list_frame = scrollable_frame
         
-        # Create alert button
-        create_alert_card = ModernCard(scrollable_frame, "Create Alert", theme=theme, padding=15)
-        create_alert_card.pack(fill=tk.X, pady=(0, 15))
+        # Create alert button - store reference so it doesn't get destroyed
+        self.create_alert_card = ModernCard(scrollable_frame, "Create Alert", theme=theme, padding=15)
+        self.create_alert_card.pack(fill=tk.X, pady=(0, 15))
         
-        create_frame = tk.Frame(create_alert_card, bg=theme['card_bg'])
-        create_frame.pack(fill=tk.X, padx=15, pady=15)
+        # Use content_frame instead of creating a new frame
+        create_frame = self.create_alert_card.content_frame
         
         tk.Label(create_frame, text="Alert Type:", bg=theme['card_bg'], fg=theme['fg']).grid(row=0, column=0, sticky=tk.W, pady=5)
         self.alert_type = ttk.Combobox(create_frame, values=['price_alert', 'prediction_alert', 'portfolio_alert'], width=20, state='readonly')
@@ -3500,7 +3894,11 @@ class StockerApp:
         
         refresh_btn = ModernButton(header_frame, text="Refresh", 
                                   command=self._refresh_trend_changes, theme=theme)
-        refresh_btn.pack(side=tk.RIGHT)
+        refresh_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        
+        clear_trend_btn = ModernButton(header_frame, text="🗑️ Clear All", 
+                                      command=self._clear_all_trend_predictions, theme=theme)
+        clear_trend_btn.pack(side=tk.RIGHT)
         
         # Info label
         info_label = tk.Label(self.trend_change_frame, 
@@ -4301,6 +4699,13 @@ class StockerApp:
             self.current_data = stock_data
             # Log the price we received from the backend
             logger.info(f"🔍 PRICE DEBUG: Received price from backend for {symbol}: {stock_data.get('price')}")
+            
+            # Update monitoring button state based on whether stock is monitored
+            if hasattr(self, 'monitor_trend_btn'):
+                if symbol in self.monitored_stocks:
+                    self.root.after(0, lambda: self.monitor_trend_btn.config(text="🔕 Stop Monitoring"))
+                else:
+                    self.root.after(0, lambda: self.monitor_trend_btn.config(text="🔔 Monitor Trend Changes"))
             
             strategy = self.strategy_var.get()
             
@@ -5243,14 +5648,16 @@ class StockerApp:
                 f"New Target: {self.localization.format_currency(target_price)}"
             )
         
-        elif action == "SELL" and current_price_usd <= target_price:
+        elif action == "SELL" and current_price_usd >= target_price:
             # Target already reached - recalculate new target
+            # NOTE: SELL = bullish (expecting price to go UP), so target should be ABOVE entry
+            # If current price >= target, the target was reached (price went up)
             if strategy == "trading":
-                target_price = current_price_usd * 0.97
+                target_price = current_price_usd * 1.03  # 3% above current
             elif strategy == "mixed":
-                target_price = current_price_usd * 0.94
+                target_price = current_price_usd * 1.06  # 6% above current
             else:  # investing
-                target_price = current_price_usd * 0.88
+                target_price = current_price_usd * 1.12  # 12% above current
             
             messagebox.showwarning(
                 self.localization.t('warning'),
@@ -5259,6 +5666,27 @@ class StockerApp:
                 f"Old Target: {self.localization.format_currency(recommendation.get('target_price', 0))}\n"
                 f"New Target: {self.localization.format_currency(target_price)}"
             )
+        
+        # Validate stop loss is correct for the action type
+        if action == "BUY":
+            if stop_loss <= 0 or stop_loss >= entry_price:
+                # Stop loss is invalid for BUY (should be below entry)
+                if strategy == "trading":
+                    stop_loss = entry_price * 0.97  # 3% stop loss
+                elif strategy == "mixed":
+                    stop_loss = entry_price * 0.95  # 5% stop loss
+                else:  # investing
+                    stop_loss = entry_price * 0.80  # 20% stop loss
+        elif action == "SELL":
+            if stop_loss <= 0 or stop_loss >= entry_price:
+                # Stop loss is invalid for SELL (bullish) - should be BELOW entry
+                # NOTE: SELL = bullish (expecting price to go UP), stop loss limits loss if price goes DOWN
+                if strategy == "trading":
+                    stop_loss = entry_price * 0.97  # 3% stop loss below entry
+                elif strategy == "mixed":
+                    stop_loss = entry_price * 0.95  # 5% stop loss below entry
+                else:  # investing
+                    stop_loss = entry_price * 0.80  # 20% stop loss below entry
         
         # Check if HOLD recommendation (needs special handling)
         is_hold_recommendation = (action == 'HOLD')
@@ -7900,7 +8328,8 @@ By using this application, you acknowledge that you understand and accept these 
     def _create_alert_ui(self):
         """Create a new alert"""
         if not HAS_NEW_MODULES or not self.alert_system:
-            messagebox.showwarning("Not Available", "Alert system not available")
+            messagebox.showwarning("Not Available", "Alert system not available. Please ensure alert_system module is installed.")
+            logger.warning("Alert system not available when trying to create alert")
             return
         
         try:
@@ -7909,25 +8338,47 @@ By using this application, you acknowledge that you understand and accept these 
             message = self.alert_message.get().strip()
             priority = self.alert_priority.get()
             
+            # Validate inputs
             if not message:
                 messagebox.showerror("Error", "Please enter an alert message")
                 return
             
-            if alert_type == 'price_alert' and not symbol:
-                messagebox.showerror("Error", "Please enter a symbol for price alert")
-                return
-            
-            # Create alert
-            if alert_type == 'price_alert' and symbol:
+            if alert_type == 'price_alert':
+                if not symbol:
+                    messagebox.showerror("Error", "Please enter a symbol for price alert")
+                    return
+                # For price alerts, try to fetch current price and create price alert
                 try:
                     stock_data = self.data_fetcher.fetch_stock_data(symbol)
+                    if 'error' in stock_data:
+                        raise Exception(stock_data.get('error', 'Failed to fetch stock data'))
                     current_price = stock_data.get('price', 0)
-                    target_price = current_price * 1.05  # 5% above
-                    self.alert_system.create_price_alert(symbol, current_price, target_price, 'above')
-                except:
-                    self.alert_system.add_alert(alert_type, message, priority)
+                    if current_price <= 0:
+                        raise Exception("Invalid stock price")
+                    # Use message as target price if it's a number, otherwise use 5% above
+                    try:
+                        target_price = float(message)
+                        direction = 'above' if target_price > current_price else 'below'
+                    except ValueError:
+                        # Message is not a number, use default 5% above
+                        target_price = current_price * 1.05
+                        direction = 'above'
+                    self.alert_system.create_price_alert(symbol, current_price, target_price, direction)
+                except Exception as e:
+                    logger.error(f"Error creating price alert: {e}")
+                    # Fallback: create regular alert with the message
+                    self.alert_system.add_alert(
+                        alert_type, 
+                        f"{symbol}: {message}", 
+                        priority, 
+                        {'symbol': symbol}
+                    )
             else:
-                self.alert_system.add_alert(alert_type, message, priority, {'symbol': symbol})
+                # For other alert types, use the message as provided
+                alert_data = {}
+                if symbol:
+                    alert_data['symbol'] = symbol
+                self.alert_system.add_alert(alert_type, message, priority, alert_data)
             
             # Clear inputs
             self.alert_symbol.delete(0, tk.END)
@@ -7936,17 +8387,23 @@ By using this application, you acknowledge that you understand and accept these 
             # Refresh display
             self._refresh_alerts()
             messagebox.showinfo("Success", "Alert created successfully!")
+            logger.info(f"Alert created: {alert_type} - {message}")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to create alert: {e}")
+            error_msg = str(e)
+            logger.error(f"Failed to create alert: {error_msg}", exc_info=True)
+            messagebox.showerror("Error", f"Failed to create alert: {error_msg}")
     
     def _refresh_alerts(self):
         """Refresh alerts display"""
         if not HAS_NEW_MODULES or not self.alert_system:
             return
         
-        # Clear existing alerts
+        # Clear existing alerts (but keep the Create Alert card)
         for widget in self.alerts_list_frame.winfo_children():
             if isinstance(widget, ModernCard):
+                # Don't destroy the Create Alert card
+                if hasattr(self, 'create_alert_card') and widget == self.create_alert_card:
+                    continue
                 widget.destroy()
         
         # Get alerts
