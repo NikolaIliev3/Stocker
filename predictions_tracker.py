@@ -304,7 +304,7 @@ class PredictionsTracker:
         return False
     
     def get_statistics(self) -> Dict:
-        """Get prediction statistics"""
+        """Get prediction statistics with enhanced tracking"""
         total = len(self.predictions)
         active = len(self.get_active_predictions())
         verified = len(self.get_verified_predictions())
@@ -315,12 +315,49 @@ class PredictionsTracker:
         
         accuracy = (correct / verified * 100) if verified > 0 else 0
         
+        # Calculate accuracy by strategy
+        strategy_stats = {}
+        for strategy in ['trading', 'mixed', 'investing']:
+            strategy_preds = [p for p in verified_preds if p.get('strategy') == strategy]
+            if strategy_preds:
+                strategy_correct = sum(1 for p in strategy_preds if p.get('was_correct') == True)
+                strategy_accuracy = (strategy_correct / len(strategy_preds) * 100) if strategy_preds else 0
+                strategy_stats[strategy] = {
+                    'total': len(strategy_preds),
+                    'correct': strategy_correct,
+                    'accuracy': strategy_accuracy
+                }
+        
+        # Calculate accuracy over time (last 30 days)
+        from datetime import datetime, timedelta
+        thirty_days_ago = datetime.now() - timedelta(days=30)
+        recent_preds = [
+            p for p in verified_preds 
+            if datetime.fromisoformat(p.get('verification_date', '2000-01-01')) >= thirty_days_ago
+        ]
+        recent_accuracy = 0
+        if recent_preds:
+            recent_correct = sum(1 for p in recent_preds if p.get('was_correct') == True)
+            recent_accuracy = (recent_correct / len(recent_preds) * 100) if recent_preds else 0
+        
+        # Calculate average days to target for correct predictions
+        correct_preds = [p for p in verified_preds if p.get('was_correct') == True]
+        avg_days_to_target = 0
+        if correct_preds:
+            days_list = [p.get('days_to_target', 0) for p in correct_preds if p.get('days_to_target') is not None]
+            if days_list:
+                avg_days_to_target = sum(days_list) / len(days_list)
+        
         return {
             "total_predictions": total,
             "active": active,
             "verified": verified,
             "correct": correct,
             "incorrect": incorrect,
-            "accuracy": accuracy
+            "accuracy": accuracy,
+            "recent_accuracy": recent_accuracy,  # Last 30 days
+            "strategy_stats": strategy_stats,
+            "avg_days_to_target": avg_days_to_target,
+            "recent_verified_count": len(recent_preds)
         }
 

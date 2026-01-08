@@ -132,6 +132,12 @@ class HybridStockPredictor:
         ml_prediction = None
         ml_available = self.ml_predictor.is_trained()
         
+        # Diagnostic: Log ML model status
+        if not ml_available:
+            logger.debug(f"ML model not available for {self.strategy} strategy")
+        else:
+            logger.debug(f"ML model available for {self.strategy} strategy")
+        
         if ml_available:
             try:
                 indicators = base_analysis.get('indicators', {})
@@ -151,6 +157,11 @@ class HybridStockPredictor:
                     logger.debug(f"ML prediction unavailable: {ml_prediction.get('error')}. Using rule-based only.")
                     ml_available = False
                     ml_prediction = None
+                else:
+                    # Diagnostic logging for backtesting
+                    if ml_prediction:
+                        logger.debug(f"ML prediction: action={ml_prediction.get('action')}, confidence={ml_prediction.get('confidence', 0):.1f}%, "
+                                   f"probabilities={ml_prediction.get('probabilities', {})}")
             except Exception as e:
                 logger.debug(f"ML prediction failed: {e}. Using rule-based only.")
                 ml_available = False
@@ -168,6 +179,13 @@ class HybridStockPredictor:
         final_prediction = self._ensemble_predictions(
             rule_prediction, ml_prediction, ensemble_weights, base_analysis
         )
+        
+        # Diagnostic logging for backtesting
+        if ml_available and ml_prediction:
+            logger.debug(f"Hybrid prediction: rule={rule_prediction.get('action')} ({rule_prediction.get('confidence', 0):.1f}%), "
+                        f"ml={ml_prediction.get('action')} ({ml_prediction.get('confidence', 0):.1f}%), "
+                        f"final={final_prediction.get('recommendation', {}).get('action')} "
+                        f"(weights: rule={ensemble_weights.get('rule', 0):.2f}, ml={ensemble_weights.get('ml', 0):.2f})")
         
         return final_prediction
     
@@ -189,21 +207,36 @@ class HybridStockPredictor:
         rule_weight = 0.5
         ml_weight = 0.5
         
-        # Adjust based on historical performance
-        rule_perf = self._get_recent_performance('weight_based')
-        ml_perf = self._get_recent_performance('ml_based')
-        
-        if rule_perf and ml_perf:
-            rule_acc = rule_perf.get('accuracy', 50)
-            ml_acc = ml_perf.get('accuracy', 50)
-            
-            if abs(rule_acc - ml_acc) > 10:
-                if rule_acc > ml_acc:
-                    rule_weight = 0.7
-                    ml_weight = 0.3
-                else:
-                    rule_weight = 0.3
+        # Check if ML model has high training accuracy (from metadata)
+        ml_high_accuracy = False
+        try:
+            if self.ml_predictor and self.ml_predictor.metadata:
+                ml_test_acc = self.ml_predictor.metadata.get('test_accuracy', 0)
+                if ml_test_acc >= 0.60:  # 60%+ validation accuracy
+                    ml_high_accuracy = True
+                    # Favor ML more when it has high accuracy
                     ml_weight = 0.7
+                    rule_weight = 0.3
+                    logger.debug(f"ML model has high accuracy ({ml_test_acc*100:.1f}%) - favoring ML in ensemble")
+        except:
+            pass
+        
+        # Adjust based on historical performance (only if ML doesn't have high accuracy)
+        if not ml_high_accuracy:
+            rule_perf = self._get_recent_performance('weight_based')
+            ml_perf = self._get_recent_performance('ml_based')
+            
+            if rule_perf and ml_perf:
+                rule_acc = rule_perf.get('accuracy', 50)
+                ml_acc = ml_perf.get('accuracy', 50)
+                
+                if abs(rule_acc - ml_acc) > 10:
+                    if rule_acc > ml_acc:
+                        rule_weight = 0.7
+                        ml_weight = 0.3
+                    else:
+                        rule_weight = 0.3
+                        ml_weight = 0.7
         
         # Adjust based on confidence
         rule_confidence = rule_pred.get('confidence', 50)

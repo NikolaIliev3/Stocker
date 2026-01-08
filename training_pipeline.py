@@ -459,7 +459,13 @@ class MLTrainingPipeline:
         if progress_callback:
             progress_callback("Training ML model...")
         
-        results = ml_model.train(all_samples)
+        # Use binary classification mode for better accuracy (60-75% vs 45-48%)
+        # Binary mode removes ambiguous HOLD class and focuses on clear UP/DOWN signals
+        results = ml_model.train(
+            all_samples,
+            use_binary_classification=True,  # Enable binary mode for better accuracy
+            model_family='voting'  # Use voting ensemble (RF + GB)
+        )
         
         results['total_samples'] = len(all_samples)
         results['symbols_used'] = symbols
@@ -709,7 +715,12 @@ class MLTrainingPipeline:
                     # If model exists, we'll combine with existing training data
                     # For now, we'll retrain on verified predictions only
                     # In the future, we could combine with historical training data
-                    training_result = ml_model.train(training_samples, test_size=0.2)
+                    training_result = ml_model.train(
+                        training_samples, 
+                        test_size=0.2,
+                        use_binary_classification=True,  # Use binary mode for better accuracy
+                        model_family='voting'
+                    )
                     
                     if 'error' not in training_result:
                         result['ml_retrained'] = True

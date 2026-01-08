@@ -15,6 +15,7 @@ import threading
 
 from data_fetcher import StockDataFetcher
 from hybrid_predictor import HybridStockPredictor
+from config import BACKTEST_TESTS_PER_RUN
 
 # Import walk-forward backtester if available
 try:
@@ -41,7 +42,7 @@ class ContinuousBacktester:
         
         # Configuration
         self.test_interval_hours = 24  # Run backtests daily
-        self.tests_per_run = 10  # Test 10 random points per run
+        self.tests_per_run = BACKTEST_TESTS_PER_RUN  # Configurable in config.py
         self.min_history_days = 100  # Need at least 100 days of history
         self.lookforward_days = {
             'trading': 10,
@@ -521,6 +522,18 @@ class ContinuousBacktester:
             predicted_action = recommendation.get('action', 'HOLD')
             predicted_target = recommendation.get('target_price', test_price)
             
+            # Diagnostic logging for backtesting
+            method = analysis.get('method', 'unknown')
+            ml_pred = analysis.get('ml_prediction', {})
+            rule_pred = analysis.get('rule_prediction', {})
+            ensemble_weights = analysis.get('ensemble_weights', {})
+            
+            logger.debug(f"Backtest prediction ({symbol} @ {test_date.date()}): "
+                        f"action={predicted_action}, method={method}, "
+                        f"ml={ml_pred.get('action', 'N/A')} ({ml_pred.get('confidence', 0):.1f}%), "
+                        f"rule={rule_pred.get('action', 'N/A')} ({rule_pred.get('confidence', 0):.1f}%), "
+                        f"weights=ML:{ensemble_weights.get('ml', 0):.2f}/Rule:{ensemble_weights.get('rule', 0):.2f}")
+            
             # Determine if prediction was correct
             # NOTE: Algorithm uses INVERTED logic:
             # - BUY = bearish signals (expecting price to go DOWN, then buy at discount)
@@ -529,6 +542,10 @@ class ContinuousBacktester:
             if predicted_action == 'BUY':
                 # BUY (bearish signals) is correct if price went DOWN (so you can buy at discount)
                 was_correct = actual_change_pct < 0
+                # Detailed logging for BUY predictions
+                logger.debug(f"BUY prediction evaluation: price_change={actual_change_pct:.2f}%, "
+                           f"correct={was_correct}, ml_action={ml_pred.get('action', 'N/A')}, "
+                           f"rule_action={rule_pred.get('action', 'N/A')}")
             elif predicted_action == 'SELL':
                 # SELL (bullish signals) is correct if price went UP (so you can sell at profit)
                 was_correct = actual_change_pct > 0

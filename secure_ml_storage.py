@@ -7,7 +7,7 @@ import json
 import pickle
 import hashlib
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional, Any, Union
 import logging
 
 logger = logging.getLogger(__name__)
@@ -135,9 +135,15 @@ class SecureMLStorage:
         except Exception as e:
             raise SecurityError(f"Could not import {module}.{name}: {e}")
     
-    def save_model(self, model: Any, filename: str):
+    def save_model(self, model: Any, filename: Union[str, Path]):
         """Save ML model securely with integrity check"""
-        filepath = self.data_dir / filename
+        filename_str = str(filename)
+        # If a full path was passed, only keep the basename for checksum keys
+        # and write the file at the requested path inside data_dir.
+        filepath = filename if isinstance(filename, Path) else (self.data_dir / filename_str)
+        if isinstance(filepath, Path) and not filepath.is_absolute():
+            filepath = self.data_dir / filepath
+        key = filepath.name if isinstance(filepath, Path) else filename_str
         
         try:
             # Save model
@@ -149,30 +155,34 @@ class SecureMLStorage:
             
             # Calculate and save checksum
             checksum = self._calculate_checksum(filepath)
-            self.checksums[filename] = checksum
+            self.checksums[str(key)] = checksum
             self._save_checksums()
             
-            logger.info(f"Saved model {filename} with integrity check")
+            logger.info(f"Saved model {key} with integrity check")
         except Exception as e:
-            logger.error(f"Error saving model {filename}: {e}")
+            logger.error(f"Error saving model {filename_str}: {e}")
             raise
     
-    def load_model(self, filename: str) -> Optional[Any]:
+    def load_model(self, filename: Union[str, Path]) -> Optional[Any]:
         """Load ML model with integrity verification"""
-        filepath = self.data_dir / filename
+        filename_str = str(filename)
+        filepath = filename if isinstance(filename, Path) else (self.data_dir / filename_str)
+        if isinstance(filepath, Path) and not filepath.is_absolute():
+            filepath = self.data_dir / filepath
+        key = filepath.name if isinstance(filepath, Path) else filename_str
         
         if not filepath.exists():
-            logger.warning(f"Model file not found: {filename}")
+            logger.warning(f"Model file not found: {key}")
             return None
         
         try:
             # Verify checksum if available
-            expected_checksum = self.checksums.get(filename)
+            expected_checksum = self.checksums.get(str(key))
             if expected_checksum:
                 current_checksum = self._calculate_checksum(filepath)
                 if current_checksum != expected_checksum:
                     raise SecurityError(
-                        f"Model {filename} integrity check failed! "
+                        f"Model {key} integrity check failed! "
                         f"File may have been tampered with."
                     )
             
@@ -190,22 +200,30 @@ class SecureMLStorage:
                 unpickler = RestrictedUnpickler(f, self)
                 model = unpickler.load()
             
-            logger.info(f"Loaded model {filename} successfully")
+            logger.info(f"Loaded model {key} successfully")
             return model
             
         except SecurityError:
             raise
         except Exception as e:
-            logger.error(f"Error loading model {filename}: {e}")
+            logger.error(f"Error loading model {filename_str}: {e}")
             return None
     
-    def model_exists(self, filename: str) -> bool:
+    def model_exists(self, filename: Union[str, Path]) -> bool:
         """Check if model file exists"""
-        return (self.data_dir / filename).exists()
+        filename_str = str(filename)
+        filepath = filename if isinstance(filename, Path) else (self.data_dir / filename_str)
+        if isinstance(filepath, Path) and not filepath.is_absolute():
+            filepath = self.data_dir / filepath
+        return filepath.exists()
     
-    def get_model_info(self, filename: str) -> dict:
+    def get_model_info(self, filename: Union[str, Path]) -> dict:
         """Get information about a model"""
-        filepath = self.data_dir / filename
+        filename_str = str(filename)
+        filepath = filename if isinstance(filename, Path) else (self.data_dir / filename_str)
+        if isinstance(filepath, Path) and not filepath.is_absolute():
+            filepath = self.data_dir / filepath
+        key = filepath.name if isinstance(filepath, Path) else filename_str
         if not filepath.exists():
             return {}
         
@@ -215,7 +233,7 @@ class SecureMLStorage:
                 'exists': True,
                 'size': stat.st_size,
                 'modified': stat.st_mtime,
-                'has_checksum': filename in self.checksums
+                'has_checksum': str(key) in self.checksums
             }
         except Exception as e:
             logger.error(f"Error getting model info: {e}")

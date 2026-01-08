@@ -156,7 +156,8 @@ class WalkForwardBacktester:
                         'action': prediction.get('action', 'HOLD'),
                         'confidence': prediction.get('confidence', 0),
                         'lookforward_days': lookforward_days,
-                        'entry_price': current_price
+                        'entry_price': current_price,
+                        'strategy': strategy  # Include strategy for correct evaluation
                     })
             except Exception as e:
                 logger.debug(f"Error generating prediction for {test_date}: {e}")
@@ -239,22 +240,38 @@ class WalkForwardBacktester:
                 
                 # Check if prediction was correct
                 action = pred.get('action', 'HOLD')
-                price_change = (future_price - entry_price) / entry_price
+                price_change_pct = ((future_price - entry_price) / entry_price) * 100  # Convert to percentage
                 
+                # NOTE: Algorithm uses INVERTED logic:
+                # - BUY = bearish signals (expecting price to go DOWN, then buy at discount)
+                # - SELL = bullish signals (expecting price to go UP, then sell to take profits)
                 is_correct = False
-                if action == 'BUY' and price_change > 0.02:  # 2% threshold
-                    is_correct = True
-                elif action == 'SELL' and price_change < -0.02:
-                    is_correct = True
-                elif action == 'HOLD' and -0.02 <= price_change <= 0.02:
-                    is_correct = True
+                if action == 'BUY':
+                    # BUY (bearish signals) is correct if price went DOWN (so you can buy at discount)
+                    is_correct = price_change_pct < 0
+                elif action == 'SELL':
+                    # SELL (bullish signals) is correct if price went UP (so you can sell at profit)
+                    is_correct = price_change_pct > 0
+                elif action == 'HOLD':
+                    # HOLD is correct if price didn't move much (strategy-specific thresholds)
+                    # Get strategy from prediction or use default
+                    strategy = pred.get('strategy', 'trading')
+                    if strategy == "trading":
+                        is_correct = abs(price_change_pct) < 3
+                    elif strategy == "mixed":
+                        is_correct = abs(price_change_pct) < 5
+                    else:  # investing
+                        # For investing (1.5 year lookforward), allow up to 20% movement for HOLD
+                        is_correct = abs(price_change_pct) < 20
+                else:
+                    is_correct = False  # Unknown action
                 
                 if is_correct:
                     correct += 1
                 else:
                     incorrect += 1
                 
-                total_return += price_change
+                total_return += price_change_pct / 100  # Convert percentage back to decimal for return calculation
                 valid_predictions += 1
             except Exception as e:
                 logger.debug(f"Error testing prediction: {e}")

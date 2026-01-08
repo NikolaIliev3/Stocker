@@ -2254,22 +2254,47 @@ class StockerApp:
         stats_grid = tk.Frame(stats_inner, bg=theme['card_bg'])
         stats_grid.pack(fill=tk.X)
         
+        # Enhanced stats display with more metrics
         stat_items = [
             (self.localization.t('total'), stats['total_predictions'], theme['fg']),
             (self.localization.t('active'), stats['active'], theme['accent']),
             (self.localization.t('verified'), stats['verified'], theme['success']),
             (self.localization.t('accuracy'), f"{stats['accuracy']:.1f}%" if stats['verified'] > 0 else "N/A", 
-             theme['accent'] if stats['verified'] > 0 else theme['text_secondary'])
+             theme['accent'] if stats['verified'] > 0 else theme['text_secondary']),
         ]
+        
+        # Add recent accuracy if available
+        if stats.get('recent_verified_count', 0) > 0:
+            stat_items.append(
+                ('30d Accuracy', f"{stats['recent_accuracy']:.1f}%", 
+                 theme['success'] if stats['recent_accuracy'] >= stats.get('accuracy', 0) else theme['warning'])
+            )
         
         for i, (label, value, color) in enumerate(stat_items):
             stat_frame = tk.Frame(stats_grid, bg=theme['card_bg'])
-            stat_frame.grid(row=0, column=i, padx=20, pady=10, sticky=tk.W+tk.E)
+            stat_frame.grid(row=0, column=i, padx=15, pady=10, sticky=tk.W+tk.E)
             
             tk.Label(stat_frame, text=label, bg=theme['card_bg'], 
                     fg=theme['text_secondary'], font=('Segoe UI', 9)).pack()
             tk.Label(stat_frame, text=str(value), bg=theme['card_bg'], 
                     fg=color, font=('Segoe UI', 16, 'bold')).pack()
+        
+        # Add strategy breakdown if available
+        if stats.get('strategy_stats'):
+            strategy_frame = tk.Frame(header_card.content_frame, bg=theme['card_bg'])
+            strategy_frame.pack(fill=tk.X, pady=(10, 0))
+            
+            tk.Label(strategy_frame, text="Strategy Breakdown:", bg=theme['card_bg'],
+                    fg=theme['text_secondary'], font=('Segoe UI', 9, 'bold')).pack(anchor=tk.W)
+            
+            strategy_inner = tk.Frame(strategy_frame, bg=theme['card_bg'])
+            strategy_inner.pack(fill=tk.X, pady=(5, 0))
+            
+            for strategy, s_stats in stats['strategy_stats'].items():
+                strategy_label = tk.Label(strategy_inner, 
+                    text=f"{strategy.title()}: {s_stats['accuracy']:.1f}% ({s_stats['correct']}/{s_stats['total']})",
+                    bg=theme['card_bg'], fg=theme['text_secondary'], font=('Segoe UI', 8))
+                strategy_label.pack(side=tk.LEFT, padx=10)
         
         ModernButton(header_card.content_frame, self.localization.t('refresh_stats'), 
                     command=self._refresh_predictions, theme=theme).pack(pady=(15, 0))
@@ -6922,19 +6947,29 @@ By using this application, you acknowledge that you understand and accept these 
             return
         
         # Show strategy selection dialog
-        selected_strategies = self._show_backtest_strategy_selection()
-        if not selected_strategies:
+        result = self._show_backtest_strategy_selection()
+        if not result:
             return  # User cancelled
+        
+        selected_strategies, test_count = result
+        
+        # Temporarily update backtester config
+        original_tests = self.backtester.tests_per_run
+        self.backtester.tests_per_run = test_count
         
         # Run in background
         def run():
             success = self.backtester.run_test_now(selected_strategies=selected_strategies)
+            # Restore original setting
+            self.backtester.tests_per_run = original_tests
+            
             if success:
                 strategies_str = ", ".join([s.capitalize() for s in selected_strategies])
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Backtest Started",
                     f"🧪 Backtest started!\n\n"
-                    f"Testing strategies: {strategies_str}\n\n"
+                    f"Testing strategies: {strategies_str}\n"
+                    f"Test points per strategy: {test_count}\n\n"
                     "The algorithm will test itself on random historical points.\n"
                     "Results will be available in 'View Backtest Results'."
                 ))
@@ -6951,7 +6986,7 @@ By using this application, you acknowledge that you understand and accept these 
         """Show dialog to select strategies for backtesting"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Select Strategies for Backtesting")
-        dialog.geometry("400x250")
+        dialog.geometry("450x450")
         dialog.transient(self.root)
         dialog.grab_set()  # Make dialog modal
         dialog.protocol("WM_DELETE_WINDOW", lambda: dialog.destroy())
@@ -6962,7 +6997,7 @@ By using this application, you acknowledge that you understand and accept these 
         # Header
         header = tk.Label(
             dialog,
-            text="Select Strategies to Test",
+            text="🧪 Configure Backtest",
             bg=theme['bg'],
             fg=theme['accent'],
             font=('Segoe UI', 14, 'bold')
@@ -6973,10 +7008,18 @@ By using this application, you acknowledge that you understand and accept these 
         strategy_frame = tk.Frame(dialog, bg=theme['bg'])
         strategy_frame.pack(pady=10, padx=20)
         
+        tk.Label(
+            strategy_frame,
+            text="Select strategies to test:",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10, 'bold')
+        ).pack(anchor=tk.W, pady=(0, 10))
+        
         # Load saved preferences
         saved_strategies = self.preferences.get_backtest_strategies()
         if not saved_strategies:
-            saved_strategies = ['trading', 'mixed', 'investing']  # Default: all
+            saved_strategies = ['trading']  # Default: trading only
         
         strategy_vars = {}
         strategies = [
@@ -7002,19 +7045,104 @@ By using this application, you acknowledge that you understand and accept these 
             )
             checkbox.pack(anchor=tk.W, pady=5)
         
+        # Test points configuration
+        config_frame = tk.Frame(dialog, bg=theme['bg'])
+        config_frame.pack(pady=15, padx=20, fill=tk.X)
+        
+        tk.Label(
+            config_frame,
+            text="Number of test points per strategy:",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10, 'bold')
+        ).pack(anchor='w', pady=(10, 5))
+        
+        from config import BACKTEST_TESTS_PER_RUN
+        tests_var = tk.IntVar(value=BACKTEST_TESTS_PER_RUN)
+        
+        tests_frame = tk.Frame(config_frame, bg=theme['bg'])
+        tests_frame.pack(anchor='w', pady=5)
+        
+        tests_entry = tk.Entry(
+            tests_frame,
+            textvariable=tests_var,
+            bg=theme['entry_bg'],
+            fg=theme['entry_fg'],
+            font=('Segoe UI', 11),
+            width=10
+        )
+        tests_entry.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Add quick preset buttons
+        preset_frame = tk.Frame(config_frame, bg=theme['bg'])
+        preset_frame.pack(anchor='w', pady=8)
+        
+        tk.Label(
+            preset_frame,
+            text="Quick presets: ",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 9)
+        ).pack(side=tk.LEFT)
+        
+        for preset_name, preset_value in [("Quick (30)", 30), ("Standard (100)", 100), ("Thorough (200)", 200)]:
+            btn = tk.Button(
+                preset_frame,
+                text=preset_name,
+                command=lambda v=preset_value: tests_var.set(v),
+                bg=theme['accent'],
+                fg='white',
+                font=('Segoe UI', 9),
+                relief=tk.FLAT,
+                cursor='hand2',
+                padx=8,
+                pady=4
+            )
+            btn.pack(side=tk.LEFT, padx=3)
+        
+        # Info label
+        info_label = tk.Label(
+            config_frame,
+            text="💡 Recommendation:\n"
+                 "• Quick (30): ~2-5 min - for fast checks\n"
+                 "• Standard (100): ~10-15 min - good balance (RECOMMENDED)\n"
+                 "• Thorough (200): ~20-30 min - high confidence",
+            bg=theme['bg'],
+            fg=theme['fg_secondary'],
+            font=('Segoe UI', 8),
+            justify=tk.LEFT
+        )
+        info_label.pack(anchor='w', pady=(8, 0))
+        
         # Buttons
         btn_frame = tk.Frame(dialog, bg=theme['bg'])
         btn_frame.pack(pady=20)
         
         selected_strategies = []
+        selected_tests = [BACKTEST_TESTS_PER_RUN]  # Use list to capture value
         
         def on_ok():
             nonlocal selected_strategies
-            selected_strategies = [key for key, var in strategy_vars.items() if var.get()]
-            if not selected_strategies:
+            strategies = [key for key, var in strategy_vars.items() if var.get()]
+            if not strategies:
                 messagebox.showwarning("No Selection", "Please select at least one strategy.")
                 return
             
+            # Validate test count
+            try:
+                test_count = tests_var.get()
+                if test_count < 10:
+                    messagebox.showwarning("Invalid Input", "Please enter at least 10 tests.")
+                    return
+                if test_count > 1000:
+                    messagebox.showwarning("Invalid Input", "Maximum 1000 tests per strategy.")
+                    return
+                selected_tests[0] = test_count
+            except:
+                messagebox.showwarning("Invalid Input", "Please enter a valid number.")
+                return
+            
+            selected_strategies = strategies
             # Save preferences
             self.preferences.set_backtest_strategies(selected_strategies)
             dialog.destroy()
@@ -7022,13 +7150,13 @@ By using this application, you acknowledge that you understand and accept these 
         def on_cancel():
             dialog.destroy()
         
-        ModernButton(btn_frame, "OK", command=on_ok, theme=theme).pack(side=tk.LEFT, padx=5)
+        ModernButton(btn_frame, "Start Backtest", command=on_ok, theme=theme).pack(side=tk.LEFT, padx=5)
         ModernButton(btn_frame, "Cancel", command=on_cancel, theme=theme).pack(side=tk.LEFT, padx=5)
         
         # Wait for dialog to close
         dialog.wait_window()
         
-        return selected_strategies if selected_strategies else None
+        return (selected_strategies, selected_tests[0]) if selected_strategies else None
     
     def _show_backtest_results(self):
         """Show backtest results dialog"""

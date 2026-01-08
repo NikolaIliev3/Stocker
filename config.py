@@ -76,5 +76,23 @@ SEEKER_AI_AUDIT_LOGGING = True
 
 # API Key Storage
 API_KEYS_ENCRYPTED = True
-API_KEYS_FILE_PERMISSIONS = 0o600  # Read/write owner only  # Default starting balance
+API_KEYS_FILE_PERMISSIONS = 0o600  # Read/write owner only
 
+# CPU/Performance Configuration
+# Set to -1 to use all available CPU cores, or specify a number (e.g., 4 for 4 cores)
+# For intensive tasks (ML training, backtesting), using all cores significantly speeds up processing
+ML_TRAINING_CPU_CORES = -1  # Use all cores for ML training (-1 = all, or specify number)
+BACKTESTING_CPU_CORES = -1  # Use all cores for backtesting (-1 = all, or specify number)
+HYPERPARAMETER_TUNING_PARALLEL_TRIALS = None  # None = auto (uses all cores), or specify number
+# Note: Setting to -1 uses all available CPU cores, which maximizes speed but uses more resources
+# If you want to leave some cores free for other tasks, set to a lower number (e.g., 4 or 6)
+
+# Backtesting Configuration
+# Number of historical test points to evaluate per strategy during each backtest run
+# RECOMMENDATIONS:
+#   - Quick test (5-10 min):  20-30 tests per strategy
+#   - Standard test (10-20 min): 50-100 tests per strategy
+#   - Thorough test (30-60 min): 150-200 tests per strategy
+#   - Deep analysis (1-2 hours): 300-500 tests per strategy
+# Higher numbers = more accurate accuracy measurement, but takes longer
+BACKTEST_TESTS_PER_RUN = 100  # Default: 100 tests per strategy (recommended for good accuracy)
