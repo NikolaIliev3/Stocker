@@ -132,11 +132,24 @@ class HybridStockPredictor:
         ml_prediction = None
         ml_available = self.ml_predictor.is_trained()
         
-        # Diagnostic: Log ML model status
+        # Diagnostic: Log ML model status (use INFO level for visibility)
         if not ml_available:
-            logger.debug(f"ML model not available for {self.strategy} strategy")
+            logger.warning(f"⚠️ ML model not available for {self.strategy} strategy")
+            # Try to diagnose why
+            if hasattr(self.ml_predictor, 'model'):
+                logger.warning(f"   - Main model is None: {self.ml_predictor.model is None}")
+            if hasattr(self.ml_predictor, 'regime_models'):
+                logger.warning(f"   - Regime models count: {len(self.ml_predictor.regime_models)}")
+                if self.ml_predictor.regime_models:
+                    for regime, regime_ml in self.ml_predictor.regime_models.items():
+                        logger.warning(f"     - {regime}: model={regime_ml.model is not None if hasattr(regime_ml, 'model') else 'N/A'}")
+            if hasattr(self.ml_predictor, 'label_encoder'):
+                has_classes = hasattr(self.ml_predictor.label_encoder, 'classes_')
+                logger.warning(f"   - Label encoder has classes: {has_classes}")
+                if has_classes:
+                    logger.warning(f"     - Classes: {list(self.ml_predictor.label_encoder.classes_)}")
         else:
-            logger.debug(f"ML model available for {self.strategy} strategy")
+            logger.info(f"✓ ML model available for {self.strategy} strategy")
         
         if ml_available:
             try:
@@ -151,19 +164,22 @@ class HybridStockPredictor:
                     stock_data, history_data, financials_data, indicators,
                     market_regime, timeframe_analysis, relative_strength, support_resistance
                 )
-                ml_prediction = self.ml_predictor.predict(features)
+                # Pass stock_data and history_data for regime-specific model detection
+                ml_prediction = self.ml_predictor.predict(features, stock_data, history_data)
                 # Check if prediction has an error (e.g., LabelEncoder not fitted)
                 if ml_prediction and 'error' in ml_prediction:
-                    logger.debug(f"ML prediction unavailable: {ml_prediction.get('error')}. Using rule-based only.")
+                    logger.warning(f"⚠️ ML prediction unavailable: {ml_prediction.get('error')}. Using rule-based only.")
                     ml_available = False
                     ml_prediction = None
                 else:
-                    # Diagnostic logging for backtesting
+                    # Diagnostic logging for backtesting (use INFO for visibility)
                     if ml_prediction:
-                        logger.debug(f"ML prediction: action={ml_prediction.get('action')}, confidence={ml_prediction.get('confidence', 0):.1f}%, "
+                        logger.info(f"✓ ML prediction: action={ml_prediction.get('action')}, confidence={ml_prediction.get('confidence', 0):.1f}%, "
                                    f"probabilities={ml_prediction.get('probabilities', {})}")
             except Exception as e:
-                logger.debug(f"ML prediction failed: {e}. Using rule-based only.")
+                logger.error(f"❌ ML prediction failed: {e}. Using rule-based only.")
+                import traceback
+                logger.error(traceback.format_exc())
                 ml_available = False
                 ml_prediction = None
         

@@ -141,8 +141,8 @@ class ModelTester:
                         logger.warning(f"Error extracting features for {symbol} at {current_date}: {e}")
                         continue
                     
-                    # Get model prediction
-                    ml_prediction = ml_model.predict(features)
+                    # Get model prediction (pass stock_data and history_data for regime detection)
+                    ml_prediction = ml_model.predict(features, stock_data, history_data)
                     predicted_action = ml_prediction.get('action', 'HOLD')
                     predicted_confidence = ml_prediction.get('confidence', 50)
                     

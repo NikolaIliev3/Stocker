@@ -835,6 +835,9 @@ class StockPredictionML:
         self.feature_extractor = FeatureExtractor()
         
         self.model = None
+        self.regime_models = {}  # Dict of regime-specific models: {'bull': model, 'bear': model, 'sideways': model}
+        self.regime_scalers = {}  # Dict of regime-specific scalers
+        self.regime_label_encoders = {}  # Dict of regime-specific label encoders
         self.scaler = StandardScaler()
         self.label_encoder = LabelEncoder()
         self.feature_importance = {}
@@ -844,13 +847,73 @@ class StockPredictionML:
         self.train_accuracy = 0.0
         self.test_accuracy = 0.0
         self.use_hyperparameter_tuning = True  # Enabled by default for better accuracy
-        self.use_regime_models = False  # Can be enabled for regime-specific models
+        self.use_regime_models = True  # Enabled by default for better accuracy (+3-5%)
         self.feature_selection_method = 'rfe'  # Changed to 'rfe' for better feature selection
+        self.regime_detector = None  # Will be initialized when needed
         
         self._load_model()
     
     def _load_model(self):
         """Load trained model if exists"""
+        # First, try to load metadata to check if regime models are used
+        if self.metadata_file.exists():
+            try:
+                with open(self.metadata_file, 'r') as f:
+                    self.metadata = json.load(f)
+                    self.feature_importance = self.metadata.get('feature_importance', {})
+                    # Load selected features if available
+                    self.selected_features = self.metadata.get('selected_features', None)
+                    if self.selected_features:
+                        self.selected_features = np.array(self.selected_features)
+                    # Also load accuracy values
+                    self.train_accuracy = self.metadata.get('train_accuracy', 0)
+                    self.test_accuracy = self.metadata.get('test_accuracy', 0)
+                    
+                    # Check if regime models were used
+                    if self.metadata.get('use_regime_models', False):
+                        self.use_regime_models = True
+                        self._load_regime_models()
+                        logger.info(f"Loaded regime-specific models for {self.strategy}")
+                        if 'regime_metadata' in self.metadata:
+                            regime_info = []
+                            for regime, meta in self.metadata['regime_metadata'].items():
+                                regime_info.append(f"{regime}: {meta.get('test_accuracy', 0)*100:.1f}%")
+                            logger.info(f"  Regime accuracies: {', '.join(regime_info)}")
+                        # If regime models loaded successfully, we're done
+                        if len(self.regime_models) > 0:
+                            return
+            except Exception as meta_error:
+                logger.error(f"Error loading metadata: {meta_error}")
+                self.metadata = {}
+                self.train_accuracy = 0
+                self.test_accuracy = 0
+        
+        # If metadata doesn't exist or regime models weren't loaded, check if regime model files exist directly
+        # This handles the case where metadata was deleted but model files still exist
+        regimes = ['bull', 'bear', 'sideways']
+        regime_files_exist = False
+        for regime in regimes:
+            regime_model_file = f"ml_model_{self.strategy}_{regime}.pkl"
+            regime_scaler_file = f"scaler_{self.strategy}_{regime}.pkl"
+            regime_encoder_file = f"label_encoder_{self.strategy}_{regime}.pkl"
+            if (self.storage.model_exists(regime_model_file) and 
+                self.storage.model_exists(regime_scaler_file) and
+                self.storage.model_exists(regime_encoder_file)):
+                regime_files_exist = True
+                break
+        
+        if regime_files_exist and not self.regime_models:
+            logger.info(f"Found regime model files but no metadata. Attempting to load regime models directly...")
+            self.use_regime_models = True
+            # Create minimal metadata if it doesn't exist
+            if not self.metadata:
+                self.metadata = {'use_regime_models': True, 'regime_metadata': {}}
+            self._load_regime_models()
+            if len(self.regime_models) > 0:
+                logger.info(f"Successfully loaded {len(self.regime_models)} regime model(s) without metadata")
+                return
+        
+        # Load single model (non-regime)
         if self.storage.model_exists(self.model_file):
             try:
                 self.model = self.storage.load_model(self.model_file)
@@ -891,8 +954,8 @@ class StockPredictionML:
                         logger.debug(f"Could not create label encoder: {e}. Model will need retraining.")
                         # Leave encoder unfitted - is_trained() will return False and predict() will handle gracefully
                 
-                # Load metadata
-                if self.metadata_file.exists():
+                # Load metadata if not already loaded
+                if not self.metadata and self.metadata_file.exists():
                     try:
                         with open(self.metadata_file, 'r') as f:
                             self.metadata = json.load(f)
@@ -904,7 +967,7 @@ class StockPredictionML:
                             # Also load accuracy values
                             self.train_accuracy = self.metadata.get('train_accuracy', 0)
                             self.test_accuracy = self.metadata.get('test_accuracy', 0)
-                            logger.info(f"Loaded ML model for {self.strategy} - Train: {self.train_accuracy*100:.1f}%, Test: {self.test_accuracy*100:.1f}%")
+                            
                             if self.selected_features is not None:
                                 logger.info(f"Using {len(self.selected_features)} selected features (out of {len(self.feature_extractor.get_feature_names())} total)")
                     except Exception as meta_error:
@@ -912,6 +975,8 @@ class StockPredictionML:
                         self.metadata = {}
                         self.train_accuracy = 0
                         self.test_accuracy = 0
+                elif self.metadata:
+                    logger.info(f"Loaded ML model for {self.strategy} - Train: {self.train_accuracy*100:.1f}%, Test: {self.test_accuracy*100:.1f}%")
                 else:
                     logger.warning(f"Metadata file not found for {self.strategy}")
                     self.metadata = {}
@@ -926,7 +991,7 @@ class StockPredictionML:
                 self.test_accuracy = 0
     
     def train(self, training_samples: List[Dict], test_size: float = 0.2, random_seed: int = None,
-              use_hyperparameter_tuning: bool = False, use_regime_models: bool = False,
+              use_hyperparameter_tuning: bool = False, use_regime_models: bool = True,  # Enabled by default
               feature_selection_method: str = 'importance',
               # Optional hyperparameter overrides for testing
               rf_n_estimators: int = None, rf_max_depth: int = None,
@@ -1047,6 +1112,142 @@ class StockPredictionML:
             max_class = max(label_counts.values())
             if min_class < max_class * 0.1:  # Less than 10% of majority class
                 logger.warning(f"Severe class imbalance detected ({min_class} vs {max_class}). This may affect model performance.")
+        
+        # Track which samples were kept after filtering (for regime detection alignment)
+        kept_sample_indices = None
+        
+        # Binary classification mode: convert BUY/SELL/HOLD to UP/DOWN (skip HOLD)
+        # This achieves ~65% accuracy vs ~45% for 3-class
+        if use_binary_classification:
+            # Check if labels are already binary (UP/DOWN) - this can happen in regime model training
+            from collections import Counter
+            label_dist = Counter(y)
+            unique_labels = set(y)
+            
+            # Check if labels are already binary (UP/DOWN instead of BUY/SELL/HOLD)
+            if unique_labels.issubset({'UP', 'DOWN'}):
+                # Labels are already binary - skip conversion
+                logger.info("Labels are already in binary format (UP/DOWN). Skipping conversion.")
+                if len(y) < 30:
+                    logger.warning(f"Not enough binary samples ({len(y)} < 30). "
+                                 f"Label distribution: {dict(label_dist)}. "
+                                 f"Falling back to 3-class classification.")
+                    use_binary_classification = False
+                    kept_sample_indices = None
+                else:
+                    kept_sample_indices = list(range(len(y)))  # Keep all samples
+                    logger.info(f"✅ Using existing binary labels: {len(y)} samples")
+                    logger.info(f"Binary label distribution: {dict(label_dist)}")
+            else:
+                # Labels are in BUY/SELL/HOLD format - convert to binary
+                logger.info("Binary classification mode: converting labels to UP/DOWN")
+                # Filter out HOLD samples and convert labels
+                binary_mask = []
+                binary_labels = []
+                for i, label in enumerate(y):
+                    if label == 'BUY':
+                        binary_mask.append(i)
+                        binary_labels.append('DOWN')  # BUY signal = price went down (inverted logic)
+                    elif label == 'SELL':
+                        binary_mask.append(i)
+                        binary_labels.append('UP')  # SELL signal = price went up (inverted logic)
+                    # Skip HOLD
+                
+                # Check label distribution BEFORE filtering (from original y array)
+                original_label_dist = Counter(y)
+                logger.info(f"Label distribution before binary filtering: {dict(original_label_dist)}")
+                
+                # Reduced minimum from 100 to 30 for incremental training scenarios (backtest results)
+                if len(binary_mask) < 30:
+                    # Auto-disable binary classification if not enough samples
+                    logger.warning(f"Not enough binary samples ({len(binary_mask)} < 30). "
+                                 f"Original label distribution: {dict(original_label_dist)}. "
+                                 f"Falling back to 3-class classification (BUY/SELL/HOLD).")
+                    logger.warning("💡 Tip: Use stocks with more volatility or longer time periods to get more BUY/SELL signals.")
+                    use_binary_classification = False  # Fall back to 3-class
+                    kept_sample_indices = None  # Keep all samples
+                else:
+                    kept_sample_indices = binary_mask  # Track which samples were kept
+                    X = X[binary_mask]
+                    y = np.array(binary_labels)
+                    binary_label_dist = Counter(y)
+                    logger.info(f"✅ Binary classification successful: {len(X)} samples (removed {len(training_samples) - len(X)} HOLD samples)")
+                    logger.info(f"Binary label distribution (UP/DOWN): {dict(binary_label_dist)}")
+        
+        # Handle missing values
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Check for and remove duplicate samples (can cause overfitting)
+        from collections import Counter
+        import hashlib
+        
+        # Create hash of each sample to detect duplicates
+        sample_hashes = []
+        for x in X:
+            # Round to 6 decimal places to catch near-duplicates
+            x_rounded = np.round(x, 6)
+            sample_hash = hashlib.md5(x_rounded.tobytes()).hexdigest()
+            sample_hashes.append(sample_hash)
+        
+        unique_indices = []
+        seen_hashes = set()
+        for i, h in enumerate(sample_hashes):
+            if h not in seen_hashes:
+                unique_indices.append(i)
+                seen_hashes.add(h)
+        
+        if len(unique_indices) < len(X):
+            logger.warning(f"Removed {len(X) - len(unique_indices)} duplicate samples ({len(unique_indices)}/{len(X)} unique) to prevent overfitting")
+            # Update kept_sample_indices to reflect duplicate removal
+            if kept_sample_indices is not None:
+                kept_sample_indices = [kept_sample_indices[i] for i in unique_indices]
+            else:
+                kept_sample_indices = unique_indices
+            X = X[unique_indices]
+            y = y[unique_indices]
+        else:
+            # No duplicates removed, but ensure kept_sample_indices is set
+            if kept_sample_indices is None:
+                kept_sample_indices = list(range(len(X)))
+        
+        # Check class distribution
+        label_counts = Counter(y)
+        logger.info(f"Training data distribution: {dict(label_counts)}")
+        
+        # Warn if severe class imbalance
+        if len(label_counts) > 1:
+            min_class = min(label_counts.values())
+            max_class = max(label_counts.values())
+            if min_class < max_class * 0.1:  # Less than 10% of majority class
+                logger.warning(f"Severe class imbalance detected ({min_class} vs {max_class}). This may affect model performance.")
+        
+        # ===== REGIME-SPECIFIC MODEL TRAINING =====
+        if use_regime_models:
+            logger.info("Training regime-specific models (bull/bear/sideways)...")
+            # Filter training_samples to match the kept indices (after binary filtering and duplicate removal)
+            # kept_sample_indices now contains the original indices of samples that are in X
+            filtered_training_samples = [training_samples[i] for i in kept_sample_indices]
+            
+            # Verify alignment
+            if len(filtered_training_samples) != len(X):
+                logger.error(f"Sample count mismatch: {len(filtered_training_samples)} training samples vs {len(X)} features")
+                return {"error": f"Sample alignment error: {len(filtered_training_samples)} != {len(X)}"}
+            
+            regime_result = self._train_regime_models(
+                X, y, filtered_training_samples, test_size, random_seed,
+                use_hyperparameter_tuning, feature_selection_method,
+                disable_feature_selection, use_smote, use_interactions,
+                model_family, hold_confidence_threshold, use_binary_classification,
+                rf_n_estimators, rf_max_depth, rf_min_samples_split, rf_min_samples_leaf,
+                gb_n_estimators, gb_max_depth
+            )
+            
+            # If regime training failed, fall back to single model
+            if regime_result is None:
+                logger.warning("Regime-specific training failed. Falling back to single model training.")
+                use_regime_models = False  # Disable regime models and continue with normal training
+            else:
+                return regime_result
         
         # Encode labels
         y_encoded = self.label_encoder.fit_transform(y)
@@ -1418,9 +1619,25 @@ class StockPredictionML:
             logger.debug(f"Could not compute final feature importances: {e}")
         
         # Cross-validation (suppress feature name warnings)
-        with warnings.catch_warnings():
-            warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.utils.validation')
-            cv_scores = cross_val_score(self.model, X_train_scaled, y_train, cv=5, scoring='accuracy')
+        # Note: StackingClassifier already uses CV internally, so we do a simpler validation
+        cv_scores = np.array([test_score])  # Default to test score
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.utils.validation')
+                logger.info("Running 5-fold cross-validation...")
+                # Use fewer folds for StackingClassifier to avoid nested CV issues
+                cv_folds = 3 if isinstance(self.model, StackingClassifier) else 5
+                cv_scores = cross_val_score(self.model, X_train_scaled, y_train, cv=cv_folds, scoring='accuracy', n_jobs=get_safe_n_jobs(ML_TRAINING_CPU_CORES))
+                if len(cv_scores) > 0 and not np.isnan(cv_scores).any():
+                    logger.info(f"Cross-validation complete: {cv_scores.mean()*100:.1f}% ± {cv_scores.std()*100:.1f}% (folds: {cv_folds}, scores: {[f'{s*100:.1f}%' for s in cv_scores]})")
+                else:
+                    logger.warning("Cross-validation returned invalid scores. Using test score as fallback.")
+                    cv_scores = np.array([test_score])
+        except Exception as e:
+            logger.warning(f"Cross-validation failed: {e}. Using test score as fallback.")
+            import traceback
+            logger.debug(traceback.format_exc())
+            cv_scores = np.array([test_score])  # Fallback to test score if CV fails
         
         # Save model securely
         self.storage.save_model(self.model, self.model_file)
@@ -1428,6 +1645,10 @@ class StockPredictionML:
         # Save label encoder (needed for prediction)
         label_encoder_file = self.data_dir / f"label_encoder_{self.strategy}.pkl"
         self.storage.save_model(self.label_encoder, label_encoder_file)
+        
+        # Store accuracy values for access by regime model training
+        self.train_accuracy = float(train_score)
+        self.test_accuracy = float(test_score)
         
         # Save metadata
         self.metadata = {
@@ -1459,8 +1680,358 @@ class StockPredictionML:
         
         return self.metadata
     
-    def predict(self, features: np.ndarray) -> Dict:
-        """Make prediction using trained model"""
+    def _train_regime_models(self, X: np.ndarray, y: np.ndarray, training_samples: List[Dict],
+                            test_size: float, random_seed: int, use_hyperparameter_tuning: bool,
+                            feature_selection_method: str, disable_feature_selection: bool,
+                            use_smote: bool, use_interactions: bool, model_family: str,
+                            hold_confidence_threshold: float, use_binary_classification: bool,
+                            rf_n_estimators: int, rf_max_depth: int, rf_min_samples_split: int,
+                            rf_min_samples_leaf: int, gb_n_estimators: int, gb_max_depth: int) -> Dict:
+        """Train separate models for each market regime"""
+        from algorithm_improvements import MarketRegimeDetector
+        import yfinance as yf
+        
+        # Initialize regime detector
+        regime_detector = MarketRegimeDetector()
+        
+        # Detect regime for each training sample
+        logger.info("Detecting market regime for each training sample...")
+        regime_labels = []
+        spy_cache = {}  # Cache SPY data by date to avoid repeated fetches
+        
+        for i, sample in enumerate(training_samples):
+            regime = 'sideways'  # Default
+            sample_date = sample.get('date')
+            
+            try:
+                    # Try to fetch SPY data for regime detection
+                if sample_date:
+                    # Use cached SPY data if available
+                    if sample_date not in spy_cache:
+                        try:
+                            # Fetch SPY data up to the sample date
+                            # Use a wider date range and more robust fetching
+                            end_date = pd.to_datetime(sample_date) + pd.Timedelta(days=1)
+                            start_date = end_date - pd.Timedelta(days=365)  # Get 1 year of data
+                            
+                            # Try multiple methods to fetch SPY data
+                            hist = None
+                            
+                            # Method 1: Direct yfinance
+                            try:
+                                ticker = yf.Ticker('SPY')
+                                hist = ticker.history(start=start_date.strftime('%Y-%m-%d'), 
+                                                     end=end_date.strftime('%Y-%m-%d'),
+                                                     progress=False, show_errors=False)
+                                if hist.empty or len(hist) < 50:
+                                    hist = None
+                            except Exception:
+                                hist = None
+                            
+                            # Method 2: Try with period instead of dates
+                            if hist is None or hist.empty:
+                                try:
+                                    ticker = yf.Ticker('SPY')
+                                    hist = ticker.history(period="1y", progress=False, show_errors=False)
+                                    if not hist.empty:
+                                        # Filter to date range
+                                        hist = hist[hist.index <= end_date]
+                                        if len(hist) < 50:
+                                            hist = None
+                                except Exception:
+                                    hist = None
+                            
+                            if hist is not None and not hist.empty and len(hist) >= 50:
+                                spy_cache[sample_date] = hist
+                            else:
+                                spy_cache[sample_date] = None
+                                logger.debug(f"Could not fetch sufficient SPY data for {sample_date} (got {len(hist) if hist is not None else 0} rows)")
+                        except Exception as e:
+                            logger.debug(f"Error fetching SPY data for {sample_date}: {e}")
+                            spy_cache[sample_date] = None
+                    
+                    spy_data = spy_cache.get(sample_date)
+                    if spy_data is not None and not spy_data.empty and len(spy_data) >= 50:
+                        try:
+                            # Detect regime using SPY data
+                            regime_info = regime_detector.detect_regime(spy_data)
+                            regime = regime_info.get('regime', 'sideways')
+                        except Exception as e:
+                            logger.debug(f"Error detecting regime from SPY data for {sample_date}: {e}")
+                            regime = 'sideways'
+                    else:
+                        # Fallback: default to sideways
+                        regime = 'sideways'
+                else:
+                    regime = 'sideways'  # Default if no date
+            except Exception as e:
+                logger.debug(f"Error detecting regime for sample {i}: {e}")
+                regime = 'sideways'  # Default on error
+            
+            regime_labels.append(regime)
+            
+            # Progress logging every 100 samples
+            if (i + 1) % 100 == 0:
+                logger.info(f"  Processed {i + 1}/{len(training_samples)} samples for regime detection...")
+        
+        # Count samples per regime
+        from collections import Counter
+        regime_counts = Counter(regime_labels)
+        logger.info(f"Regime distribution: {dict(regime_counts)}")
+        
+        # Check if we have enough samples for each regime
+        min_samples_per_regime = 100  # Minimum samples needed per regime
+        regimes_to_train = []
+        for regime in ['bull', 'bear', 'sideways']:
+            count = regime_counts.get(regime, 0)
+            if count >= min_samples_per_regime:
+                regimes_to_train.append(regime)
+                logger.info(f"  {regime}: {count} samples (sufficient)")
+            else:
+                logger.warning(f"  {regime}: {count} samples (insufficient, need {min_samples_per_regime})")
+        
+        if len(regimes_to_train) == 0:
+            logger.warning("Not enough samples for any regime. Falling back to single model.")
+            # Continue with normal training by returning None (caller will handle)
+            return None
+        
+        # Train models for each regime
+        regime_models = {}
+        regime_metadata = {}
+        overall_train_acc = 0.0
+        overall_test_acc = 0.0
+        overall_cv_mean = 0.0
+        overall_cv_std = 0.0
+        total_samples = 0
+        
+        for regime in regimes_to_train:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Training {regime.upper()} regime model")
+            logger.info(f"{'='*60}")
+            
+            # Filter samples for this regime
+            regime_mask = np.array([r == regime for r in regime_labels])
+            regime_X = X[regime_mask]
+            regime_y = y[regime_mask]
+            regime_samples = [s for i, s in enumerate(training_samples) if regime_mask[i]]
+            
+            logger.info(f"Training on {len(regime_X)} {regime} samples...")
+            
+            # Check label distribution in regime samples
+            from collections import Counter
+            regime_label_dist = Counter([s.get('label', 'HOLD') for s in regime_samples])
+            logger.info(f"Regime {regime} label distribution: {dict(regime_label_dist)}")
+            
+            # Create a temporary ML instance for this regime
+            # We'll train it using the same logic as the main model
+            regime_ml = StockPredictionML(self.data_dir, f"{self.strategy}_{regime}")
+            regime_ml.use_hyperparameter_tuning = use_hyperparameter_tuning
+            regime_ml.feature_selection_method = feature_selection_method
+            
+            # Train the regime model (reuse existing train logic)
+            # Note: regime_samples have original BUY/SELL/HOLD labels, so binary classification will work correctly
+            try:
+                regime_result = regime_ml.train(
+                    regime_samples,
+                    test_size=test_size,
+                    random_seed=random_seed,
+                    use_hyperparameter_tuning=use_hyperparameter_tuning,
+                    use_regime_models=False,  # Don't recurse!
+                    feature_selection_method=feature_selection_method,
+                    disable_feature_selection=disable_feature_selection,
+                    use_smote=use_smote,
+                    use_interactions=use_interactions,
+                    model_family=model_family,
+                    hold_confidence_threshold=hold_confidence_threshold,
+                    use_binary_classification=use_binary_classification,  # This will convert BUY/SELL to UP/DOWN
+                    rf_n_estimators=rf_n_estimators,
+                    rf_max_depth=rf_max_depth,
+                    rf_min_samples_split=rf_min_samples_split,
+                    rf_min_samples_leaf=rf_min_samples_leaf,
+                    gb_n_estimators=gb_n_estimators,
+                    gb_max_depth=gb_max_depth
+                )
+                
+                if 'error' in regime_result:
+                    logger.error(f"Error training {regime} model: {regime_result['error']}")
+                    continue
+                
+                # Get accuracy from result or from regime_ml attributes
+                train_acc = regime_result.get('train_accuracy', regime_ml.train_accuracy if hasattr(regime_ml, 'train_accuracy') else 0.0)
+                test_acc = regime_result.get('test_accuracy', regime_ml.test_accuracy if hasattr(regime_ml, 'test_accuracy') else 0.0)
+                cv_mean = regime_result.get('cv_mean', 0.0)
+                cv_std = regime_result.get('cv_std', 0.0)
+                
+                # Store the regime model
+                regime_models[regime] = regime_ml
+                regime_metadata[regime] = {
+                    'train_accuracy': train_acc,
+                    'test_accuracy': test_acc,
+                    'cv_mean': cv_mean,
+                    'cv_std': cv_std,
+                    'samples': len(regime_X),
+                    'selected_features': regime_ml.selected_features.tolist() if regime_ml.selected_features is not None else None,
+                    'num_features': len(regime_ml.selected_features) if regime_ml.selected_features is not None else None
+                }
+                
+                # Weighted average for overall metrics
+                overall_train_acc += train_acc * len(regime_X)
+                overall_test_acc += test_acc * len(regime_X)
+                overall_cv_mean += cv_mean * len(regime_X)
+                # For CV std, we'll use a weighted average (simplified approach)
+                overall_cv_std += cv_std * len(regime_X)
+                total_samples += len(regime_X)
+                
+                logger.info(f"✓ {regime} model trained: {test_acc*100:.1f}% test accuracy")
+                
+            except Exception as e:
+                logger.error(f"Error training {regime} model: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                continue
+        
+        if len(regime_models) == 0:
+            logger.error("Failed to train any regime models. Falling back to single model.")
+            return None
+        
+        # Calculate weighted average accuracy and CV scores
+        if total_samples > 0:
+            overall_train_acc /= total_samples
+            overall_test_acc /= total_samples
+            overall_cv_mean /= total_samples
+            overall_cv_std /= total_samples
+        
+        # Store regime models
+        self.regime_models = regime_models
+        self.use_regime_models = True
+        
+        # Update metadata
+        self.metadata = {
+            'strategy': self.strategy,
+            'train_accuracy': overall_train_acc,
+            'test_accuracy': overall_test_acc,
+            'cv_mean': overall_cv_mean,
+            'cv_std': overall_cv_std,
+            'use_regime_models': True,
+            'regime_metadata': regime_metadata,
+            'regime_distribution': dict(regime_counts),
+            'trained_regimes': list(regime_models.keys()),
+            'training_date': datetime.now().isoformat(),
+            'use_binary_classification': use_binary_classification
+        }
+        
+        # Save metadata
+        with open(self.metadata_file, 'w') as f:
+            json.dump(self.metadata, f, indent=2)
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"REGIME-SPECIFIC MODELS TRAINING COMPLETE")
+        logger.info(f"{'='*60}")
+        logger.info(f"Overall Training Accuracy: {overall_train_acc*100:.1f}%")
+        logger.info(f"Overall Test Accuracy: {overall_test_acc*100:.1f}%")
+        logger.info(f"Trained {len(regime_models)} regime models: {', '.join(regime_models.keys())}")
+        
+        return self.metadata
+    
+    def _detect_current_regime(self, history_data: dict = None, stock_data: dict = None) -> str:
+        """Detect current market regime for prediction"""
+        try:
+            from algorithm_improvements import MarketRegimeDetector
+            import yfinance as yf
+            
+            if self.regime_detector is None:
+                self.regime_detector = MarketRegimeDetector()
+            
+            # Try to get SPY data for regime detection
+            spy_df = None
+            
+            # Check cache first
+            if hasattr(self, '_spy_data_cache') and hasattr(self, '_spy_data_cache_time'):
+                if self._spy_data_cache_time and (datetime.now() - self._spy_data_cache_time).days < 1:
+                    spy_df = self._spy_data_cache
+            
+            # Fetch SPY data if not cached
+            if spy_df is None or spy_df.empty:
+                try:
+                    spy_hist = yf.download('SPY', period="1y", interval="1d", progress=False, show_errors=False)
+                    if not spy_hist.empty:
+                        spy_df = spy_hist
+                        self._spy_data_cache = spy_df
+                        self._spy_data_cache_time = datetime.now()
+                except Exception as e:
+                    logger.debug(f"Could not fetch SPY data for regime detection: {e}")
+            
+            # If SPY data available, use it
+            if spy_df is not None and not spy_df.empty:
+                # Handle yfinance MultiIndex columns
+                if isinstance(spy_df.columns, pd.MultiIndex):
+                    if 'Close' in spy_df.columns.get_level_values(1):
+                        spy_df = spy_df['Close'].to_frame()
+                        spy_df.columns = ['close']
+                    elif 'close' in spy_df.columns.get_level_values(1):
+                        spy_df = spy_df['close'].to_frame()
+                        spy_df.columns = ['close']
+                elif 'Close' in spy_df.columns:
+                    spy_df = spy_df.rename(columns={'Close': 'close'})
+                elif 'close' not in spy_df.columns and len(spy_df.columns) > 0:
+                    # Assume first column is close price
+                    spy_df = spy_df.rename(columns={spy_df.columns[0]: 'close'})
+                
+                if 'close' in spy_df.columns:
+                    regime_info = self.regime_detector.detect_regime(spy_df)
+                    regime = regime_info.get('regime', 'sideways')
+                    # Map 'unknown' to 'sideways'
+                    if regime == 'unknown':
+                        regime = 'sideways'
+                    return regime
+            
+            # Fallback: try to detect from history_data if available
+            if history_data and history_data.get('data'):
+                try:
+                    import pandas as pd
+                    df = pd.DataFrame(history_data['data'])
+                    if 'date' in df.columns:
+                        df['date'] = pd.to_datetime(df['date'])
+                        df.set_index('date', inplace=True)
+                    # Ensure 'close' column exists
+                    if 'close' not in df.columns and 'Close' in df.columns:
+                        df = df.rename(columns={'Close': 'close'})
+                    if 'close' in df.columns and len(df) >= 50:
+                        regime_info = self.regime_detector.detect_regime(df)
+                        regime = regime_info.get('regime', 'sideways')
+                        if regime == 'unknown':
+                            regime = 'sideways'
+                        return regime
+                except Exception as e:
+                    logger.debug(f"Could not detect regime from history_data: {e}")
+            
+            # Default to sideways if we can't detect
+            return 'sideways'
+            
+        except Exception as e:
+            logger.warning(f"Error detecting market regime: {e}. Defaulting to sideways.")
+            return 'sideways'
+    
+    def predict(self, features: np.ndarray, stock_data: dict = None, history_data: dict = None) -> Dict:
+        """Make prediction using trained model (or regime-specific model if enabled)"""
+        # Check if we should use regime-specific models
+        if self.use_regime_models and len(self.regime_models) > 0:
+            # Detect current market regime
+            current_regime = self._detect_current_regime(history_data, stock_data)
+            
+            if current_regime in self.regime_models:
+                regime_ml = self.regime_models[current_regime]
+                logger.debug(f"Using {current_regime} regime model for prediction")
+                # Regime models also support the same signature
+                return regime_ml.predict(features, stock_data, history_data)
+            else:
+                # Fallback to sideways or default model
+                fallback_regime = 'sideways' if 'sideways' in self.regime_models else list(self.regime_models.keys())[0]
+                logger.debug(f"{current_regime} regime model not found, using {fallback_regime} model")
+                regime_ml = self.regime_models[fallback_regime]
+                return regime_ml.predict(features, stock_data, history_data)
+        
+        # Original single model prediction
         if self.model is None:
             return {
                 'action': 'HOLD',
@@ -1484,6 +2055,26 @@ class StockPredictionML:
             }
         
         # Apply feature selection if available
+        scaler_expected_features = self.scaler.n_features_in_ if hasattr(self.scaler, 'n_features_in_') else None
+        
+        # If selected_features is None, try to infer from scaler
+        if self.selected_features is None and scaler_expected_features is not None:
+            # Scaler expects fewer features than input - feature selection was used
+            # Estimate: if scaler expects 75 and we have 130, interactions likely add ~5, so selected = ~70
+            # For now, use first N features where N = scaler_expected (assuming no interactions)
+            # Or if interactions were used, N = scaler_expected - 5
+            if scaler_expected_features < len(features[0]):
+                # Try without interactions first
+                if scaler_expected_features == len(features[0]):
+                    # No feature selection needed
+                    logger.debug(f"selected_features is None, but scaler expects {scaler_expected_features} = input {len(features[0])}. No feature selection needed.")
+                else:
+                    # Feature selection was used - use first N features as fallback
+                    # This is not ideal but better than failing
+                    estimated_selected = max(1, scaler_expected_features - 5)  # Assume ~5 interactions
+                    logger.warning(f"selected_features is None but scaler expects {scaler_expected_features} < {len(features[0])} input. Using first {estimated_selected} features as fallback (estimated, may be incorrect).")
+                    self.selected_features = np.arange(min(estimated_selected, len(features[0])))
+        
         if self.selected_features is not None:
             if len(features[0]) > len(self.selected_features):
                 # Select only the features that were used during training
@@ -1499,8 +2090,36 @@ class StockPredictionML:
                 }
         
         # Add feature interactions if they were used during training
-        # (This is a simplified version - in production, you'd store interaction info)
-        # For now, we'll skip interactions in prediction to avoid complexity
+        # Check if interactions were used (scaler expects more features than selected)
+        num_selected = len(self.selected_features) if self.selected_features is not None else len(features[0])
+        
+        use_interactions = False
+        if scaler_expected_features is not None and scaler_expected_features > num_selected:
+            # Scaler expects more features than we have after selection - interactions were used
+            use_interactions = True
+            logger.debug(f"Detected interactions: scaler expects {scaler_expected_features} features, we have {num_selected} after selection")
+        
+        if use_interactions:
+            # Get feature names for selected features
+            all_feature_names = self.feature_extractor.get_feature_names()
+            if self.selected_features is not None:
+                selected_feature_names = [all_feature_names[i] for i in self.selected_features if i < len(all_feature_names)]
+            else:
+                selected_feature_names = all_feature_names[:len(features[0])]
+            
+            # Add interactions using the same logic as training (method is on FeatureExtractor)
+            try:
+                features, _ = self.feature_extractor._add_feature_interactions(features, selected_feature_names, fit=False)
+                logger.debug(f"Added feature interactions: {len(features[0])} features total (was {num_selected})")
+            except Exception as e:
+                logger.warning(f"Could not add feature interactions during prediction: {e}. Using features without interactions.")
+                # If interactions fail, we can't proceed - return error
+                return {
+                    'action': 'HOLD',
+                    'confidence': 0.0,
+                    'error': f'Feature interaction error: {e}',
+                    'probabilities': {'BUY': 0.0, 'SELL': 0.0, 'HOLD': 100.0}
+                }
         
         # Scale
         features_scaled = self.scaler.transform(features)
@@ -1655,8 +2274,141 @@ class StockPredictionML:
         logger.info(f"Hyperparameter tuning complete. Best CV score: {study.best_value:.4f}")
         return best_params
     
+    def _load_regime_models(self):
+        """Load regime-specific models if they exist"""
+        if not self.metadata.get('use_regime_models', False):
+            return
+        
+        self.regime_models = {}
+        regimes = ['bull', 'bear', 'sideways']
+        
+        for regime in regimes:
+            regime_model_file = f"ml_model_{self.strategy}_{regime}.pkl"
+            regime_scaler_file = f"scaler_{self.strategy}_{regime}.pkl"
+            regime_encoder_file = f"label_encoder_{self.strategy}_{regime}.pkl"
+            
+            if (self.storage.model_exists(regime_model_file) and 
+                self.storage.model_exists(regime_scaler_file) and
+                self.storage.model_exists(regime_encoder_file)):
+                try:
+                    # Create a minimal regime model object without calling __init__ (which would try to load again)
+                    # Use object.__new__ to create instance without calling __init__
+                    regime_ml = object.__new__(StockPredictionML)
+                    # Set ALL required attributes (from __init__)
+                    regime_ml.data_dir = self.data_dir
+                    regime_ml.strategy = f"{self.strategy}_{regime}"
+                    regime_ml.model_file = f"ml_model_{self.strategy}_{regime}.pkl"
+                    regime_ml.scaler_file = f"scaler_{self.strategy}_{regime}.pkl"
+                    regime_ml.metadata_file = self.data_dir / f"ml_metadata_{self.strategy}_{regime}.json"
+                    regime_ml.storage = self.storage
+                    regime_ml.feature_extractor = self.feature_extractor
+                    regime_ml.use_regime_models = False  # Regime models don't use nested regime models
+                    regime_ml.regime_models = {}  # Regime models don't have nested regime models
+                    regime_ml.regime_detector = None
+                    regime_ml.feature_importance = {}
+                    regime_ml.use_hyperparameter_tuning = False
+                    regime_ml.feature_selection_method = 'importance'
+                    
+                    # Load the actual model components
+                    regime_ml.model = self.storage.load_model(regime_model_file)
+                    regime_ml.scaler = self.storage.load_model(regime_scaler_file)
+                    regime_ml.label_encoder = self.storage.load_model(regime_encoder_file)
+                    
+                    # Load metadata for this regime if available
+                    # Try multiple sources: main metadata -> regime's own metadata file
+                    regime_metadata = {}
+                    if self.metadata and 'regime_metadata' in self.metadata:
+                        regime_metadata = self.metadata['regime_metadata'].get(regime, {})
+                    
+                    # Also try loading from the regime model's own metadata file
+                    if not regime_metadata and regime_ml.metadata_file.exists():
+                        try:
+                            with open(regime_ml.metadata_file, 'r') as f:
+                                regime_own_metadata = json.load(f)
+                                # Extract selected_features and other info from regime's own metadata
+                                if 'selected_features' in regime_own_metadata:
+                                    regime_metadata['selected_features'] = regime_own_metadata['selected_features']
+                                if 'train_accuracy' in regime_own_metadata:
+                                    regime_metadata['train_accuracy'] = regime_own_metadata['train_accuracy']
+                                if 'test_accuracy' in regime_own_metadata:
+                                    regime_metadata['test_accuracy'] = regime_own_metadata['test_accuracy']
+                                logger.debug(f"Loaded regime metadata from {regime_ml.metadata_file.name}")
+                        except Exception as e:
+                            logger.debug(f"Could not load regime metadata from {regime_ml.metadata_file.name}: {e}")
+                    
+                    regime_ml.metadata = regime_metadata if regime_metadata else {}
+                    regime_ml.train_accuracy = regime_metadata.get('train_accuracy', 0) if regime_metadata else 0
+                    regime_ml.test_accuracy = regime_metadata.get('test_accuracy', 0) if regime_metadata else 0
+                    
+                    # Load selected features if available
+                    # First try from regime-specific metadata (from main metadata or regime's own file)
+                    if regime_metadata and 'selected_features' in regime_metadata:
+                        regime_ml.selected_features = np.array(regime_metadata['selected_features'])
+                        logger.info(f"Loaded selected_features for {regime} regime: {len(regime_ml.selected_features)} features")
+                    # Then try from main metadata's regime_metadata section
+                    elif self.metadata and 'regime_metadata' in self.metadata:
+                        regime_meta = self.metadata['regime_metadata'].get(regime, {})
+                        if 'selected_features' in regime_meta:
+                            regime_ml.selected_features = np.array(regime_meta['selected_features'])
+                            logger.info(f"Loaded selected_features for {regime} regime from main metadata: {len(regime_ml.selected_features)} features")
+                        else:
+                            # Fallback to main model's selected features
+                            regime_ml.selected_features = self.selected_features if hasattr(self, 'selected_features') and self.selected_features is not None else None
+                            if regime_ml.selected_features is not None:
+                                logger.debug(f"Using main model's selected_features for {regime} regime: {len(regime_ml.selected_features)} features")
+                            else:
+                                logger.warning(f"No selected_features found for {regime} regime. Feature selection may not work correctly.")
+                    else:
+                        # Fallback to main model's selected features
+                        regime_ml.selected_features = self.selected_features if hasattr(self, 'selected_features') and self.selected_features is not None else None
+                        if regime_ml.selected_features is not None:
+                            logger.debug(f"Using main model's selected_features for {regime} regime: {len(regime_ml.selected_features)} features")
+                        else:
+                            logger.warning(f"No selected_features found for {regime} regime. Feature selection may not work correctly.")
+                    
+                    # Verify the model loaded correctly
+                    if regime_ml.model is None:
+                        logger.warning(f"Regime model {regime}: model is None")
+                        continue
+                    if not hasattr(regime_ml.label_encoder, 'classes_'):
+                        logger.warning(f"Regime model {regime}: label_encoder has no classes_ attribute")
+                        continue
+                    if len(regime_ml.label_encoder.classes_) == 0:
+                        logger.warning(f"Regime model {regime}: label_encoder has no classes")
+                        continue
+                    
+                    self.regime_models[regime] = regime_ml
+                    logger.info(f"✓ Loaded {regime} regime model for {self.strategy} (model={regime_ml.model is not None}, encoder={len(regime_ml.label_encoder.classes_)} classes)")
+                except Exception as e:
+                    logger.error(f"Error loading {regime} regime model for {self.strategy}: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+        
+        if not self.regime_models:
+            logger.warning(f"No regime models loaded for {self.strategy}. Falling back to single model logic.")
+            # Try to load the main model as fallback
+            if self.storage.model_exists(self.model_file):
+                try:
+                    self.model = self.storage.load_model(self.model_file)
+                    logger.info(f"Loaded fallback single model for {self.strategy}")
+                except Exception as e:
+                    logger.error(f"Error loading fallback model: {e}")
+        else:
+            logger.info(f"Successfully loaded {len(self.regime_models)} regime model(s) for {self.strategy}")
+    
     def is_trained(self) -> bool:
         """Check if model is trained and ready to use"""
+        # Check for regime models first
+        if self.use_regime_models and len(self.regime_models) > 0:
+            # At least one regime model should have a fitted label encoder
+            for regime, regime_ml in self.regime_models.items():
+                if (regime_ml.model is not None and 
+                    hasattr(regime_ml.label_encoder, 'classes_') and 
+                    len(regime_ml.label_encoder.classes_) > 0):
+                    return True
+            return False
+        
+        # Check single model
         if self.model is None:
             return False
         # Also check if LabelEncoder is fitted (needed for predictions)

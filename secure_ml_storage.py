@@ -117,17 +117,22 @@ class SecureMLStorage:
         trusted_modules = [
             'sklearn', 'numpy', 'pandas', 'scipy',
             '__builtin__', 'builtins', '_pickle',
+            # Python standard library modules used by ML libraries
+            'collections',  # Used by sklearn and other libraries (defaultdict, OrderedDict, etc.)
             # scikit-learn internal modules (Cython extensions)
             '_loss', '_tree', '_splitter', '_criterion',
             '_utils', '_base', '_classes', '_ensemble',
             '_forest', '_gb_losses', '_gradient_boosting',
             '_weight_boosting', '_logistic', '_linear_model',
-            '_preprocessing', '_validation', '_feature_selection'
+            '_preprocessing', '_validation', '_feature_selection',
+            # Advanced ML libraries
+            'lightgbm', 'xgboost', 'optuna'
         ]
         
         module_base = module.split('.')[0]
         # Also allow sklearn submodules (sklearn.ensemble, sklearn.tree, etc.)
-        if module_base not in trusted_modules and not module.startswith('sklearn.'):
+        # And allow lightgbm/xgboost submodules
+        if module_base not in trusted_modules and not module.startswith('sklearn.') and not module.startswith('lightgbm.') and not module.startswith('xgboost.'):
             raise SecurityError(f"Untrusted module attempted: {module}.{name}")
         
         try:
