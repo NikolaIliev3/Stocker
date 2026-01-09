@@ -997,7 +997,7 @@ class StockPredictionML:
               rf_n_estimators: int = None, rf_max_depth: int = None,
               rf_min_samples_split: int = None, rf_min_samples_leaf: int = None,
               gb_n_estimators: int = None, gb_max_depth: int = None,
-              disable_feature_selection: bool = False, use_smote: bool = False,
+              disable_feature_selection: bool = False, use_smote: bool = None,  # None = auto-enable for binary classification
               use_interactions: bool = None,
               # Simplification knobs (default: simpler + more generalizable)
               model_family: str = 'voting',  # 'rf' | 'voting' - voting is default for better accuracy
@@ -1023,6 +1023,10 @@ class StockPredictionML:
             use_hyperparameter_tuning = False
             use_regime_models = False
         
+        # Auto-enable SMOTE for binary classification if not explicitly set
+        if use_smote is None:
+            use_smote = use_binary_classification  # Auto-enable SMOTE for binary classification to reduce bias
+        
         # Force retraining by resetting model components
         logger.info("Resetting model for fresh training...")
         self.model = None
@@ -1046,6 +1050,7 @@ class StockPredictionML:
         logger.info(f"  • Model family: {model_family}")
         logger.info(f"  • HOLD confidence threshold: {hold_confidence_threshold}")
         logger.info(f"  • Binary classification: {use_binary_classification}")
+        logger.info(f"  • SMOTE balancing: {use_smote}")
         
         # Prepare data
         X = np.array([s['features'] for s in training_samples])
@@ -1256,6 +1261,33 @@ class StockPredictionML:
         X_train, X_test, y_train, y_test = train_test_split(
             X, y_encoded, test_size=test_size, random_state=random_seed, stratify=y_encoded
         )
+        
+        # Apply SMOTE for class balancing if enabled and binary classification is used
+        if use_smote and use_binary_classification:
+            try:
+                from imblearn.over_sampling import SMOTE
+                # Check class imbalance
+                unique, counts = np.unique(y_train, return_counts=True)
+                class_dist = dict(zip(unique, counts))
+                if len(class_dist) == 2:
+                    max_count = max(class_dist.values())
+                    min_count = min(class_dist.values())
+                    imbalance_ratio = max_count / min_count if min_count > 0 else 1.0
+                    
+                    if imbalance_ratio > 1.3:  # More than 30% imbalance
+                        logger.info(f"Applying SMOTE to balance classes (ratio: {imbalance_ratio:.2f})")
+                        logger.info(f"  Before SMOTE: {class_dist}")
+                        smote = SMOTE(random_state=random_seed, k_neighbors=min(5, min_count - 1))
+                        X_train, y_train = smote.fit_resample(X_train, y_train)
+                        unique_after, counts_after = np.unique(y_train, return_counts=True)
+                        class_dist_after = dict(zip(unique_after, counts_after))
+                        logger.info(f"  After SMOTE: {class_dist_after}")
+                    else:
+                        logger.debug(f"Class imbalance ratio ({imbalance_ratio:.2f}) is acceptable, skipping SMOTE")
+            except ImportError as e:
+                logger.warning(f"SMOTE requested but imbalanced-learn not available: {e}. Install with: pip install --upgrade scikit-learn imbalanced-learn")
+            except Exception as e:
+                logger.warning(f"SMOTE application failed: {e}. Continuing without SMOTE.")
         
         # ===== FEATURE SELECTION =====
         # Scale features first
@@ -2056,42 +2088,46 @@ class StockPredictionML:
         
         # Apply feature selection if available
         scaler_expected_features = self.scaler.n_features_in_ if hasattr(self.scaler, 'n_features_in_') else None
+        input_features = len(features[0])
         
-        # If selected_features is None, try to infer from scaler
-        if self.selected_features is None and scaler_expected_features is not None:
-            # Scaler expects fewer features than input - feature selection was used
-            # Estimate: if scaler expects 75 and we have 130, interactions likely add ~5, so selected = ~70
-            # For now, use first N features where N = scaler_expected (assuming no interactions)
-            # Or if interactions were used, N = scaler_expected - 5
-            if scaler_expected_features < len(features[0]):
-                # Try without interactions first
-                if scaler_expected_features == len(features[0]):
-                    # No feature selection needed
-                    logger.debug(f"selected_features is None, but scaler expects {scaler_expected_features} = input {len(features[0])}. No feature selection needed.")
-                else:
-                    # Feature selection was used - use first N features as fallback
-                    # This is not ideal but better than failing
-                    estimated_selected = max(1, scaler_expected_features - 5)  # Assume ~5 interactions
-                    logger.warning(f"selected_features is None but scaler expects {scaler_expected_features} < {len(features[0])} input. Using first {estimated_selected} features as fallback (estimated, may be incorrect).")
-                    self.selected_features = np.arange(min(estimated_selected, len(features[0])))
+        logger.debug(f"ML prediction for {self.strategy}: input_features={input_features}, scaler_expects={scaler_expected_features}, selected_features={'None' if self.selected_features is None else f'{len(self.selected_features)} indices'}")
         
-        if self.selected_features is not None:
-            if len(features[0]) > len(self.selected_features):
+        # If selected_features is None or empty, try to infer from scaler
+        if (self.selected_features is None or (isinstance(self.selected_features, np.ndarray) and len(self.selected_features) == 0)) and scaler_expected_features is not None:
+            if scaler_expected_features < input_features:
+                # Feature selection was used - estimate number of selected features
+                # If scaler expects 75 and we have 130, interactions likely add ~5, so selected = ~70
+                estimated_selected = max(1, scaler_expected_features - 5)  # Assume ~5 interactions
+                logger.warning(f"selected_features is None/empty but scaler expects {scaler_expected_features} < {input_features} input. Inferring {estimated_selected} selected features (estimated, may be incorrect).")
+                self.selected_features = np.arange(min(estimated_selected, input_features))
+            elif scaler_expected_features == input_features:
+                # No feature selection needed
+                logger.debug(f"selected_features is None/empty, but scaler expects {scaler_expected_features} = input {input_features}. No feature selection needed.")
+                self.selected_features = None  # Keep as None
+        
+        # Apply feature selection if available
+        if self.selected_features is not None and len(self.selected_features) > 0:
+            if input_features > len(self.selected_features):
                 # Select only the features that were used during training
                 features = features[:, self.selected_features]
-            elif len(features[0]) < len(self.selected_features):
+                logger.debug(f"Applied feature selection: {input_features} -> {len(features[0])} features")
+            elif input_features < len(self.selected_features):
                 # Features don't match - model may need retraining
-                logger.warning(f"Feature count mismatch: got {len(features[0])}, expected {len(self.selected_features)}")
+                logger.warning(f"Feature count mismatch: got {input_features}, expected {len(self.selected_features)} selected features")
                 return {
                     'action': 'HOLD',
                     'confidence': 0.0,
                     'error': 'Feature count mismatch - model may need retraining',
                     'probabilities': {'BUY': 0.0, 'SELL': 0.0, 'HOLD': 100.0}
                 }
+        elif scaler_expected_features is not None and scaler_expected_features < input_features:
+            # Fallback: if we still have more features than scaler expects, use first N
+            logger.warning(f"selected_features is None but scaler expects {scaler_expected_features} < {input_features}. Using first {scaler_expected_features} features as emergency fallback.")
+            features = features[:, :scaler_expected_features]
         
         # Add feature interactions if they were used during training
         # Check if interactions were used (scaler expects more features than selected)
-        num_selected = len(self.selected_features) if self.selected_features is not None else len(features[0])
+        num_selected = len(features[0])  # Current number of features after selection
         
         use_interactions = False
         if scaler_expected_features is not None and scaler_expected_features > num_selected:
@@ -2102,10 +2138,10 @@ class StockPredictionML:
         if use_interactions:
             # Get feature names for selected features
             all_feature_names = self.feature_extractor.get_feature_names()
-            if self.selected_features is not None:
+            if self.selected_features is not None and len(self.selected_features) > 0:
                 selected_feature_names = [all_feature_names[i] for i in self.selected_features if i < len(all_feature_names)]
             else:
-                selected_feature_names = all_feature_names[:len(features[0])]
+                selected_feature_names = all_feature_names[:num_selected]
             
             # Add interactions using the same logic as training (method is on FeatureExtractor)
             try:
@@ -2120,6 +2156,16 @@ class StockPredictionML:
                     'error': f'Feature interaction error: {e}',
                     'probabilities': {'BUY': 0.0, 'SELL': 0.0, 'HOLD': 100.0}
                 }
+        
+        # Final check: ensure feature count matches scaler expectations
+        if scaler_expected_features is not None and len(features[0]) != scaler_expected_features:
+            logger.error(f"Feature count mismatch after selection/interactions: got {len(features[0])}, scaler expects {scaler_expected_features}")
+            return {
+                'action': 'HOLD',
+                'confidence': 0.0,
+                'error': f'Feature count mismatch: got {len(features[0])}, expected {scaler_expected_features}',
+                'probabilities': {'BUY': 0.0, 'SELL': 0.0, 'HOLD': 100.0}
+            }
         
         # Scale
         features_scaled = self.scaler.transform(features)
@@ -2140,6 +2186,27 @@ class StockPredictionML:
         classes = list(self.label_encoder.classes_)
         hold_idx = classes.index('HOLD') if 'HOLD' in classes else None
         maxp = float(np.max(probabilities))
+        
+        # For binary classification, add confidence threshold to reduce bias
+        # If confidence is too low, return HOLD instead of making a biased prediction
+        is_binary_mode = (set(classes) == {'UP', 'DOWN'} or 
+                         (len(classes) == 2 and 'UP' in classes and 'DOWN' in classes))
+        
+        # Binary confidence threshold: if max probability < 60%, return HOLD
+        # This helps reduce bias toward majority class
+        # Increased from 55% to 60% to be more aggressive in filtering uncertain predictions
+        binary_confidence_threshold = 0.60  # 60% minimum confidence for binary predictions
+        if is_binary_mode and maxp < binary_confidence_threshold:
+            logger.debug(f"Low confidence binary prediction ({maxp*100:.1f}% < {binary_confidence_threshold*100}%), returning HOLD")
+            return {
+                'action': 'HOLD',
+                'confidence': float(maxp * 100),
+                'reasoning': f'Low confidence prediction ({maxp*100:.1f}%) - avoiding biased prediction',
+                'probabilities': {'BUY': float(probabilities[classes.index('DOWN')] * 100) if 'DOWN' in classes else 0.0,
+                                 'SELL': float(probabilities[classes.index('UP')] * 100) if 'UP' in classes else 0.0,
+                                 'HOLD': 100.0 - float(maxp * 100)}
+            }
+        
         if hold_idx is not None and hold_threshold > 0.0 and maxp < hold_threshold:
             prediction = hold_idx
 
@@ -2397,7 +2464,34 @@ class StockPredictionML:
             logger.info(f"Successfully loaded {len(self.regime_models)} regime model(s) for {self.strategy}")
     
     def is_trained(self) -> bool:
-        """Check if model is trained and ready to use"""
+        """Check if model is trained and ready to use. Reloads model if files exist but model isn't loaded."""
+        # First, check if model files exist but model isn't loaded - try to reload
+        if self.model is None and len(self.regime_models) == 0:
+            # Check if regime model files exist
+            regimes = ['bull', 'bear', 'sideways']
+            regime_files_exist = False
+            for regime in regimes:
+                regime_model_file = f"ml_model_{self.strategy}_{regime}.pkl"
+                regime_scaler_file = f"scaler_{self.strategy}_{regime}.pkl"
+                regime_encoder_file = f"label_encoder_{self.strategy}_{regime}.pkl"
+                if (self.storage.model_exists(regime_model_file) and 
+                    self.storage.model_exists(regime_scaler_file) and
+                    self.storage.model_exists(regime_encoder_file)):
+                    regime_files_exist = True
+                    break
+            
+            # Check if single model files exist
+            single_model_exists = (self.storage.model_exists(self.model_file) and 
+                                  self.storage.model_exists(self.scaler_file))
+            
+            # If model files exist but model isn't loaded, try to reload
+            if regime_files_exist or single_model_exists:
+                logger.debug(f"Model files exist but model not loaded for {self.strategy}. Attempting to reload...")
+                try:
+                    self._load_model()
+                except Exception as e:
+                    logger.debug(f"Could not reload model: {e}")
+        
         # Check for regime models first
         if self.use_regime_models and len(self.regime_models) > 0:
             # At least one regime model should have a fitted label encoder
