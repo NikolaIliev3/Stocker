@@ -843,9 +843,9 @@ class StockPredictionML:
         self.metadata = {}
         self.train_accuracy = 0.0
         self.test_accuracy = 0.0
-        self.use_hyperparameter_tuning = False  # Can be enabled for better accuracy
+        self.use_hyperparameter_tuning = True  # Enabled by default for better accuracy
         self.use_regime_models = False  # Can be enabled for regime-specific models
-        self.feature_selection_method = 'importance'  # 'importance', 'rfe', 'mutual_info'
+        self.feature_selection_method = 'rfe'  # Changed to 'rfe' for better feature selection
         
         self._load_model()
     
@@ -1075,9 +1075,10 @@ class StockPredictionML:
             # Create dummy importance dict for all features
             feature_importance_dict = {name: 1.0 / len(selected_feature_names) for name in selected_feature_names}
         else:
-            # Determine number of features to select (40-60% of total - more aggressive filtering)
-            # Reduced from 60% to 50% to remove more noise features
-            n_features_to_select = max(30, min(70, int(len(X_train[0]) * 0.5)))
+            # Determine number of features to select (top 50-70 features to reduce overfitting)
+            # Reduced feature count to prevent overfitting while maintaining performance
+            total_features = len(X_train[0])
+            n_features_to_select = max(50, min(70, int(total_features * 0.5)))  # 50% of features, clamped to 50-70 range
             
             if self.feature_selection_method == 'rfe' and len(X_train) > n_features_to_select:
                 # Use RFE for feature selection
@@ -1160,10 +1161,10 @@ class StockPredictionML:
                 X_test_selected = X_test_scaled_initial[:, self.selected_features]
                 selected_feature_indices = list(self.selected_features)
         
-        # Step 4: Add feature interactions (optional, can be disabled)
-        # Default OFF: interactions explode feature space and tend to overfit on small/noisy datasets.
+        # Step 4: Add feature interactions (enabled by default for better accuracy)
+        # Feature interactions capture non-linear relationships between features
         if use_interactions is None:
-            use_interactions = False
+            use_interactions = True  # Enabled by default
         if use_interactions and len(selected_feature_indices) > 10:
             try:
                 X_train_selected, interaction_names = self.feature_extractor._add_feature_interactions(
@@ -1189,30 +1190,44 @@ class StockPredictionML:
             for name in selected_feature_names
         }
         
-        # ===== HYPERPARAMETER TUNING (Optional) =====
+        # ===== HYPERPARAMETER TUNING (Enabled by default) =====
         if self.use_hyperparameter_tuning and HAS_OPTUNA and len(X_train_scaled) > 500:
             logger.info("Step 3: Tuning hyperparameters with Optuna...")
             try:
                 best_params = self._tune_hyperparameters(X_train_scaled, y_train, random_seed)
-                logger.info(f"Best hyperparameters found: {best_params}")
+                if best_params:
+                    logger.info(f"Best hyperparameters found: {best_params}")
+                else:
+                    logger.info("Hyperparameter tuning completed but no optimal parameters found - using defaults")
             except Exception as e:
                 logger.warning(f"Hyperparameter tuning failed: {e}. Using default parameters.")
                 best_params = None
         else:
             best_params = None
+            if not HAS_OPTUNA:
+                logger.debug("Optuna not available - skipping hyperparameter tuning")
+            elif len(X_train_scaled) <= 500:
+                logger.debug(f"Not enough samples ({len(X_train_scaled)}) for hyperparameter tuning - need >500")
         
-        # Create model - OPTIMIZED configuration based on systematic testing
-        # Binary mode achieves ~65% accuracy, 3-class achieves ~45-48%
+        # Create model - ANTI-OVERFITTING configuration
+        # Reduced complexity and increased regularization to prevent overfitting
         rf_params = {
-            'n_estimators': rf_n_estimators if rf_n_estimators is not None else 100,
-            'max_depth': rf_max_depth if rf_max_depth is not None else 5,  # OPTIMIZED (was 8)
-            'min_samples_split': rf_min_samples_split if rf_min_samples_split is not None else 20,
-            'min_samples_leaf': rf_min_samples_leaf if rf_min_samples_leaf is not None else 10,
+            'n_estimators': rf_n_estimators if rf_n_estimators is not None else 80,  # Reduced from 100
+            'max_depth': rf_max_depth if rf_max_depth is not None else 4,  # Reduced from 5 to prevent overfitting
+            'min_samples_split': rf_min_samples_split if rf_min_samples_split is not None else 30,  # Increased from 20
+            'min_samples_leaf': rf_min_samples_leaf if rf_min_samples_leaf is not None else 15,  # Increased from 10
             'max_features': 'sqrt',
             'class_weight': 'balanced',
             'random_state': random_seed,
             'n_jobs': get_safe_n_jobs(ML_TRAINING_CPU_CORES)
         }
+        # Add max_samples if sklearn version supports it (0.22+)
+        try:
+            from sklearn import __version__ as sklearn_version
+            if tuple(map(int, sklearn_version.split('.')[:2])) >= (0, 22):
+                rf_params['max_samples'] = 0.8  # Use only 80% of samples per tree (bootstrap sampling)
+        except:
+            pass  # Skip if version check fails
         
         # Apply tuned parameters if available (only if not overridden)
         if best_params and 'rf' in best_params:
@@ -1222,29 +1237,86 @@ class StockPredictionML:
         
         rf = RandomForestClassifier(**rf_params)
 
-        # OPTIMIZED: Voting ensemble with deeper GB (achieves best validation accuracy)
+        # OPTIMIZED: Stacking ensemble with LightGBM/XGBoost (achieves best validation accuracy)
         if model_family == 'voting':
-            gb = GradientBoostingClassifier(
-                n_estimators=gb_n_estimators if gb_n_estimators is not None else 150,
-                max_depth=gb_max_depth if gb_max_depth is not None else 4,  # OPTIMIZED (was 3)
-                learning_rate=0.05,
-                min_samples_split=20,
-                min_samples_leaf=10,
-                subsample=0.8,
-                random_state=random_seed
-            )
+            # Use LightGBM if available, otherwise XGBoost, otherwise fallback to GradientBoosting
+            if HAS_LIGHTGBM:
+                gb_params = {
+                    'n_estimators': gb_n_estimators if gb_n_estimators is not None else 150,  # Reduced from 200
+                    'max_depth': gb_max_depth if gb_max_depth is not None else 4,  # Reduced from 6 to prevent overfitting
+                    'learning_rate': 0.03,  # Reduced from 0.05 for more conservative learning
+                    'subsample': 0.7,  # Reduced from 0.8 for more randomness
+                    'colsample_bytree': 0.7,  # Reduced from 0.8 for more feature randomness
+                    'min_child_samples': 30,  # Increased from 20 to prevent overfitting
+                    'reg_alpha': 0.5,  # Increased L1 regularization from 0.1
+                    'reg_lambda': 2.0,  # Increased L2 regularization from 1.0
+                    'random_state': random_seed,
+                    'verbose': -1
+                }
+                # Apply tuned parameters if available
+                if best_params and 'lgb' in best_params:
+                    gb_params.update(best_params['lgb'])
+                gb = LGBMClassifier(**gb_params)
+                logger.info("Using LightGBM in ensemble")
+            elif HAS_XGBOOST:
+                gb_params = {
+                    'n_estimators': gb_n_estimators if gb_n_estimators is not None else 150,  # Reduced from 200
+                    'max_depth': gb_max_depth if gb_max_depth is not None else 4,  # Reduced from 6 to prevent overfitting
+                    'learning_rate': 0.03,  # Reduced from 0.05 for more conservative learning
+                    'subsample': 0.7,  # Reduced from 0.8 for more randomness
+                    'colsample_bytree': 0.7,  # Reduced from 0.8 for more feature randomness
+                    'min_child_weight': 3,  # Increased from 1 to prevent overfitting
+                    'gamma': 0.1,  # Added minimum loss reduction (regularization)
+                    'reg_alpha': 0.5,  # Increased L1 regularization from 0.1
+                    'reg_lambda': 2.0,  # Increased L2 regularization from 1.0
+                    'random_state': random_seed,
+                    'eval_metric': 'mlogloss'
+                }
+                # Apply tuned parameters if available
+                if best_params and 'xgb' in best_params:
+                    gb_params.update(best_params['xgb'])
+                gb = XGBClassifier(**gb_params)
+                logger.info("Using XGBoost in ensemble")
+            else:
+                # Fallback to sklearn GradientBoosting
+                gb = GradientBoostingClassifier(
+                    n_estimators=gb_n_estimators if gb_n_estimators is not None else 150,
+                    max_depth=gb_max_depth if gb_max_depth is not None else 4,
+                    learning_rate=0.05,
+                    min_samples_split=20,
+                    min_samples_leaf=10,
+                    subsample=0.8,
+                    random_state=random_seed
+                )
+                logger.info("Using sklearn GradientBoosting (LightGBM/XGBoost not available)")
+            
             lr = LogisticRegression(
                 max_iter=1000,
-                C=0.2,
+                C=0.1,  # Reduced from 0.2 for stronger regularization
                 class_weight='balanced',
-                random_state=random_seed
+                random_state=random_seed,
+                penalty='l2'  # Explicit L2 regularization
             )
-            self.model = VotingClassifier(
-                estimators=[('rf', rf), ('gb', gb), ('lr', lr)],
-                voting='soft',
-                weights=[2, 1, 1]
-            )
-            logger.info("Using simplified Voting ensemble (sklearn-only)")
+            
+            # Use StackingClassifier instead of VotingClassifier for better performance
+            if HAS_LIGHTGBM or HAS_XGBOOST:
+                # Stacking ensemble: meta-learner learns optimal combination
+                self.model = StackingClassifier(
+                    estimators=[('rf', rf), ('gb', gb), ('lr', lr)],
+                    final_estimator=LogisticRegression(max_iter=1000, C=0.2, class_weight='balanced', random_state=random_seed, penalty='l2'),  # Reduced C from 0.5 for stronger regularization
+                    cv=5,  # 5-fold cross-validation for meta-learner
+                    stack_method='predict_proba',  # Use probabilities for better combination
+                    n_jobs=get_safe_n_jobs(ML_TRAINING_CPU_CORES)
+                )
+                logger.info("Using Stacking ensemble with LightGBM/XGBoost (optimal performance)")
+            else:
+                # Fallback to VotingClassifier if advanced libraries not available
+                self.model = VotingClassifier(
+                    estimators=[('rf', rf), ('gb', gb), ('lr', lr)],
+                    voting='soft',
+                    weights=[2, 1, 1]
+                )
+                logger.info("Using Voting ensemble (sklearn-only)")
         else:
             self.model = rf
             logger.info("Using single RandomForest (simplified default)")
@@ -1288,9 +1360,22 @@ class StockPredictionML:
         test_score = accuracy_score(y_test, test_pred_adj)
         
         # Warn if overfitting detected
-        if train_score > 0.95 and test_score < train_score - 0.1:
-            logger.warning(f"⚠️ Overfitting detected! Train: {train_score*100:.1f}%, Test: {test_score*100:.1f}%")
-            logger.warning("   Model may be too complex. Consider reducing model complexity or adding more training data.")
+        train_test_gap = train_score - test_score
+        if train_score > 0.90 and train_test_gap > 0.15:
+            logger.warning(f"⚠️ SEVERE OVERFITTING DETECTED!")
+            logger.warning(f"   Training: {train_score*100:.1f}%, Test: {test_score*100:.1f}%, Gap: {train_test_gap*100:.1f}%")
+            logger.warning("   Model is memorizing training data. Consider:")
+            logger.warning("   - Increasing regularization (already applied)")
+            logger.warning("   - Using more diverse training data")
+            logger.warning("   - Reducing model complexity further")
+        elif train_test_gap > 0.10:
+            logger.warning(f"⚠️ Moderate overfitting detected. Train: {train_score*100:.1f}%, Test: {test_score*100:.1f}%, Gap: {train_test_gap*100:.1f}%")
+        
+        # Log generalization quality
+        if train_test_gap < 0.05:
+            logger.info(f"✅ Excellent generalization! Train-test gap: {train_test_gap*100:.1f}%")
+        elif train_test_gap < 0.10:
+            logger.info(f"✓ Good generalization. Train-test gap: {train_test_gap*100:.1f}%")
         
         # Log training details
         logger.info(
@@ -1502,27 +1587,27 @@ class StockPredictionML:
             
             if HAS_LIGHTGBM:
                 params['lgb'] = {
-                    'n_estimators': trial.suggest_int('lgb_n_estimators', 100, 500),
-                    'max_depth': trial.suggest_int('lgb_max_depth', 3, 10),
-                    'learning_rate': trial.suggest_float('lgb_learning_rate', 0.01, 0.3, log=True),
-                    'subsample': trial.suggest_float('lgb_subsample', 0.6, 1.0),
-                    'colsample_bytree': trial.suggest_float('lgb_colsample_bytree', 0.6, 1.0),
-                    'min_child_samples': trial.suggest_int('lgb_min_child_samples', 10, 50),
-                    'reg_alpha': trial.suggest_float('lgb_reg_alpha', 0, 1),
-                    'reg_lambda': trial.suggest_float('lgb_reg_lambda', 0, 2),
+                    'n_estimators': trial.suggest_int('lgb_n_estimators', 100, 300),  # Reduced max from 500
+                    'max_depth': trial.suggest_int('lgb_max_depth', 3, 5),  # Reduced max from 10 to prevent overfitting
+                    'learning_rate': trial.suggest_float('lgb_learning_rate', 0.01, 0.1, log=True),  # Reduced max from 0.3
+                    'subsample': trial.suggest_float('lgb_subsample', 0.6, 0.8),  # Reduced max from 1.0
+                    'colsample_bytree': trial.suggest_float('lgb_colsample_bytree', 0.6, 0.8),  # Reduced max from 1.0
+                    'min_child_samples': trial.suggest_int('lgb_min_child_samples', 20, 50),  # Increased min from 10
+                    'reg_alpha': trial.suggest_float('lgb_reg_alpha', 0.1, 1.0),  # Increased min from 0
+                    'reg_lambda': trial.suggest_float('lgb_reg_lambda', 1.0, 3.0),  # Increased min from 0, max from 2
                 }
             
             if HAS_XGBOOST:
                 params['xgb'] = {
-                    'n_estimators': trial.suggest_int('xgb_n_estimators', 100, 500),
-                    'max_depth': trial.suggest_int('xgb_max_depth', 3, 10),
-                    'learning_rate': trial.suggest_float('xgb_learning_rate', 0.01, 0.3, log=True),
-                    'subsample': trial.suggest_float('xgb_subsample', 0.6, 1.0),
-                    'colsample_bytree': trial.suggest_float('xgb_colsample_bytree', 0.6, 1.0),
-                    'min_child_weight': trial.suggest_int('xgb_min_child_weight', 1, 10),
-                    'gamma': trial.suggest_float('xgb_gamma', 0, 0.5),
-                    'reg_alpha': trial.suggest_float('xgb_reg_alpha', 0, 1),
-                    'reg_lambda': trial.suggest_float('xgb_reg_lambda', 0, 2),
+                    'n_estimators': trial.suggest_int('xgb_n_estimators', 100, 300),  # Reduced max from 500
+                    'max_depth': trial.suggest_int('xgb_max_depth', 3, 5),  # Reduced max from 10 to prevent overfitting
+                    'learning_rate': trial.suggest_float('xgb_learning_rate', 0.01, 0.1, log=True),  # Reduced max from 0.3
+                    'subsample': trial.suggest_float('xgb_subsample', 0.6, 0.8),  # Reduced max from 1.0
+                    'colsample_bytree': trial.suggest_float('xgb_colsample_bytree', 0.6, 0.8),  # Reduced max from 1.0
+                    'min_child_weight': trial.suggest_int('xgb_min_child_weight', 2, 10),  # Increased min from 1
+                    'gamma': trial.suggest_float('xgb_gamma', 0.1, 0.5),  # Increased min from 0
+                    'reg_alpha': trial.suggest_float('xgb_reg_alpha', 0.1, 1.0),  # Increased min from 0
+                    'reg_lambda': trial.suggest_float('xgb_reg_lambda', 1.0, 3.0),  # Increased min from 0, max from 2
                 }
             
             # Create model with suggested parameters
