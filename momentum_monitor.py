@@ -422,10 +422,15 @@ class MomentumMonitor:
             if is_at_peak:
                 peak_signals += 1
                 reasoning_parts.append(f"Price reached 20-day peak at ${max_high:.2f}")
-            elif price_moved_from_peak and current_price < max_high * 0.95:
-                # Price was at peak recently and has moved down significantly (reversal detected)
+            elif price_moved_from_peak:
+                # Price was at peak recently and has moved down (reversal detected)
+                # This handles cases where we detect the peak after price has already started falling
                 peak_signals += 1
-                reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down")
+                price_decrease_pct = ((max_high - current_price) / max_high) * 100
+                if price_decrease_pct >= 5.0:
+                    reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down ({price_decrease_pct:.1f}% decline)")
+                else:
+                    reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down ({price_decrease_pct:.1f}% below peak)")
             
             # Check RSI for overbought (peak)
             rsi = indicators.get('rsi', 50)
@@ -478,10 +483,15 @@ class MomentumMonitor:
             if is_at_bottom:
                 bottom_signals += 1
                 reasoning_parts.append(f"Price reached 20-day bottom at ${min_low:.2f}")
-            elif price_moved_from_bottom and current_price > min_low * 1.05:
-                # Price was at bottom recently and has moved up significantly (reversal detected)
+            elif price_moved_from_bottom:
+                # Price was at bottom recently and has moved up (reversal detected)
+                # This handles cases where we detect the bottom after price has already started rising
                 bottom_signals += 1
-                reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up")
+                price_increase_pct = ((current_price - min_low) / min_low) * 100
+                if price_increase_pct >= 5.0:
+                    reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up ({price_increase_pct:.1f}% recovery)")
+                else:
+                    reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up ({price_increase_pct:.1f}% above bottom)")
             
             # Check RSI for oversold (bottom)
             if rsi <= 30:

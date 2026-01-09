@@ -1037,8 +1037,11 @@ class StockerApp:
         
         message += f"Confidence: {confidence:.1f}%\n\n"
         message += f"Reasoning:\n{reasoning}\n\n"
-        message += "⚠️ Price reached its highest point and is likely to reverse downward.\n"
-        message += "Consider taking profits or preparing for SELL signal.\n\n"
+        message += "⚠️ Price reached its highest point and is likely to reverse downward.\n\n"
+        message += "💰 SELL SIGNAL: Consider taking profits NOW!\n"
+        message += "   • Price may decline from here\n"
+        message += "   • Best time to exit positions\n"
+        message += "   • Lock in gains before reversal\n\n"
         message += "🧠 Data fed to Megamind for learning!"
         
         messagebox.showinfo(title, message)
