@@ -395,7 +395,8 @@ class MomentumMonitor:
             peak_detected = False
             bottom_detected = False
             confidence = 0.0
-            reasoning_parts = []
+            peak_reasoning_parts = []
+            bottom_reasoning_parts = []
             
             # 1. Detect actual local minima/maxima (price reversals)
             # Find the actual lowest/highest points in recent history
@@ -417,41 +418,43 @@ class MomentumMonitor:
             price_moved_from_bottom = current_price > min_low * 1.03  # Price is 3%+ above the low
             price_moved_from_peak = current_price < max_high * 0.97  # Price is 3%+ below the high
             
+            # Get indicators once
+            rsi = indicators.get('rsi', 50)
+            mfi = indicators.get('mfi', 50)
+            macd_diff = indicators.get('macd_diff', 0)
+            
             # Peak detection signals
             peak_signals = 0
             if is_at_peak:
                 peak_signals += 1
-                reasoning_parts.append(f"Price reached 20-day peak at ${max_high:.2f}")
+                peak_reasoning_parts.append(f"Price reached 20-day peak at ${max_high:.2f}")
             elif price_moved_from_peak:
                 # Price was at peak recently and has moved down (reversal detected)
                 # This handles cases where we detect the peak after price has already started falling
                 peak_signals += 1
                 price_decrease_pct = ((max_high - current_price) / max_high) * 100
                 if price_decrease_pct >= 5.0:
-                    reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down ({price_decrease_pct:.1f}% decline)")
+                    peak_reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down ({price_decrease_pct:.1f}% decline)")
                 else:
-                    reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down ({price_decrease_pct:.1f}% below peak)")
+                    peak_reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down ({price_decrease_pct:.1f}% below peak)")
             
             # Check RSI for overbought (peak)
-            rsi = indicators.get('rsi', 50)
             if rsi >= 70:
                 peak_signals += 2  # Strong signal
-                reasoning_parts.append(f"RSI overbought ({rsi:.1f})")
+                peak_reasoning_parts.append(f"RSI overbought ({rsi:.1f})")
             elif rsi >= 65:
                 peak_signals += 1
-                reasoning_parts.append(f"RSI approaching overbought ({rsi:.1f})")
+                peak_reasoning_parts.append(f"RSI approaching overbought ({rsi:.1f})")
             
             # Check MFI for overbought (peak)
-            mfi = indicators.get('mfi', 50)
             if mfi >= 80:
                 peak_signals += 2
-                reasoning_parts.append(f"MFI overbought ({mfi:.1f})")
+                peak_reasoning_parts.append(f"MFI overbought ({mfi:.1f})")
             elif mfi >= 75:
                 peak_signals += 1
-                reasoning_parts.append(f"MFI approaching overbought ({mfi:.1f})")
+                peak_reasoning_parts.append(f"MFI approaching overbought ({mfi:.1f})")
             
             # Check MACD divergence (price making higher highs, MACD making lower highs = peak)
-            macd_diff = indicators.get('macd_diff', 0)
             if len(recent_prices) >= 10:
                 recent_high_prices = recent_highs.tail(10)
                 if len(recent_high_prices) >= 5:
@@ -459,7 +462,7 @@ class MomentumMonitor:
                     # If price is rising but MACD is falling, bearish divergence (peak forming)
                     if price_trend and macd_diff < 0:
                         peak_signals += 2
-                        reasoning_parts.append("Bearish MACD divergence detected")
+                        peak_reasoning_parts.append("Bearish MACD divergence detected")
             
             # Bottom detection signals
             bottom_signals = 0
@@ -476,38 +479,38 @@ class MomentumMonitor:
                         if volume_ratio > 1.5:
                             if peak_signals > 0:
                                 peak_signals += 1
-                                reasoning_parts.append("High volume confirms peak")
+                                peak_reasoning_parts.append("High volume confirms peak")
                             if bottom_signals > 0:
                                 bottom_signals += 1
-                                reasoning_parts.append("High volume confirms bottom")
+                                bottom_reasoning_parts.append("High volume confirms bottom")
             if is_at_bottom:
                 bottom_signals += 1
-                reasoning_parts.append(f"Price reached 20-day bottom at ${min_low:.2f}")
+                bottom_reasoning_parts.append(f"Price reached 20-day bottom at ${min_low:.2f}")
             elif price_moved_from_bottom:
                 # Price was at bottom recently and has moved up (reversal detected)
                 # This handles cases where we detect the bottom after price has already started rising
                 bottom_signals += 1
                 price_increase_pct = ((current_price - min_low) / min_low) * 100
                 if price_increase_pct >= 5.0:
-                    reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up ({price_increase_pct:.1f}% recovery)")
+                    bottom_reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up ({price_increase_pct:.1f}% recovery)")
                 else:
-                    reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up ({price_increase_pct:.1f}% above bottom)")
+                    bottom_reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up ({price_increase_pct:.1f}% above bottom)")
             
             # Check RSI for oversold (bottom)
             if rsi <= 30:
                 bottom_signals += 2  # Strong signal
-                reasoning_parts.append(f"RSI oversold ({rsi:.1f})")
+                bottom_reasoning_parts.append(f"RSI oversold ({rsi:.1f})")
             elif rsi <= 35:
                 bottom_signals += 1
-                reasoning_parts.append(f"RSI approaching oversold ({rsi:.1f})")
+                bottom_reasoning_parts.append(f"RSI approaching oversold ({rsi:.1f})")
             
             # Check MFI for oversold (bottom)
             if mfi <= 20:
                 bottom_signals += 2
-                reasoning_parts.append(f"MFI oversold ({mfi:.1f})")
+                bottom_reasoning_parts.append(f"MFI oversold ({mfi:.1f})")
             elif mfi <= 25:
                 bottom_signals += 1
-                reasoning_parts.append(f"MFI approaching oversold ({mfi:.1f})")
+                bottom_reasoning_parts.append(f"MFI approaching oversold ({mfi:.1f})")
             
             # Check MACD divergence (price making lower lows, MACD making higher lows = bottom)
             if len(recent_prices) >= 10:
@@ -517,16 +520,94 @@ class MomentumMonitor:
                     # If price is falling but MACD is rising, bullish divergence (bottom forming)
                     if price_trend and macd_diff > 0:
                         bottom_signals += 2
-                        reasoning_parts.append("Bullish MACD divergence detected")
+                        bottom_reasoning_parts.append("Bullish MACD divergence detected")
             
             # Determine if peak/bottom detected (need at least 3 signals)
             peak_detected = peak_signals >= 3
             bottom_detected = bottom_signals >= 3
             
-            if peak_detected:
+            # FIX: Separate reasoning for peak vs bottom to avoid confusion
+            # If both are detected, prioritize the stronger signal
+            peak_reasoning_parts = []
+            bottom_reasoning_parts = []
+            
+            # Separate peak reasoning
+            if is_at_peak:
+                peak_reasoning_parts.append(f"Price reached 20-day peak at ${max_high:.2f}")
+            elif price_moved_from_peak:
+                price_decrease_pct = ((max_high - current_price) / max_high) * 100
+                if price_decrease_pct >= 5.0:
+                    peak_reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down ({price_decrease_pct:.1f}% decline)")
+                else:
+                    peak_reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down ({price_decrease_pct:.1f}% below peak)")
+            
+            if rsi >= 70:
+                peak_reasoning_parts.append(f"RSI overbought ({rsi:.1f})")
+            elif rsi >= 65:
+                peak_reasoning_parts.append(f"RSI approaching overbought ({rsi:.1f})")
+            
+            if mfi >= 80:
+                peak_reasoning_parts.append(f"MFI overbought ({mfi:.1f})")
+            elif mfi >= 75:
+                peak_reasoning_parts.append(f"MFI approaching overbought ({mfi:.1f})")
+            
+            if len(recent_prices) >= 10:
+                recent_high_prices = recent_highs.tail(10)
+                if len(recent_high_prices) >= 5:
+                    price_trend = recent_high_prices.iloc[-1] > recent_high_prices.iloc[-5]
+                    if price_trend and macd_diff < 0:
+                        peak_reasoning_parts.append("Bearish MACD divergence detected")
+            
+            # Separate bottom reasoning
+            if is_at_bottom:
+                bottom_reasoning_parts.append(f"Price reached 20-day bottom at ${min_low:.2f}")
+            elif price_moved_from_bottom:
+                price_increase_pct = ((current_price - min_low) / min_low) * 100
+                if price_increase_pct >= 5.0:
+                    bottom_reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up ({price_increase_pct:.1f}% recovery)")
+                else:
+                    bottom_reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up ({price_increase_pct:.1f}% above bottom)")
+            
+            if rsi <= 30:
+                bottom_reasoning_parts.append(f"RSI oversold ({rsi:.1f})")
+            elif rsi <= 35:
+                bottom_reasoning_parts.append(f"RSI approaching oversold ({rsi:.1f})")
+            
+            if mfi <= 20:
+                bottom_reasoning_parts.append(f"MFI oversold ({mfi:.1f})")
+            elif mfi <= 25:
+                bottom_reasoning_parts.append(f"MFI approaching oversold ({mfi:.1f})")
+            
+            if len(recent_prices) >= 10:
+                recent_low_prices = recent_lows.tail(10)
+                if len(recent_low_prices) >= 5:
+                    price_trend = recent_low_prices.iloc[-1] < recent_low_prices.iloc[-5]
+                    if price_trend and macd_diff > 0:
+                        bottom_reasoning_parts.append("Bullish MACD divergence detected")
+            
+            # Determine final reasoning based on what was detected
+            # If both detected, prioritize the stronger signal
+            if peak_detected and bottom_detected:
+                # Both detected - use the stronger signal
+                if peak_signals >= bottom_signals:
+                    final_reasoning = '; '.join(peak_reasoning_parts) if peak_reasoning_parts else 'Peak detected with multiple confirmations'
+                    confidence = min(90, 50 + (peak_signals * 10))
+                    # Only return peak detection
+                    bottom_detected = False
+                else:
+                    final_reasoning = '; '.join(bottom_reasoning_parts) if bottom_reasoning_parts else 'Bottom detected with multiple confirmations'
+                    confidence = min(90, 50 + (bottom_signals * 10))
+                    # Only return bottom detection
+                    peak_detected = False
+            elif peak_detected:
+                final_reasoning = '; '.join(peak_reasoning_parts) if peak_reasoning_parts else 'Peak detected with multiple confirmations'
                 confidence = min(90, 50 + (peak_signals * 10))
             elif bottom_detected:
+                final_reasoning = '; '.join(bottom_reasoning_parts) if bottom_reasoning_parts else 'Bottom detected with multiple confirmations'
                 confidence = min(90, 50 + (bottom_signals * 10))
+            else:
+                final_reasoning = 'No significant signals'
+                confidence = 0.0
             
             # Return the actual peak/bottom prices (the detected minimum/maximum)
             # These are the prices where reversal occurred, not necessarily current price
@@ -534,7 +615,7 @@ class MomentumMonitor:
                 'peak_detected': peak_detected,
                 'bottom_detected': bottom_detected,
                 'confidence': confidence,
-                'reasoning': '; '.join(reasoning_parts) if reasoning_parts else 'No significant signals',
+                'reasoning': final_reasoning,
                 'current_price': current_price,
                 'peak_price': max_high if peak_detected else None,  # The actual peak price detected
                 'bottom_price': min_low if bottom_detected else None,  # The actual bottom price detected
