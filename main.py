@@ -2827,9 +2827,9 @@ class StockerApp:
         """Clear ALL predictions (regular and trend change) - fresh start"""
         theme = self.theme_manager.get_theme()
         
-        # Count predictions
-        regular_count = len(self.predictions_tracker.get_active_predictions())
-        trend_count = len(self.trend_change_tracker.get_active_predictions())
+        # Count predictions - include ALL predictions (active, verified, expired)
+        regular_count = len(self.predictions_tracker.predictions)  # All regular predictions
+        trend_count = len(self.trend_change_tracker.predictions)  # All trend change predictions
         total_count = regular_count + trend_count
         
         if total_count == 0:
