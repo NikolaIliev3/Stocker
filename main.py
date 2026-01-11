@@ -236,8 +236,14 @@ class StockerApp:
         # Start periodic trend change verification
         self._start_trend_change_verification()
         
+        # Start periodic peak/bottom detection verification
+        self._start_peak_bottom_verification()
+        
         # Verify trend change predictions at startup (after a short delay)
         self.root.after(5000, self._verify_trend_changes_at_startup)
+        
+        # Verify peak/bottom detections at startup (after a short delay)
+        self.root.after(5000, self._verify_peak_bottom_detections_at_startup)
         
         # Schedule automatic training checks
         self._schedule_auto_training()
@@ -740,6 +746,180 @@ class StockerApp:
         thread.daemon = True
         thread.start()
     
+    def _verify_peak_bottom_detections_at_startup(self):
+        """Verify peak/bottom detections at startup"""
+        def verify_in_background():
+            try:
+                logger.info("Verifying peak/bottom detections at startup...")
+                verified_count = 0
+                
+                # Verify peak detections
+                pending_peaks = self.learning_tracker.get_pending_peak_verifications()
+                for detection in pending_peaks:
+                    try:
+                        symbol = detection.get('symbol')
+                        if not symbol:
+                            continue
+                        
+                        # Fetch current price
+                        stock_data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=False)
+                        if 'error' in stock_data:
+                            continue
+                        
+                        current_price = stock_data.get('price', 0)
+                        if current_price == 0:
+                            continue
+                        
+                        # Verify the detection
+                        verification_result = self.learning_tracker.verify_peak_detection(
+                            detection, current_price
+                        )
+                        
+                        # Record verified detection
+                        self.learning_tracker.record_verified_peak_detection(
+                            detection, verification_result
+                        )
+                        
+                        verified_count += 1
+                        logger.info(f"Verified peak detection for {symbol} at startup: {'correct' if verification_result.get('was_correct') else 'false positive'}")
+                    except Exception as e:
+                        logger.error(f"Error verifying peak detection for {detection.get('symbol', 'UNKNOWN')} at startup: {e}")
+                
+                # Verify bottom detections
+                pending_bottoms = self.learning_tracker.get_pending_bottom_verifications()
+                for detection in pending_bottoms:
+                    try:
+                        symbol = detection.get('symbol')
+                        if not symbol:
+                            continue
+                        
+                        # Fetch current price
+                        stock_data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=False)
+                        if 'error' in stock_data:
+                            continue
+                        
+                        current_price = stock_data.get('price', 0)
+                        if current_price == 0:
+                            continue
+                        
+                        # Verify the detection
+                        verification_result = self.learning_tracker.verify_bottom_detection(
+                            detection, current_price
+                        )
+                        
+                        # Record verified detection
+                        self.learning_tracker.record_verified_bottom_detection(
+                            detection, verification_result
+                        )
+                        
+                        verified_count += 1
+                        logger.info(f"Verified bottom detection for {symbol} at startup: {'correct' if verification_result.get('was_correct') else 'false positive'}")
+                    except Exception as e:
+                        logger.error(f"Error verifying bottom detection for {detection.get('symbol', 'UNKNOWN')} at startup: {e}")
+                
+                if verified_count > 0:
+                    logger.info(f"Verified {verified_count} peak/bottom detection(s) at startup")
+                    # Update ML status if needed
+                    self.root.after(0, self._update_ml_status)
+            except Exception as e:
+                logger.error(f"Error in startup peak/bottom verification: {e}")
+        
+        thread = threading.Thread(target=verify_in_background)
+        thread.daemon = True
+        thread.start()
+    
+    def _start_peak_bottom_verification(self):
+        """Start periodic automatic verification of peak/bottom detections"""
+        # Check every 12 hours (43200000 milliseconds)
+        check_interval_ms = 43200000  # 12 hours
+        
+        def periodic_check():
+            def verify_in_background():
+                try:
+                    logger.info("Periodic verification of peak/bottom detections...")
+                    verified_count = 0
+                    
+                    # Verify peak detections
+                    pending_peaks = self.learning_tracker.get_pending_peak_verifications()
+                    for detection in pending_peaks:
+                        try:
+                            symbol = detection.get('symbol')
+                            if not symbol:
+                                continue
+                            
+                            # Fetch current price
+                            stock_data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=False)
+                            if 'error' in stock_data:
+                                continue
+                            
+                            current_price = stock_data.get('price', 0)
+                            if current_price == 0:
+                                continue
+                            
+                            # Verify the detection
+                            verification_result = self.learning_tracker.verify_peak_detection(
+                                detection, current_price
+                            )
+                            
+                            # Record verified detection
+                            self.learning_tracker.record_verified_peak_detection(
+                                detection, verification_result
+                            )
+                            
+                            verified_count += 1
+                            logger.info(f"Verified peak detection for {symbol}: {'correct' if verification_result.get('was_correct') else 'false positive'}")
+                        except Exception as e:
+                            logger.error(f"Error verifying peak detection for {detection.get('symbol', 'UNKNOWN')}: {e}")
+                    
+                    # Verify bottom detections
+                    pending_bottoms = self.learning_tracker.get_pending_bottom_verifications()
+                    for detection in pending_bottoms:
+                        try:
+                            symbol = detection.get('symbol')
+                            if not symbol:
+                                continue
+                            
+                            # Fetch current price
+                            stock_data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=False)
+                            if 'error' in stock_data:
+                                continue
+                            
+                            current_price = stock_data.get('price', 0)
+                            if current_price == 0:
+                                continue
+                            
+                            # Verify the detection
+                            verification_result = self.learning_tracker.verify_bottom_detection(
+                                detection, current_price
+                            )
+                            
+                            # Record verified detection
+                            self.learning_tracker.record_verified_bottom_detection(
+                                detection, verification_result
+                            )
+                            
+                            verified_count += 1
+                            logger.info(f"Verified bottom detection for {symbol}: {'correct' if verification_result.get('was_correct') else 'false positive'}")
+                        except Exception as e:
+                            logger.error(f"Error verifying bottom detection for {detection.get('symbol', 'UNKNOWN')}: {e}")
+                    
+                    if verified_count > 0:
+                        logger.info(f"Verified {verified_count} peak/bottom detection(s) in periodic check")
+                        # Update ML status if needed
+                        self.root.after(0, self._update_ml_status)
+                except Exception as e:
+                    logger.error(f"Error in periodic peak/bottom verification: {e}")
+            
+            thread = threading.Thread(target=verify_in_background)
+            thread.daemon = True
+            thread.start()
+            
+            # Schedule next check
+            self.root.after(check_interval_ms, periodic_check)
+        
+        # Start first check after initial delay (12 hours)
+        self.root.after(check_interval_ms, periodic_check)
+    
     def _start_stock_monitoring(self):
         """Start periodic monitoring of stocks for BUY signals"""
         # Check every 30 minutes (1800000 milliseconds)
@@ -1024,28 +1204,46 @@ class StockerApp:
         title = "🔴 PEAK DETECTED - REVERSAL INCOMING"
         message = f"📈 {symbol} - Highest Price Reached\n\n"
         message += f"Time: {timestamp}\n"
-        message += f"Peak Price (Highest): ${peak_price:,.2f}\n"
+        message += f"Peak Price (Highest in 20 days): ${peak_price:,.2f}\n"
         message += f"Current Price: ${current_price:,.2f}\n"
         
-        if current_price < peak_price:
-            price_diff = peak_price - current_price
-            price_diff_pct = ((peak_price - current_price) / peak_price) * 100
+        # Calculate price difference
+        price_diff = peak_price - current_price
+        price_diff_pct = ((peak_price - current_price) / peak_price) * 100
+        
+        # Determine if reversal is confirmed or just detected
+        # Reversal is confirmed if price moved significantly away from peak (3%+)
+        reversal_confirmed = price_diff_pct >= 3.0
+        
+        if reversal_confirmed:
             message += f"Price Change: -${price_diff:.2f} ({price_diff_pct:.1f}% down from peak)\n"
-            message += f"\n🔄 REVERSAL CONFIRMED: Price has already started declining!\n\n"
+            message += f"\n🔄 REVERSAL CONFIRMED: Price has declined {price_diff_pct:.1f}% from peak!\n\n"
+        elif current_price < peak_price:
+            message += f"Price Change: -${price_diff:.2f} ({price_diff_pct:.1f}% below peak high)\n"
+            message += f"\n⚠️ PEAK DETECTED: Price reached ${peak_price:.2f} (highest in 20 days). "
+            message += f"Current price is {price_diff_pct:.1f}% below peak.\n"
+            message += f"⚠️ WARNING: If price continues rising above ${peak_price:.2f}, this was a false peak detection.\n\n"
         else:
-            message += f"\n⚠️ REVERSAL IMMINENT: Price at peak - expect downward movement!\n\n"
+            message += f"\n⚠️ REVERSAL IMMINENT: Price at/near peak - expect downward movement!\n\n"
         
         message += f"Confidence: {confidence:.1f}%\n\n"
         message += f"Reasoning:\n{reasoning}\n\n"
-        message += "⚠️ Price reached its highest point and is likely to reverse downward.\n\n"
-        message += "💰 SELL SIGNAL: Consider taking profits NOW!\n"
-        message += "   • Price may decline from here\n"
-        message += "   • Best time to exit positions\n"
-        message += "   • Lock in gains before reversal\n\n"
+        
+        if reversal_confirmed:
+            message += "⚠️ Price reached its highest point and has started reversing downward.\n\n"
+            message += "💰 SELL SIGNAL: Consider taking profits NOW!\n"
+            message += "   • Price has declined from peak\n"
+            message += "   • Best time to exit positions\n"
+            message += "   • Lock in gains before further decline\n\n"
+        else:
+            message += "⚠️ Peak detected based on indicators, but reversal not yet confirmed.\n"
+            message += "   • Monitor if price breaks above peak (false signal)\n"
+            message += "   • If price declines further, reversal will be confirmed\n\n"
+        
         message += "🧠 Data fed to Megamind for learning!"
         
         messagebox.showinfo(title, message)
-        logger.info(f"Peak notification shown for {symbol}: Peak ${peak_price:.2f}, Current ${current_price:.2f}")
+        logger.info(f"Peak notification shown for {symbol}: Peak ${peak_price:.2f}, Current ${current_price:.2f}, Reversal Confirmed: {reversal_confirmed}")
     
     def _show_bottom_notification(self, symbol: str, bottom_price: float, current_price: float, confidence: float, reasoning: str, timestamp: str):
         """Show notification when bottom is detected"""
@@ -2805,9 +3003,9 @@ class StockerApp:
                 confidence = peak_bottom_detection.get('confidence', 0)
                 reasoning = peak_bottom_detection.get('reasoning', '')
                 
-                # Feed to Megamind
+                # Feed to Megamind (with current price for tracking)
                 self.learning_tracker.record_peak_detection(
-                    symbol, peak_price, confidence, reasoning
+                    symbol, peak_price, confidence, reasoning, current_price
                 )
                 
                 # Show notification (pass both peak price and current price)
@@ -2827,9 +3025,9 @@ class StockerApp:
                 confidence = peak_bottom_detection.get('confidence', 0)
                 reasoning = peak_bottom_detection.get('reasoning', '')
                 
-                # Feed to Megamind
+                # Feed to Megamind (with current price for tracking)
                 self.learning_tracker.record_bottom_detection(
-                    symbol, bottom_price, confidence, reasoning
+                    symbol, bottom_price, confidence, reasoning, current_price
                 )
                 
                 # Show notification (pass both bottom price and current price)
@@ -2908,27 +3106,34 @@ class StockerApp:
         else:
             title = f"🔄 TREND CHANGE: {symbol}"
         
-        message = f"📊 TREND CHANGE DETECTED\n\n"
-        message += f"Stock: {symbol}\n"
+        message = f"📊 TECHNICAL UPDATE - {symbol}\n\n"
         message += f"Time: {timestamp}\n\n"
         
         if trend_change:
             message += f"📈 Trend Change: {trend_change}\n\n"
         
+        # Show momentum-based recommendation but clarify it's technical-only
         action_emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "🟡"
-        message += f"{action_emoji} New Recommendation: {action} (Confidence: {confidence}%)\n\n"
+        message += f"{action_emoji} Momentum Signal: {action} (Confidence: {confidence}%)\n"
+        message += f"⚠️ NOTE: This is a momentum-based signal. Check the Analysis tab for the comprehensive recommendation (ML + Technical + Fundamental).\n\n"
         
-        message += "Key Changes Detected:\n"
-        for change in change_list[:5]:
-            message += f"• {change}\n"
+        message += "Key Factors:\n"
+        reasons = recommendation.get('reasons', [])
+        if reasons:
+            for reason in reasons[:3]:
+                message += f"• {reason}\n"
+        else:
+            for change in change_list[:3]:
+                message += f"• {change}\n"
         
-        if len(change_list) > 5:
-            message += f"\n... and {len(change_list) - 5} more changes\n"
+        if len(change_list) > 3:
+            message += f"\n... and {len(change_list) - 3} more changes\n"
         
-        message += "\n🧠 Data fed to Megamind for learning!"
+        message += "\n💡 TIP: View the Analysis tab for the full recommendation that combines ML predictions, technical analysis, and fundamental factors."
+        message += "\n\n🧠 Data fed to Megamind for learning!"
         
         messagebox.showinfo(title, message)
-        logger.info(f"Trend change notification for {symbol} at {timestamp}: {action} ({confidence}%)")
+        logger.info(f"Trend change notification for {symbol} at {timestamp}: Momentum signal {action} ({confidence}%) - Note: May differ from main analysis")
     
     def _start_monitored_stocks_checking(self):
         """Start periodic checking of monitored stocks (every 5 minutes)"""
@@ -5031,6 +5236,62 @@ class StockerApp:
                     
                     logger.info(f"Converted HOLD to SELL for {symbol} based on overbought conditions")
         
+        # CRITICAL FIX: Check if BUY recommendation contradicts trend reversal predictions
+        # If trend predictions show price will drop first, convert BUY to HOLD or adjust entry
+        if action == 'BUY' and symbol:
+            trend_predictions = analysis.get('trend_predictions', [])
+            if trend_predictions:
+                bullish_predictions = [p for p in trend_predictions if p.get('predicted_change') == 'bullish_reversal']
+                
+                if bullish_predictions:
+                    # Get current market price (not entry price)
+                    current_market_price = 0
+                    if hasattr(self, 'current_data') and self.current_data and 'price' in self.current_data:
+                        current_market_price = self.current_data.get('price', 0)
+                    elif 'stock_data' in analysis and analysis['stock_data'].get('price'):
+                        current_market_price = analysis['stock_data'].get('price', 0)
+                    
+                    if current_market_price > 0:
+                        # Calculate predicted low from trend predictions
+                        best_pred = max(bullish_predictions, key=lambda p: p.get('confidence', 0))
+                        confidence_pred = best_pred.get('confidence', 50)
+                        
+                        # Calculate predicted drop (same logic as display)
+                        price_adjustment = self.trend_change_predictor.learned_adjustments.get('price_prediction_adjustment', 1.0)
+                        base_drop_pct = min(10, max(3, confidence_pred / 7))  # 3-10% drop before bounce
+                        estimated_drop_pct = base_drop_pct * price_adjustment
+                        predicted_low = current_market_price * (1 - estimated_drop_pct / 100)
+                        
+                        current_entry_price = recommendation.get('entry_price', current_market_price)
+                        
+                        # Check if predicted drop is significant (>5% below current price)
+                        drop_from_current = ((current_market_price - predicted_low) / current_market_price) * 100
+                        
+                        # If entry price is close to predicted low (already accounts for drop), that's fine
+                        # But if entry price is close to current price and predicted drop is significant, we have a problem
+                        entry_price_diff_from_current = abs(current_entry_price - current_market_price) / current_market_price * 100
+                        entry_price_diff_from_predicted = abs(current_entry_price - predicted_low) / current_market_price * 100
+                        
+                        # If entry is at current price but significant drop is predicted, convert to HOLD
+                        if drop_from_current > 5 and entry_price_diff_from_current < 3:
+                            # Entry price is at current price, but drop is predicted - convert to HOLD
+                            logger.warning(f"⚠️ BUY recommendation contradicts trend prediction: price predicted to drop {drop_from_current:.1f}% to ${predicted_low:.2f} before reversal. Converting BUY to HOLD.")
+                            action = 'HOLD'
+                            recommendation['action'] = 'HOLD'
+                            recommendation['confidence'] = max(confidence - 10, 40)  # Reduce confidence
+                            
+                            # Update reasoning to explain why
+                            original_reasoning = analysis.get('reasoning', '')
+                            analysis['reasoning'] = original_reasoning + f"\n\n⚠️ IMPORTANT: Trend reversal predictions indicate price is likely to drop to ${predicted_low:.2f} ({drop_from_current:.1f}% below current ${current_market_price:.2f}) before a bullish reversal. " + \
+                                f"Recommendation changed from BUY to HOLD - wait for entry near ${predicted_low:.2f} for optimal entry point."
+                        
+                        # If entry price is already set to predicted low (or close), that's correct - just verify
+                        elif entry_price_diff_from_predicted < 5 and drop_from_current > 3:
+                            # Entry price is correctly set to predicted low - add note to reasoning
+                            original_reasoning = analysis.get('reasoning', '')
+                            if 'optimal entry' not in original_reasoning.lower():
+                                analysis['reasoning'] = original_reasoning + f"\n\n✓ Entry price (${current_entry_price:.2f}) aligns with predicted low (${predicted_low:.2f}) - optimal entry point before reversal."
+        
         # Automatically save prediction if it's a BUY or SELL recommendation
         if action in ['BUY', 'SELL'] and symbol:
             entry_price = recommendation.get('entry_price', 0)
@@ -5165,6 +5426,13 @@ class StockerApp:
         
         header = f"{'='*60}\n"
         header += f"RECOMMENDATION: {action} (Confidence: {confidence}%)\n"
+        
+        # Add warning if HOLD was recommended due to predicted price drop
+        analysis_reasoning = analysis.get('reasoning', '')
+        if action == 'HOLD' and ('trend reversal predictions indicate price is likely to drop' in analysis_reasoning.lower() or 
+                                 'price predicted to drop' in analysis_reasoning.lower()):
+            header += f"   ⚠️ WAIT FOR BETTER ENTRY - Price drop predicted before reversal\n"
+        
         header += f"{'='*60}\n\n"
         
         # Display current market price in both USD and EUR
@@ -5185,6 +5453,16 @@ class StockerApp:
             entry_usd = f"${entry_price:,.2f}"
             entry_eur = f"€{self.localization.convert_from_usd(entry_price, 'EUR'):,.2f}"
             header += f"   Entry Price: {entry_usd} USD / {entry_eur} EUR\n"
+            
+            # Check if entry price differs significantly from current price (indicates "wait for entry")
+            if current_price_display and current_price_display > 0 and entry_price > 0:
+                price_diff_pct = abs(current_price_display - entry_price) / current_price_display * 100
+                if price_diff_pct > 5:  # Entry price is >5% different from current
+                    if entry_price < current_price_display:
+                        header += f"   ⚠️ WAIT FOR ENTRY: Entry price (${entry_price:.2f}) is {price_diff_pct:.1f}% below current price (${current_price_display:.2f})\n"
+                        header += f"      💡 Recommendation: Wait for price to drop to entry level before buying\n"
+                    else:
+                        header += f"   ⚠️ ENTRY ABOVE CURRENT: Entry price (${entry_price:.2f}) is {price_diff_pct:.1f}% above current price (${current_price_display:.2f})\n"
             # Format target price
             target_usd = f"${target_price:,.2f}"
             target_eur = f"€{self.localization.convert_from_usd(target_price, 'EUR'):,.2f}"

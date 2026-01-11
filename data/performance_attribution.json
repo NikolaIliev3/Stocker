@@ -1,0 +1,93 @@
+{
+  "by_strategy": {
+    "trading": {
+      "total": 30,
+      "correct": 20,
+      "incorrect": 10,
+      "accuracy": 66.66666666666666
+    },
+    "mixed": {
+      "total": 30,
+      "correct": 20,
+      "incorrect": 10,
+      "accuracy": 66.66666666666666
+    }
+  },
+  "by_regime": {
+    "bull": {
+      "total": 20,
+      "correct": 0,
+      "incorrect": 20,
+      "accuracy": 0.0
+    },
+    "bear": {
+      "total": 20,
+      "correct": 20,
+      "incorrect": 0,
+      "accuracy": 100.0
+    },
+    "sideways": {
+      "total": 20,
+      "correct": 20,
+      "incorrect": 0,
+      "accuracy": 100.0
+    }
+  },
+  "by_confidence": {
+    "50-70": {
+      "total": 40,
+      "correct": 26,
+      "incorrect": 14,
+      "accuracy": 65.0
+    },
+    "70-85": {
+      "total": 20,
+      "correct": 14,
+      "incorrect": 6,
+      "accuracy": 70.0
+    }
+  },
+  "by_sector": {
+    "Technology": {
+      "total": 30,
+      "correct": 20,
+      "incorrect": 10,
+      "accuracy": 66.66666666666666
+    },
+    "Finance": {
+      "total": 30,
+      "correct": 20,
+      "incorrect": 10,
+      "accuracy": 66.66666666666666
+    }
+  },
+  "by_action": {
+    "BUY": {
+      "total": 20,
+      "correct": 0,
+      "incorrect": 20,
+      "accuracy": 0.0
+    },
+    "SELL": {
+      "total": 20,
+      "correct": 20,
+      "incorrect": 0,
+      "accuracy": 100.0
+    },
+    "HOLD": {
+      "total": 20,
+      "correct": 20,
+      "incorrect": 0,
+      "accuracy": 100.0
+    }
+  },
+  "by_time_period": {
+    "2026-01": {
+      "total": 60,
+      "correct": 40,
+      "incorrect": 20,
+      "accuracy": 66.66666666666666
+    }
+  },
+  "last_updated": "2026-01-10T16:46:49.601438"
+}

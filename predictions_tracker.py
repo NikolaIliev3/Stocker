@@ -8,6 +8,20 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import logging
 
+# Import production monitor if available
+try:
+    from production_monitor import ProductionMonitor
+    HAS_MONITORING = True
+except ImportError:
+    HAS_MONITORING = False
+
+# Import performance attribution if available
+try:
+    from performance_attribution import PerformanceAttribution
+    HAS_ATTRIBUTION = True
+except ImportError:
+    HAS_ATTRIBUTION = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,6 +33,26 @@ class PredictionsTracker:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.predictions_file = self.data_dir / "predictions.json"
         self.predictions = []
+        
+        # Initialize production monitors for each strategy
+        self.production_monitors = {}
+        if HAS_MONITORING:
+            for strategy in ['trading', 'mixed', 'investing']:
+                try:
+                    self.production_monitors[strategy] = ProductionMonitor(data_dir, strategy)
+                except Exception as e:
+                    logger.warning(f"Could not initialize production monitor for {strategy}: {e}")
+        
+        # Initialize performance attribution
+        if HAS_ATTRIBUTION:
+            try:
+                self.performance_attribution = PerformanceAttribution(data_dir)
+            except Exception as e:
+                logger.warning(f"Could not initialize performance attribution: {e}")
+                self.performance_attribution = None
+        else:
+            self.performance_attribution = None
+        
         self.load()
     
     def load(self):
@@ -149,6 +183,36 @@ class PredictionsTracker:
         pred_date = datetime.fromisoformat(prediction['timestamp'])
         days_diff = (datetime.now() - pred_date).days
         prediction['days_to_target'] = days_diff
+        
+        # Record outcome in production monitor
+        strategy = prediction.get('strategy', 'trading')
+        if strategy in self.production_monitors:
+            try:
+                price_change = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+                self.production_monitors[strategy].record_outcome(
+                    symbol=prediction['symbol'],
+                    action=action,
+                    was_correct=was_correct,
+                    actual_price_change=price_change
+                )
+            except Exception as e:
+                logger.debug(f"Error recording outcome in production monitor: {e}")
+        
+        # Record outcome in performance attribution
+        if self.performance_attribution:
+            try:
+                outcome_dict = {
+                    'was_correct': was_correct,
+                    'actual_price_change': price_change if entry_price > 0 else 0
+                }
+                # Add market regime and sector if available
+                prediction_with_metadata = prediction.copy()
+                self.performance_attribution.record_prediction_outcome(
+                    prediction=prediction_with_metadata,
+                    outcome=outcome_dict
+                )
+            except Exception as e:
+                logger.debug(f"Error recording outcome in performance attribution: {e}")
         
         self.save()
         return prediction

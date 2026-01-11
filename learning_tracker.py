@@ -51,9 +51,12 @@ class LearningTracker:
                 'total_stocks_learned': 0,
                 'model_retrainings': 0,
                 'trend_change_accuracy': [],
+                'peak_bottom_accuracy': [],
                 'accuracy_improvements': []
             },
             'learning_history': [],
+            'pending_peak_verifications': [],  # Peak detections waiting to be verified
+            'pending_bottom_verifications': [],  # Bottom detections waiting to be verified
             'first_learning_date': None,
             'last_learning_date': None
         }
@@ -199,37 +202,103 @@ class LearningTracker:
         self.save()
         logger.info(f"✅ Learning: Trend change prediction verified ({'correct' if was_correct else 'incorrect'})")
     
-    def record_peak_detection(self, symbol: str, price: float, confidence: float, reasoning: str):
-        """Record a peak detection event for Megamind learning"""
+    def record_peak_detection(self, symbol: str, price: float, confidence: float, reasoning: str, current_price: float = None):
+        """Record a peak detection event for Megamind learning and add to pending verifications
+        
+        Args:
+            symbol: Stock symbol
+            price: Peak price detected
+            confidence: Detection confidence
+            reasoning: Detection reasoning
+            current_price: Current price when detection was made (for tracking)
+        """
         if not self.data['data_sources'].get('first_learning_date'):
             self.data['data_sources']['first_learning_date'] = datetime.now().isoformat()
         
+        # Ensure pending_peak_verifications exists
+        if 'pending_peak_verifications' not in self.data:
+            self.data['pending_peak_verifications'] = []
+        
         self.data['data_sources']['peak_detections'] = self.data['data_sources'].get('peak_detections', 0) + 1
         self._add_symbol(symbol)
+        
+        # Add to pending verifications (will be checked in 7-10 days)
+        detection_id = len(self.data['pending_peak_verifications']) + 1
+        verification_record = {
+            'id': detection_id,
+            'symbol': symbol.upper(),
+            'peak_price': price,
+            'current_price_at_detection': current_price or price,
+            'confidence': confidence,
+            'reasoning': reasoning,
+            'detection_date': datetime.now().isoformat(),
+            'verification_due_date': (datetime.now() + timedelta(days=7)).isoformat(),  # Verify after 7 days
+            'verified': False
+        }
+        self.data['pending_peak_verifications'].append(verification_record)
+        
+        # Keep only last 500 pending verifications
+        if len(self.data['pending_peak_verifications']) > 500:
+            self.data['pending_peak_verifications'] = self.data['pending_peak_verifications'][-500:]
+        
         self._add_learning_event('peak_detection', {
             'symbol': symbol,
             'price': price,
             'confidence': confidence,
-            'reasoning': reasoning
+            'reasoning': reasoning,
+            'verification_id': detection_id
         })
         self.save()
-        logger.info(f"🧠 Learning: Peak detection for {symbol} recorded (${price:.2f}, {confidence:.1f}% confidence)")
+        logger.info(f"🧠 Learning: Peak detection for {symbol} recorded (${price:.2f}, {confidence:.1f}% confidence) - will verify in 7 days")
     
-    def record_bottom_detection(self, symbol: str, price: float, confidence: float, reasoning: str):
-        """Record a bottom detection event for Megamind learning"""
+    def record_bottom_detection(self, symbol: str, price: float, confidence: float, reasoning: str, current_price: float = None):
+        """Record a bottom detection event for Megamind learning and add to pending verifications
+        
+        Args:
+            symbol: Stock symbol
+            price: Bottom price detected
+            confidence: Detection confidence
+            reasoning: Detection reasoning
+            current_price: Current price when detection was made (for tracking)
+        """
         if not self.data['data_sources'].get('first_learning_date'):
             self.data['data_sources']['first_learning_date'] = datetime.now().isoformat()
         
+        # Ensure pending_bottom_verifications exists
+        if 'pending_bottom_verifications' not in self.data:
+            self.data['pending_bottom_verifications'] = []
+        
         self.data['data_sources']['bottom_detections'] = self.data['data_sources'].get('bottom_detections', 0) + 1
         self._add_symbol(symbol)
+        
+        # Add to pending verifications (will be checked in 7-10 days)
+        detection_id = len(self.data['pending_bottom_verifications']) + 1
+        verification_record = {
+            'id': detection_id,
+            'symbol': symbol.upper(),
+            'bottom_price': price,
+            'current_price_at_detection': current_price or price,
+            'confidence': confidence,
+            'reasoning': reasoning,
+            'detection_date': datetime.now().isoformat(),
+            'verification_due_date': (datetime.now() + timedelta(days=7)).isoformat(),  # Verify after 7 days
+            'verified': False
+        }
+        self.data['pending_bottom_verifications'].append(verification_record)
+        
+        # Keep only last 500 pending verifications
+        if len(self.data['pending_bottom_verifications']) > 500:
+            self.data['pending_bottom_verifications'] = self.data['pending_bottom_verifications'][-500:]
+        
         self._add_learning_event('bottom_detection', {
             'symbol': symbol,
             'price': price,
             'confidence': confidence,
-            'reasoning': reasoning
+            'reasoning': reasoning,
+            'verification_id': detection_id
         })
         self.save()
-        logger.info(f"🧠 Learning: Bottom detection for {symbol} recorded (${price:.2f}, {confidence:.1f}% confidence)")
+        logger.info(f"🧠 Learning: Bottom detection for {symbol} recorded (${price:.2f}, {confidence:.1f}% confidence) - will verify in 7 days")
     
     def record_trend_change_detection(self, symbol: str, old_trend: str, new_trend: str, price: float, confidence: float):
         """Record a trend change detection event for Megamind learning"""
@@ -366,4 +435,299 @@ class LearningTracker:
                 pass
         
         return summary
+    
+    def verify_peak_detection(self, detection_record: Dict, current_price: float, current_date: datetime = None) -> Dict:
+        """Verify if a peak detection was correct by checking if price actually reversed
+        
+        Args:
+            detection_record: The peak detection record to verify
+            current_price: Current price of the stock
+            current_date: Current date (defaults to now)
+            
+        Returns:
+            Dict with verification results:
+            {
+                'was_correct': bool,
+                'reversal_confirmed': bool,  # Price actually declined from peak
+                'false_positive': bool,  # Price continued rising above peak
+                'peak_price': float,
+                'current_price': float,
+                'price_change_pct': float,
+                'verification_date': str
+            }
+        """
+        if current_date is None:
+            current_date = datetime.now()
+        
+        peak_price = detection_record.get('peak_price', 0)
+        if peak_price == 0:
+            return {'was_correct': False, 'error': 'Invalid peak price'}
+        
+        price_change_pct = ((current_price - peak_price) / peak_price) * 100
+        
+        # Peak detection is CORRECT if:
+        # 1. Price declined significantly from peak (3%+ decrease) OR
+        # 2. Price is at least 1.5% below peak (smaller threshold for confirmation)
+        reversal_confirmed = price_change_pct <= -1.5
+        
+        # Peak detection is FALSE POSITIVE if:
+        # Price exceeded the peak price by 2%+ (price continued rising)
+        false_positive = price_change_pct >= 2.0
+        
+        # Determine if detection was correct
+        was_correct = reversal_confirmed and not false_positive
+        
+        result = {
+            'was_correct': was_correct,
+            'reversal_confirmed': reversal_confirmed,
+            'false_positive': false_positive,
+            'peak_price': peak_price,
+            'current_price': current_price,
+            'price_change_pct': price_change_pct,
+            'verification_date': current_date.isoformat()
+        }
+        
+        return result
+    
+    def verify_bottom_detection(self, detection_record: Dict, current_price: float, current_date: datetime = None) -> Dict:
+        """Verify if a bottom detection was correct by checking if price actually reversed
+        
+        Args:
+            detection_record: The bottom detection record to verify
+            current_price: Current price of the stock
+            current_date: Current date (defaults to now)
+            
+        Returns:
+            Dict with verification results:
+            {
+                'was_correct': bool,
+                'reversal_confirmed': bool,  # Price actually rose from bottom
+                'false_positive': bool,  # Price continued falling below bottom
+                'bottom_price': float,
+                'current_price': float,
+                'price_change_pct': float,
+                'verification_date': str
+            }
+        """
+        if current_date is None:
+            current_date = datetime.now()
+        
+        bottom_price = detection_record.get('bottom_price', 0)
+        if bottom_price == 0:
+            return {'was_correct': False, 'error': 'Invalid bottom price'}
+        
+        price_change_pct = ((current_price - bottom_price) / bottom_price) * 100
+        
+        # Bottom detection is CORRECT if:
+        # 1. Price rose significantly from bottom (3%+ increase) OR
+        # 2. Price is at least 1.5% above bottom (smaller threshold for confirmation)
+        reversal_confirmed = price_change_pct >= 1.5
+        
+        # Bottom detection is FALSE POSITIVE if:
+        # Price fell below the bottom price by 2%+ (price continued falling)
+        false_positive = price_change_pct <= -2.0
+        
+        # Determine if detection was correct
+        was_correct = reversal_confirmed and not false_positive
+        
+        result = {
+            'was_correct': was_correct,
+            'reversal_confirmed': reversal_confirmed,
+            'false_positive': false_positive,
+            'bottom_price': bottom_price,
+            'current_price': current_price,
+            'price_change_pct': price_change_pct,
+            'verification_date': current_date.isoformat()
+        }
+        
+        return result
+    
+    def record_verified_peak_detection(self, detection_record: Dict, verification_result: Dict):
+        """Record a verified peak detection for learning"""
+        if 'peak_bottom_accuracy' not in self.data['knowledge']:
+            self.data['knowledge']['peak_bottom_accuracy'] = []
+        
+        was_correct = verification_result.get('was_correct', False)
+        confidence = detection_record.get('confidence', 0)
+        
+        self.data['knowledge']['peak_bottom_accuracy'].append({
+            'timestamp': verification_result.get('verification_date', datetime.now().isoformat()),
+            'type': 'peak',
+            'was_correct': was_correct,
+            'peak_price': verification_result.get('peak_price', 0),
+            'current_price': verification_result.get('current_price', 0),
+            'price_change_pct': verification_result.get('price_change_pct', 0),
+            'reversal_confirmed': verification_result.get('reversal_confirmed', False),
+            'false_positive': verification_result.get('false_positive', False),
+            'confidence': confidence,
+            'symbol': detection_record.get('symbol', '')
+        })
+        
+        if len(self.data['knowledge']['peak_bottom_accuracy']) > 1000:
+            self.data['knowledge']['peak_bottom_accuracy'] = self.data['knowledge']['peak_bottom_accuracy'][-1000:]
+        
+        if was_correct:
+            self.data['knowledge']['accuracy_improvements'].append({
+                'timestamp': datetime.now().isoformat(),
+                'type': 'correct_peak_detection',
+                'symbol': detection_record.get('symbol', ''),
+                'confidence': confidence
+            })
+        
+        detection_record['verified'] = True
+        detection_record['verification_result'] = verification_result
+        
+        self._add_learning_event('verified_peak_detection', {
+            'symbol': detection_record.get('symbol', ''),
+            'was_correct': was_correct,
+            'peak_price': verification_result.get('peak_price', 0),
+            'current_price': verification_result.get('current_price', 0),
+            'confidence': confidence
+        })
+        self.save()
+        
+        status = 'CORRECT' if was_correct else 'FALSE POSITIVE'
+        logger.info(f"Learning: Peak detection verified for {detection_record.get('symbol', '')} - {status}")
+    
+    def record_verified_bottom_detection(self, detection_record: Dict, verification_result: Dict):
+        """Record a verified bottom detection for learning"""
+        if 'peak_bottom_accuracy' not in self.data['knowledge']:
+            self.data['knowledge']['peak_bottom_accuracy'] = []
+        
+        was_correct = verification_result.get('was_correct', False)
+        confidence = detection_record.get('confidence', 0)
+        
+        self.data['knowledge']['peak_bottom_accuracy'].append({
+            'timestamp': verification_result.get('verification_date', datetime.now().isoformat()),
+            'type': 'bottom',
+            'was_correct': was_correct,
+            'bottom_price': verification_result.get('bottom_price', 0),
+            'current_price': verification_result.get('current_price', 0),
+            'price_change_pct': verification_result.get('price_change_pct', 0),
+            'reversal_confirmed': verification_result.get('reversal_confirmed', False),
+            'false_positive': verification_result.get('false_positive', False),
+            'confidence': confidence,
+            'symbol': detection_record.get('symbol', '')
+        })
+        
+        if len(self.data['knowledge']['peak_bottom_accuracy']) > 1000:
+            self.data['knowledge']['peak_bottom_accuracy'] = self.data['knowledge']['peak_bottom_accuracy'][-1000:]
+        
+        if was_correct:
+            self.data['knowledge']['accuracy_improvements'].append({
+                'timestamp': datetime.now().isoformat(),
+                'type': 'correct_bottom_detection',
+                'symbol': detection_record.get('symbol', ''),
+                'confidence': confidence
+            })
+        
+        detection_record['verified'] = True
+        detection_record['verification_result'] = verification_result
+        
+        self._add_learning_event('verified_bottom_detection', {
+            'symbol': detection_record.get('symbol', ''),
+            'was_correct': was_correct,
+            'bottom_price': verification_result.get('bottom_price', 0),
+            'current_price': verification_result.get('current_price', 0),
+            'confidence': confidence
+        })
+        self.save()
+        
+        status = 'CORRECT' if was_correct else 'FALSE POSITIVE'
+        logger.info(f"Learning: Bottom detection verified for {detection_record.get('symbol', '')} - {status}")
+    
+    def get_pending_peak_verifications(self, symbol: str = None) -> List[Dict]:
+        """Get pending peak detections that need verification"""
+        if 'pending_peak_verifications' not in self.data:
+            self.data['pending_peak_verifications'] = []
+        
+        pending = [d for d in self.data['pending_peak_verifications'] 
+                   if not d.get('verified', False)]
+        
+        if symbol:
+            pending = [d for d in pending if d.get('symbol', '').upper() == symbol.upper()]
+        
+        now = datetime.now()
+        ready_for_verification = []
+        for detection in pending:
+            try:
+                due_date_str = detection.get('verification_due_date')
+                if due_date_str:
+                    due_date = datetime.fromisoformat(due_date_str)
+                    if now >= due_date:
+                        ready_for_verification.append(detection)
+            except:
+                continue
+        
+        return ready_for_verification
+    
+    def get_pending_bottom_verifications(self, symbol: str = None) -> List[Dict]:
+        """Get pending bottom detections that need verification"""
+        if 'pending_bottom_verifications' not in self.data:
+            self.data['pending_bottom_verifications'] = []
+        
+        pending = [d for d in self.data['pending_bottom_verifications'] 
+                   if not d.get('verified', False)]
+        
+        if symbol:
+            pending = [d for d in pending if d.get('symbol', '').upper() == symbol.upper()]
+        
+        now = datetime.now()
+        ready_for_verification = []
+        for detection in pending:
+            try:
+                due_date_str = detection.get('verification_due_date')
+                if due_date_str:
+                    due_date = datetime.fromisoformat(due_date_str)
+                    if now >= due_date:
+                        ready_for_verification.append(detection)
+            except:
+                continue
+        
+        return ready_for_verification
+    
+    def get_peak_bottom_accuracy_stats(self) -> Dict:
+        """Get accuracy statistics for peak/bottom detections"""
+        if 'peak_bottom_accuracy' not in self.data['knowledge']:
+            return {
+                'total_peaks_verified': 0,
+                'correct_peaks': 0,
+                'false_positive_peaks': 0,
+                'peak_accuracy': 0.0,
+                'total_bottoms_verified': 0,
+                'correct_bottoms': 0,
+                'false_positive_bottoms': 0,
+                'bottom_accuracy': 0.0,
+                'overall_accuracy': 0.0
+            }
+        
+        peak_records = [r for r in self.data['knowledge']['peak_bottom_accuracy'] if r.get('type') == 'peak']
+        bottom_records = [r for r in self.data['knowledge']['peak_bottom_accuracy'] if r.get('type') == 'bottom']
+        
+        total_peaks = len(peak_records)
+        correct_peaks = sum(1 for r in peak_records if r.get('was_correct', False))
+        false_positive_peaks = sum(1 for r in peak_records if r.get('false_positive', False))
+        
+        total_bottoms = len(bottom_records)
+        correct_bottoms = sum(1 for r in bottom_records if r.get('was_correct', False))
+        false_positive_bottoms = sum(1 for r in bottom_records if r.get('false_positive', False))
+        
+        peak_accuracy = (correct_peaks / total_peaks * 100) if total_peaks > 0 else 0.0
+        bottom_accuracy = (correct_bottoms / total_bottoms * 100) if total_bottoms > 0 else 0.0
+        
+        total_verified = total_peaks + total_bottoms
+        total_correct = correct_peaks + correct_bottoms
+        overall_accuracy = (total_correct / total_verified * 100) if total_verified > 0 else 0.0
+        
+        return {
+            'total_peaks_verified': total_peaks,
+            'correct_peaks': correct_peaks,
+            'false_positive_peaks': false_positive_peaks,
+            'peak_accuracy': peak_accuracy,
+            'total_bottoms_verified': total_bottoms,
+            'correct_bottoms': correct_bottoms,
+            'false_positive_bottoms': false_positive_bottoms,
+            'bottom_accuracy': bottom_accuracy,
+            'overall_accuracy': overall_accuracy
+        }
 

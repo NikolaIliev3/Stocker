@@ -23,10 +23,27 @@ class MarketRegimeDetector:
         Returns:
             Dict with regime info: {'regime': 'bull'/'bear'/'sideways', 'strength': 0-100}
         """
-        if market_data.empty or len(market_data) < 50:
+        # Allow detection with less data (minimum 20 days instead of 50)
+        if market_data.empty or len(market_data) < 20:
             return {'regime': 'unknown', 'strength': 50}
         
-        prices = market_data['close'].values
+        # Handle both 'close' and 'Close' column names
+        if 'close' in market_data.columns:
+            prices = market_data['close'].values
+        elif 'Close' in market_data.columns:
+            prices = market_data['Close'].values
+        else:
+            # Try to find any price-like column
+            price_cols = [c for c in market_data.columns if 'close' in c.lower() or 'price' in c.lower()]
+            if price_cols:
+                prices = market_data[price_cols[0]].values
+            else:
+                # Use first numeric column as fallback
+                numeric_cols = market_data.select_dtypes(include=[np.number]).columns
+                if len(numeric_cols) > 0:
+                    prices = market_data[numeric_cols[0]].values
+                else:
+                    return {'regime': 'unknown', 'strength': 50}
         current_price = prices[-1]
         
         # Calculate moving averages
@@ -54,15 +71,53 @@ class MarketRegimeDetector:
             else:
                 trend_strength = 0.0
         
-        # Determine regime
-        if current_price > sma_50 > sma_200 and trend_strength > 0.1:
-            regime = 'bull'
-            strength = min(100, 50 + abs(trend_strength) * 10)
-        elif current_price < sma_50 < sma_200 and trend_strength < -0.1:
-            regime = 'bear'
-            strength = min(100, 50 + abs(trend_strength) * 10)
+        # Determine regime - relaxed thresholds for better classification
+        # Use trend_strength threshold of 0.02 (2%) instead of 0.1 (10%) for more realistic detection
+        # Also consider price position relative to moving averages more flexibly
+        
+        # Calculate price position relative to MAs
+        price_above_sma50 = current_price > sma_50
+        price_above_sma200 = current_price > sma_200
+        sma50_above_sma200 = sma_50 > sma_200
+        
+        # Bull market: Price above both MAs, SMA50 above SMA200, positive trend
+        is_bull_aligned = price_above_sma50 and price_above_sma200 and sma50_above_sma200
+        is_bull_trend = trend_strength > 0.005  # Further relaxed from 0.02 to 0.005 (0.5% avg daily return)
+        
+        # Bear market: Price below both MAs, SMA50 below SMA200, negative trend
+        is_bear_aligned = not price_above_sma50 and not price_above_sma200 and not sma50_above_sma200
+        is_bear_trend = trend_strength < -0.005  # Further relaxed from -0.02 to -0.005 (-0.5% avg daily return)
+        
+        # Determine regime with SIMPLIFIED and VERY relaxed criteria
+        # PRIMARY SIGNAL: Price position relative to SMA50 (this is the key decision point)
+        # SECONDARY SIGNAL: Trend strength reinforces the primary signal
+        # Goal: Classify as bull/bear more often, only use sideways for truly neutral cases
+        
+        # Primary classification: Price above SMA50 = Bull, Price below/equal SMA50 = Bear
+        # This ensures we ALWAYS get either bull or bear (never sideways) unless there's an error
+        
+        if price_above_sma50:
+            # Price is above SMA50 - classify as BULL
+            # Stronger if fully aligned and positive trend, but still bull even if not
+            if is_bull_aligned and is_bull_trend:
+                regime = 'bull'
+                strength = min(100, 50 + abs(trend_strength) * 20)
+            else:
+                regime = 'bull'  # Still bull, just moderate
+                strength = min(80, 40 + abs(trend_strength) * 15)
         else:
-            regime = 'sideways'
+            # Price is at or below SMA50 - classify as BEAR
+            # Stronger if fully aligned and negative trend, but still bear even if not
+            if is_bear_aligned and is_bear_trend:
+                regime = 'bear'
+                strength = min(100, 50 + abs(trend_strength) * 20)
+            else:
+                regime = 'bear'  # Still bear, just moderate
+                strength = min(80, 40 + abs(trend_strength) * 15)
+        
+        # Safety check: ensure we never return 'unknown' from this point (should be caught earlier)
+        if regime not in ['bull', 'bear', 'sideways']:
+            regime = 'sideways'  # Fallback safety
             strength = 50
         
         return {
