@@ -16,6 +16,15 @@ import threading
 from data_fetcher import StockDataFetcher
 from hybrid_predictor import HybridStockPredictor
 
+# Import benchmarking if available
+try:
+    from model_benchmarking import ModelBenchmarker
+    HAS_BENCHMARKING = True
+except ImportError:
+    HAS_BENCHMARKING = False
+    logger = logging.getLogger(__name__)
+    logger.debug("Model benchmarking not available")
+
 # Import walk-forward backtester if available
 try:
     from walk_forward_backtester import WalkForwardBacktester
@@ -68,6 +77,16 @@ class ContinuousBacktester:
                 self.walk_forward_backtester = None
         else:
             self.walk_forward_backtester = None
+        
+        # Initialize benchmarker
+        if HAS_BENCHMARKING:
+            try:
+                self.benchmarker = ModelBenchmarker(data_dir)
+            except Exception as e:
+                logger.warning(f"Could not initialize benchmarker: {e}")
+                self.benchmarker = None
+        else:
+            self.benchmarker = None
         
         # Popular stocks to test
         self.test_symbols = [
@@ -405,6 +424,45 @@ class ContinuousBacktester:
             # Learn from backtest results if we have enough data
             if new_tests > 0:
                 self._learn_from_backtest_results()
+                
+                # Calculate benchmarks
+                if self.benchmarker:
+                    try:
+                        # Get recent backtest results for benchmarking
+                        recent_results = self.results['test_details'][-100:] if len(self.results['test_details']) >= 20 else self.results['test_details']
+                        
+                        if len(recent_results) >= 20:
+                            predictions = [{
+                                'action': r.get('predicted_action', 'HOLD'),
+                                'strategy': r.get('strategy', 'trading'),
+                                'confidence': r.get('confidence', 50)
+                            } for r in recent_results]
+                            
+                            outcomes = [{
+                                'was_correct': r.get('was_correct', False),
+                                'actual_price_change': r.get('actual_change_pct', 0)
+                            } for r in recent_results]
+                            
+                            # Calculate baselines (pass strategy to check ML model configuration)
+                            baselines = self.benchmarker.calculate_baselines(predictions, outcomes, strategy='trading')
+                            
+                            # Compare each strategy
+                            for strategy in tested_strategies:
+                                if strategy in self.results['strategy_results']:
+                                    strategy_acc = self.results['strategy_results'][strategy].get('accuracy', 0)
+                                    comparisons = self.benchmarker.compare_to_baselines(strategy_acc, strategy)
+                                    
+                                    if comparisons:
+                                        vs_random = comparisons.get('vs_random', {})
+                                        diff = vs_random.get('difference', 0)
+                                        improvement = vs_random.get('improvement_pct', 0)
+                                        # Get actual random baseline from stored baselines
+                                        baselines = self.benchmarker.benchmark_data.get('baseline_performance', {})
+                                        random_baseline = baselines.get('random', {}).get('accuracy', 50)
+                                        logger.info(f"📊 Benchmarking ({strategy}): Model {strategy_acc:.1f}% vs Random {random_baseline:.1f}% "
+                                                   f"(diff: {diff:+.1f}pp, improvement: {improvement:+.1f}%)")
+                    except Exception as e:
+                        logger.debug(f"Error calculating benchmarks: {e}")
             
             # Update UI
             self.app.root.after(0, self._update_ui)

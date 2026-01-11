@@ -5,6 +5,9 @@ Trains ML models on historical stock data to improve predictions
 import pandas as pd
 import numpy as np
 import warnings
+import logging
+import sys
+import multiprocessing
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier, StackingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler, LabelEncoder, PolynomialFeatures
@@ -44,15 +47,52 @@ import json
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-import logging
 
 from secure_ml_storage import SecureMLStorage
+try:
+    from model_versioning import ModelVersionManager
+    HAS_VERSIONING = True
+except ImportError:
+    HAS_VERSIONING = False
+    logger = logging.getLogger(__name__)
+    logger.warning("Model versioning not available")
+
+try:
+    from production_monitor import ProductionMonitor
+    HAS_MONITORING = True
+except ImportError:
+    HAS_MONITORING = False
+    logger = logging.getLogger(__name__)
+    logger.warning("Production monitoring not available")
+
+try:
+    from model_explainability import ModelExplainer
+    HAS_EXPLAINABILITY = True
+except ImportError:
+    HAS_EXPLAINABILITY = False
+    logger = logging.getLogger(__name__)
+    logger.warning("Model explainability not available")
+
+try:
+    from training_data_validator import TrainingDataValidator
+    HAS_DATA_VALIDATION = True
+except ImportError:
+    HAS_DATA_VALIDATION = False
+    logger = logging.getLogger(__name__)
+    logger.warning("Training data validation not available")
+
+try:
+    from prediction_quality_scorer import PredictionQualityScorer
+    HAS_QUALITY_SCORER = True
+except ImportError:
+    HAS_QUALITY_SCORER = False
+    logger = logging.getLogger(__name__)
+    logger.warning("Prediction quality scorer not available")
+
 try:
     from config import ML_TRAINING_CPU_CORES, HYPERPARAMETER_TUNING_PARALLEL_TRIALS
 except ImportError:
     # Fallback if not in config
-    import multiprocessing
-    import sys
     # Windows-specific: limit to 4 cores to prevent deadlocks
     if sys.platform == 'win32':
         ML_TRAINING_CPU_CORES = min(4, multiprocessing.cpu_count())
@@ -61,9 +101,6 @@ except ImportError:
     HYPERPARAMETER_TUNING_PARALLEL_TRIALS = None
 
 # Helper function to safely get n_jobs value (Windows-specific fix)
-import sys
-import multiprocessing
-
 def get_safe_n_jobs(requested_cores):
     """Get safe n_jobs value, accounting for Windows deadlock issues"""
     if sys.platform == 'win32':
@@ -851,7 +888,40 @@ class StockPredictionML:
         self.feature_selection_method = 'rfe'  # Changed to 'rfe' for better feature selection
         self.regime_detector = None  # Will be initialized when needed
         
+        # Initialize version manager
+        if HAS_VERSIONING:
+            self.version_manager = ModelVersionManager(data_dir, strategy)
+        else:
+            self.version_manager = None
+        
+        # Initialize production monitor
+        if HAS_MONITORING:
+            self.production_monitor = ProductionMonitor(data_dir, strategy)
+        else:
+            self.production_monitor = None
+        
+        # Model explainer will be initialized after model is loaded
+        self.model_explainer = None
+        
+        # Initialize quality scorer
+        if HAS_QUALITY_SCORER:
+            self.quality_scorer = PredictionQualityScorer()
+        else:
+            self.quality_scorer = None
+        
         self._load_model()
+        
+        # Initialize explainer after model is loaded
+        if HAS_EXPLAINABILITY and self.model is not None:
+            try:
+                feature_names = self.feature_extractor.get_feature_names()
+                self.model_explainer = ModelExplainer(
+                    model=self.model,
+                    feature_names=feature_names,
+                    scaler=self.scaler
+                )
+            except Exception as e:
+                logger.debug(f"Could not initialize model explainer: {e}")
     
     def _load_model(self):
         """Load trained model if exists"""
@@ -1051,6 +1121,55 @@ class StockPredictionML:
         logger.info(f"  • HOLD confidence threshold: {hold_confidence_threshold}")
         logger.info(f"  • Binary classification: {use_binary_classification}")
         logger.info(f"  • SMOTE balancing: {use_smote}")
+        
+        # Validate training data before training
+        if HAS_DATA_VALIDATION:
+            try:
+                validator = TrainingDataValidator()
+                validation_report = validator.validate_training_samples(training_samples)
+                
+                if not validation_report['valid']:
+                    logger.error(f"❌ Training data validation failed:")
+                    for issue in validation_report['issues']:
+                        logger.error(f"   - {issue}")
+                    return {
+                        "error": "Training data validation failed",
+                        "validation_report": validation_report
+                    }
+                
+                if validation_report.get('warnings'):
+                    logger.warning(f"⚠️ Training data validation warnings:")
+                    for warning in validation_report['warnings']:
+                        logger.warning(f"   - {warning}")
+                
+                # Clean training samples if needed
+                if validation_report.get('missing_percentage', 0) > 0 or validation_report.get('outlier_percentage', 0) > 10:
+                    training_samples = validator.clean_training_samples(training_samples, validation_report)
+                    logger.info(f"Cleaned training samples: {len(training_samples)} samples after cleaning")
+                
+                logger.info(f"✅ Training data validation passed")
+            except Exception as e:
+                logger.warning(f"Training data validation error: {e}. Proceeding with training anyway.")
+        
+        # Create version backup before training (if versioning enabled)
+        version_number = None
+        if self.version_manager:
+            try:
+                # Get current metadata for backup
+                current_metadata = {}
+                if self.metadata_file.exists():
+                    try:
+                        with open(self.metadata_file, 'r') as f:
+                            current_metadata = json.load(f)
+                    except:
+                        pass
+                
+                version_number = self.version_manager.generate_version_number()
+                backup_created = self.version_manager.create_version_backup(version_number, current_metadata)
+                if backup_created:
+                    logger.info(f"📦 Created version backup: {version_number}")
+            except Exception as e:
+                logger.warning(f"Could not create version backup: {e}")
         
         # Prepare data
         X = np.array([s['features'] for s in training_samples])
@@ -1557,7 +1676,7 @@ class StockPredictionML:
         # Train (suppress feature name warnings)
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.utils.validation')
-            self.model.fit(X_train_scaled, y_train)
+        self.model.fit(X_train_scaled, y_train)
         
         # Evaluate
         # Key trick for noisy 3-class tasks: if the model isn't confident, predict HOLD.
@@ -1633,20 +1752,20 @@ class StockPredictionML:
 
             if rf_model is not None and hasattr(rf_model, 'feature_importances_'):
                 final_importances = rf_model.feature_importances_
-                selected_feature_names = [self.feature_extractor.get_feature_names()[idx]
-                                          for idx in self.selected_features]
-                final_importance_dict = dict(zip(selected_feature_names, final_importances))
-                for name in final_importance_dict:
-                    if name in self.feature_importance:
+            selected_feature_names = [self.feature_extractor.get_feature_names()[idx] 
+                                     for idx in self.selected_features]
+            final_importance_dict = dict(zip(selected_feature_names, final_importances))
+            for name in final_importance_dict:
+                if name in self.feature_importance:
                         self.feature_importance[name] = max(self.feature_importance[name], final_importance_dict[name])
-                    else:
-                        self.feature_importance[name] = final_importance_dict[name]
-
-                self.feature_importance = dict(sorted(
-                    self.feature_importance.items(),
-                    key=lambda x: x[1],
-                    reverse=True
-                )[:20])
+                else:
+                    self.feature_importance[name] = final_importance_dict[name]
+            
+            self.feature_importance = dict(sorted(
+                self.feature_importance.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:20])
         except Exception as e:
             logger.debug(f"Could not compute final feature importances: {e}")
         
@@ -1705,10 +1824,55 @@ class StockPredictionML:
             'use_binary_classification': use_binary_classification  # Store binary mode flag
         }
         
-        with open(self.metadata_file, 'w') as f:
-            json.dump(self.metadata, f, indent=2)
+        # Register new version and check if it should be activated
+        should_activate = True
+        if self.version_manager:
+            try:
+                # Generate version number if not already created
+                if not version_number:
+                    version_number = self.version_manager.generate_version_number()
+                
+                registered_version, should_activate = self.version_manager.register_new_version(
+                    metadata=self.metadata,
+                    test_accuracy=test_score,
+                    train_accuracy=train_score,
+                    cv_mean=cv_scores.mean() if len(cv_scores) > 0 else None
+                )
+                
+                if not should_activate:
+                    # New model is worse, rollback to previous version
+                    logger.warning(f"⚠️ New model performs worse than current. Rolling back...")
+                    current_version = self.version_manager.get_current_version()
+                    if current_version:
+                        rollback_success = self.version_manager.rollback_to_version(current_version.get('version'))
+                        if rollback_success:
+                            logger.info(f"✅ Rolled back to previous version {current_version.get('version')}")
+                            # Reload the previous model
+                            self._load_model()
+                            # Return previous metadata
+                            return self.metadata
+                        else:
+                            logger.error("❌ Rollback failed! New model may be active despite being worse.")
+                    else:
+                        logger.warning("⚠️ No previous version to rollback to. Keeping new model.")
+                else:
+                    logger.info(f"✅ New model version {registered_version} activated (accuracy: {test_score*100:.1f}%)")
+            except Exception as e:
+                logger.error(f"Error in version management: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
         
-        logger.info(f"Trained and saved ML model: {test_score*100:.1f}% accuracy")
+        # Only save if versioning says we should activate, or if versioning is disabled
+        if should_activate or not self.version_manager:
+            with open(self.metadata_file, 'w') as f:
+                json.dump(self.metadata, f, indent=2)
+
+            logger.info(f"Trained and saved ML model: {test_score*100:.1f}% accuracy")
+        else:
+            # Don't save if we rolled back
+            logger.info(f"Model training complete but not saved (rolled back to previous version)")
+            # Don't save if we rolled back
+            logger.info(f"Model training complete but not saved (rolled back to previous version)")
         
         return self.metadata
     
@@ -1749,51 +1913,194 @@ class StockPredictionML:
                             # Try multiple methods to fetch SPY data
                             hist = None
                             
-                            # Method 1: Direct yfinance
+                            # Method 1: Direct yfinance (without progress parameter for compatibility)
                             try:
                                 ticker = yf.Ticker('SPY')
-                                hist = ticker.history(start=start_date.strftime('%Y-%m-%d'), 
-                                                     end=end_date.strftime('%Y-%m-%d'),
-                                                     progress=False, show_errors=False)
-                                if hist.empty or len(hist) < 50:
+                                # Try with start/end dates first
+                                try:
+                                    hist = ticker.history(start=start_date.strftime('%Y-%m-%d'), 
+                                                         end=end_date.strftime('%Y-%m-%d'))
+                                except TypeError:
+                                    # Some yfinance versions don't support start/end
+                                    hist = ticker.history(period="1y")
+                                    if not hist.empty:
+                                        hist = hist[(hist.index >= start_date) & (hist.index <= end_date)]
+                                
+                                if hist.empty or len(hist) < 20:  # Relaxed from 50 to 20
                                     hist = None
-                            except Exception:
+                            except Exception as e1:
                                 hist = None
                             
-                            # Method 2: Try with period instead of dates
-                            if hist is None or hist.empty:
+                            # Method 2: Try with period and filter
+                            if hist is None or (isinstance(hist, pd.DataFrame) and hist.empty):
                                 try:
                                     ticker = yf.Ticker('SPY')
-                                    hist = ticker.history(period="1y", progress=False, show_errors=False)
+                                    hist = ticker.history(period="1y")
                                     if not hist.empty:
                                         # Filter to date range
                                         hist = hist[hist.index <= end_date]
-                                        if len(hist) < 50:
+                                        if len(hist) < 20:  # Relaxed from 50 to 20
                                             hist = None
-                                except Exception:
+                                except Exception as e2:
                                     hist = None
                             
-                            if hist is not None and not hist.empty and len(hist) >= 50:
+                            if hist is not None and not hist.empty and len(hist) >= 20:  # Relaxed from 50 to 20
+                                # Handle MultiIndex columns if present (normalize to simple columns)
+                                if isinstance(hist.columns, pd.MultiIndex):
+                                    # Extract Close column and flatten
+                                    if 'Close' in hist.columns.get_level_values(1):
+                                        hist = hist.xs('Close', level=1, axis=1).to_frame()
+                                        hist.columns = ['Close']
+                                    elif 'close' in hist.columns.get_level_values(1):
+                                        hist = hist.xs('close', level=1, axis=1).to_frame()
+                                        hist.columns = ['Close']
                                 spy_cache[sample_date] = hist
                             else:
                                 spy_cache[sample_date] = None
-                                logger.debug(f"Could not fetch sufficient SPY data for {sample_date} (got {len(hist) if hist is not None else 0} rows)")
+                                if i < 10:  # Log first 10 failures for debugging
+                                    logger.debug(f"Could not fetch sufficient SPY data for {sample_date} (got {len(hist) if hist is not None else 0} rows, need 20)")
                         except Exception as e:
                             logger.debug(f"Error fetching SPY data for {sample_date}: {e}")
                             spy_cache[sample_date] = None
                     
                     spy_data = spy_cache.get(sample_date)
-                    if spy_data is not None and not spy_data.empty and len(spy_data) >= 50:
+                    if spy_data is not None and not spy_data.empty and len(spy_data) >= 20:  # Relaxed from 50 to 20
                         try:
+                            # Handle MultiIndex columns from yfinance (e.g., ('SPY', 'Close'))
+                            spy_data_for_regime = spy_data.copy()
+                            
+                            # Check for MultiIndex columns
+                            if isinstance(spy_data_for_regime.columns, pd.MultiIndex):
+                                # Extract Close column from MultiIndex
+                                if 'Close' in spy_data_for_regime.columns.get_level_values(1):
+                                    spy_data_for_regime = spy_data_for_regime.xs('Close', level=1, axis=1).to_frame()
+                                    spy_data_for_regime.columns = ['close']
+                                elif 'close' in spy_data_for_regime.columns.get_level_values(1):
+                                    spy_data_for_regime = spy_data_for_regime.xs('close', level=1, axis=1).to_frame()
+                                    spy_data_for_regime.columns = ['close']
+                                else:
+                                    # Try to get first numeric column
+                                    numeric_cols = spy_data_for_regime.select_dtypes(include=[np.number])
+                                    if not numeric_cols.empty:
+                                        spy_data_for_regime = numeric_cols.iloc[:, [0]].copy()
+                                        spy_data_for_regime.columns = ['close']
+                                    else:
+                                        spy_data_for_regime = None
+                            else:
+                                # Normal columns - handle 'Close' or 'close'
+                                if 'Close' in spy_data_for_regime.columns:
+                                    spy_data_for_regime = spy_data_for_regime[['Close']].rename(columns={'Close': 'close'})
+                                elif 'close' in spy_data_for_regime.columns:
+                                    spy_data_for_regime = spy_data_for_regime[['close']].copy()
+                                else:
+                                    # Try to infer close column from numeric columns
+                                    numeric_cols = spy_data_for_regime.select_dtypes(include=[np.number])
+                                    if not numeric_cols.empty:
+                                        spy_data_for_regime = numeric_cols.iloc[:, [0]].copy()
+                                        spy_data_for_regime.columns = ['close']
+                                    else:
+                                        spy_data_for_regime = None
+                            
                             # Detect regime using SPY data
-                            regime_info = regime_detector.detect_regime(spy_data)
-                            regime = regime_info.get('regime', 'sideways')
+                            if spy_data_for_regime is not None and not spy_data_for_regime.empty and 'close' in spy_data_for_regime.columns:
+                                # Ensure we have enough data points
+                                if len(spy_data_for_regime) >= 20:
+                                    try:
+                                        regime_info = regime_detector.detect_regime(spy_data_for_regime)
+                                        regime = regime_info.get('regime', 'sideways')
+                                        if regime == 'unknown':
+                                            regime = 'sideways'
+                                        
+                                        # Log all detections for first 10 samples to debug
+                                        if i < 10:
+                                            logger.info(f"Sample {i+1}: Regime={regime}, trend={regime_info.get('trend_strength', 0):.4f}, price={spy_data_for_regime['close'].iloc[-1]:.2f}, sma50={regime_info.get('sma_50', 0):.2f}")
+                                        elif regime != 'sideways' and i % 500 == 0:
+                                            logger.info(f"Detected regime {regime} from SPY data for {sample_date} (sample {i+1}), trend_strength={regime_info.get('trend_strength', 0):.4f}")
+                                    except Exception as detect_e:
+                                        if i < 5:
+                                            logger.warning(f"Error in detect_regime for sample {i+1}: {detect_e}")
+                                        regime = 'sideways'
+                                else:
+                                    if i < 5:
+                                        logger.debug(f"SPY data has insufficient rows: {len(spy_data_for_regime)} (need 20)")
+                                    regime = 'sideways'
+                            else:
+                                if i < 5:
+                                    cols_list = list(spy_data.columns) if hasattr(spy_data, 'columns') else 'unknown'
+                                    if isinstance(cols_list, pd.MultiIndex):
+                                        cols_list = [str(c) for c in cols_list]
+                                    logger.debug(f"SPY data missing 'close' column for {sample_date} (sample {i+1}), columns={cols_list}, data_for_regime={spy_data_for_regime is not None}")
+                                regime = 'sideways'
                         except Exception as e:
-                            logger.debug(f"Error detecting regime from SPY data for {sample_date}: {e}")
+                            if i < 5:
+                                import traceback
+                                logger.warning(f"Error detecting regime from SPY data for {sample_date} (sample {i+1}): {e}\n{traceback.format_exc()}")
                             regime = 'sideways'
                     else:
-                        # Fallback: default to sideways
-                        regime = 'sideways'
+                        # Fallback: Use stock's own price data for regime detection if SPY unavailable
+                        sample_symbol = sample.get('symbol', '')
+                        if sample_symbol:
+                            # Try to fetch stock's own historical data for regime detection
+                            try:
+                                ticker = yf.Ticker(sample_symbol)
+                                # Fetch recent history (1 year) - remove progress parameter for compatibility
+                                stock_hist = ticker.history(period="1y")
+                                if not stock_hist.empty and len(stock_hist) >= 20:
+                                    # Filter to date range if sample_date available
+                                    if sample_date:
+                                        sample_datetime = pd.to_datetime(sample_date)
+                                        stock_hist = stock_hist[stock_hist.index <= sample_datetime]
+                                    
+                                    if len(stock_hist) >= 20:
+                                        # Handle MultiIndex columns from yfinance
+                                        stock_hist_for_regime = None
+                                        if isinstance(stock_hist.columns, pd.MultiIndex):
+                                            # Extract Close column from MultiIndex
+                                            if 'Close' in stock_hist.columns.get_level_values(1):
+                                                stock_hist_for_regime = stock_hist.xs('Close', level=1, axis=1).to_frame()
+                                                stock_hist_for_regime.columns = ['close']
+                                            elif 'close' in stock_hist.columns.get_level_values(1):
+                                                stock_hist_for_regime = stock_hist.xs('close', level=1, axis=1).to_frame()
+                                                stock_hist_for_regime.columns = ['close']
+                                        elif 'Close' in stock_hist.columns:
+                                            stock_hist_for_regime = stock_hist[['Close']].rename(columns={'Close': 'close'})
+                                        elif 'close' in stock_hist.columns:
+                                            stock_hist_for_regime = stock_hist[['close']].copy()
+                                        
+                                        if stock_hist_for_regime is not None and not stock_hist_for_regime.empty and 'close' in stock_hist_for_regime.columns:
+                                            if len(stock_hist_for_regime) >= 20:
+                                                try:
+                                                    regime_info = regime_detector.detect_regime(stock_hist_for_regime)
+                                                    regime = regime_info.get('regime', 'sideways')
+                                                    if regime == 'unknown':
+                                                        regime = 'sideways'
+                                                    
+                                                    # Log all detections for first 10 samples to debug
+                                                    if i < 10:
+                                                        logger.info(f"Sample {i+1} ({sample_symbol}): Regime={regime}, trend={regime_info.get('trend_strength', 0):.4f}, price={stock_hist_for_regime['close'].iloc[-1]:.2f}, sma50={regime_info.get('sma_50', 0):.2f}")
+                                                    elif regime != 'sideways' and i % 500 == 0:
+                                                        logger.info(f"Used {sample_symbol}'s own data for regime detection: {regime} (sample {i+1}), trend_strength={regime_info.get('trend_strength', 0):.4f}")
+                                                except Exception as detect_e:
+                                                    if i < 5:
+                                                        logger.warning(f"Error in detect_regime for {sample_symbol} (sample {i+1}): {detect_e}")
+                                                    regime = 'sideways'
+                                            else:
+                                                regime = 'sideways'
+                                        else:
+                                            if i < 5:
+                                                logger.debug(f"{sample_symbol} stock data format issue: hist_for_regime={stock_hist_for_regime is not None}, empty={stock_hist_for_regime.empty if stock_hist_for_regime is not None else 'N/A'}, has_close={'close' in stock_hist_for_regime.columns if stock_hist_for_regime is not None else False}")
+                                            regime = 'sideways'
+                                    else:
+                                        regime = 'sideways'
+                                else:
+                                    regime = 'sideways'
+                            except Exception as e:
+                                if i < 5:
+                                    logger.debug(f"Could not fetch {sample_symbol} data for regime detection (sample {i+1}): {e}")
+                                regime = 'sideways'
+                        else:
+                            # Last resort: default to sideways
+                            regime = 'sideways'
                 else:
                     regime = 'sideways'  # Default if no date
             except Exception as e:
@@ -1812,7 +2119,8 @@ class StockPredictionML:
         logger.info(f"Regime distribution: {dict(regime_counts)}")
         
         # Check if we have enough samples for each regime
-        min_samples_per_regime = 100  # Minimum samples needed per regime
+        # Lowered from 100 to 50 to allow training with smaller datasets
+        min_samples_per_regime = 50  # Minimum samples needed per regime (relaxed from 100)
         regimes_to_train = []
         for regime in ['bull', 'bear', 'sideways']:
             count = regime_counts.get(regime, 0)
@@ -2173,8 +2481,8 @@ class StockPredictionML:
         # Predict (suppress feature name warnings - they're harmless)
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.utils.validation')
-            prediction = self.model.predict(features_scaled)[0]
-            probabilities = self.model.predict_proba(features_scaled)[0]
+        prediction = self.model.predict(features_scaled)[0]
+        probabilities = self.model.predict_proba(features_scaled)[0]
         
         # Optional: low-confidence -> HOLD (stored in metadata after training)
         hold_threshold = 0.0
@@ -2209,7 +2517,7 @@ class StockPredictionML:
         
         if hold_idx is not None and hold_threshold > 0.0 and maxp < hold_threshold:
             prediction = hold_idx
-
+        
         # Decode label
         action = self.label_encoder.inverse_transform([prediction])[0]
         original_action = action  # Store for logging
@@ -2256,11 +2564,60 @@ class StockPredictionML:
         if 'HOLD' not in prob_dict:
             prob_dict['HOLD'] = 0.0
         
-        return {
+        # Record prediction in production monitor
+        if hasattr(self, 'production_monitor') and self.production_monitor:
+            try:
+                symbol = stock_data.get('symbol', 'UNKNOWN') if stock_data else 'UNKNOWN'
+                self.production_monitor.record_prediction(
+                    symbol=symbol,
+                    action=action,
+                    confidence=confidence,
+                    features=features_scaled[0] if len(features_scaled) > 0 else None,
+                    metadata={'strategy': self.strategy, 'probabilities': prob_dict}
+                )
+            except Exception as e:
+                logger.debug(f"Error recording prediction in production monitor: {e}")
+        
+        # Generate explanation if explainer is available
+        explanation = None
+        if hasattr(self, 'model_explainer') and self.model_explainer:
+            try:
+                explanation = self.model_explainer.explain_prediction(
+                    features=features_scaled[0] if len(features_scaled) > 0 else features[0],
+                    prediction={'action': action, 'confidence': confidence, 'probabilities': prob_dict}
+                )
+            except Exception as e:
+                logger.debug(f"Error generating explanation: {e}")
+        
+        result = {
             'action': action,
             'confidence': confidence,
             'probabilities': prob_dict
         }
+        
+        # Add explanation if available
+        if explanation and explanation.get('has_explanation'):
+            result['explanation'] = explanation
+        
+        # Score prediction quality
+        if hasattr(self, 'quality_scorer') and self.quality_scorer:
+            try:
+                quality_score = self.quality_scorer.score_prediction(
+                    prediction=result,
+                    features=features_scaled[0] if len(features_scaled) > 0 else features[0]
+                )
+                result['quality_score'] = quality_score
+                
+                # Flag if quality is very low
+                if quality_score.get('should_flag', False):
+                    result['flagged'] = True
+                    result['flag_reason'] = 'Low quality prediction detected'
+                    logger.warning(f"⚠️ Low quality prediction flagged: {quality_score.get('quality_level')} "
+                                 f"(score: {quality_score.get('quality_score', 0):.2f})")
+            except Exception as e:
+                logger.debug(f"Error scoring prediction quality: {e}")
+        
+        return result
     
     def _tune_hyperparameters(self, X_train: np.ndarray, y_train: np.ndarray, random_seed: int) -> Dict:
         """Tune hyperparameters using Optuna"""
@@ -2375,6 +2732,23 @@ class StockPredictionML:
                     regime_ml.feature_importance = {}
                     regime_ml.use_hyperparameter_tuning = False
                     regime_ml.feature_selection_method = 'importance'
+                    
+                    # Initialize production monitor (same as main model)
+                    if HAS_MONITORING:
+                        regime_ml.production_monitor = ProductionMonitor(self.data_dir, f"{self.strategy}_{regime}")
+                    else:
+                        regime_ml.production_monitor = None
+                    
+                    # Initialize other optional components
+                    regime_ml.model_explainer = None
+                    if HAS_QUALITY_SCORER:
+                        from prediction_quality_scorer import PredictionQualityScorer
+                        regime_ml.quality_scorer = PredictionQualityScorer()
+                    else:
+                        regime_ml.quality_scorer = None
+                    
+                    # Initialize version manager (optional, regime models don't need versioning)
+                    regime_ml.version_manager = None
                     
                     # Load the actual model components
                     regime_ml.model = self.storage.load_model(regime_model_file)
