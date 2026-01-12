@@ -28,6 +28,7 @@ from mixed_analyzer import MixedAnalyzer
 from chart_generator import ChartGenerator
 from portfolio import Portfolio
 from predictions_tracker import PredictionsTracker
+from model_benchmarking import ModelBenchmarker
 from ui_themes import ThemeManager
 from modern_ui import ModernCard, ModernButton, GradientLabel, ModernScrollbar
 from localization import Localization
@@ -117,6 +118,7 @@ class StockerApp:
         self.mixed_analyzer = MixedAnalyzer()
         self.chart_generator = ChartGenerator()
         self.portfolio = Portfolio(APP_DATA_DIR)
+        self.model_benchmarker = ModelBenchmarker(APP_DATA_DIR, data_fetcher=self.data_fetcher)  # S&P 500 comparison
         self.predictions_tracker = PredictionsTracker(APP_DATA_DIR)
         self.theme_manager = ThemeManager()
         self.preferences = UserPreferences(APP_DATA_DIR)
@@ -274,6 +276,9 @@ class StockerApp:
         
         # Start periodic checking of monitored stocks for peaks/bottoms/trend changes
         self.root.after(120000, self._start_monitored_stocks_checking)  # Start after 2 minutes
+        
+        # Start periodic portfolio snapshot updates (daily)
+        self._schedule_portfolio_snapshots()
         
         # Handle cleanup on window close
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
@@ -1843,7 +1848,13 @@ class StockerApp:
         self.stats_label = tk.Label(self.portfolio_card.content_frame, 
                                    text=f"{self.localization.t('wins')}: 0 | {self.localization.t('losses')}: 0", bg=theme['card_bg'],
                                    fg=theme['text_secondary'], font=('Segoe UI', 10))
-        self.stats_label.pack(anchor=tk.W, pady=(0, 15))
+        self.stats_label.pack(anchor=tk.W, pady=(0, 10))
+        
+        # S&P 500 Comparison Label
+        self.sp500_label = tk.Label(self.portfolio_card.content_frame, 
+                                   text="S&P 500: Loading...", bg=theme['card_bg'],
+                                   fg=theme['text_secondary'], font=('Segoe UI', 9))
+        self.sp500_label.pack(anchor=tk.W, pady=(0, 15))
         
         self.set_balance_btn = ModernButton(self.portfolio_card.content_frame, self.localization.t('set_balance'), 
                     command=self._set_balance, theme=theme)
@@ -6381,6 +6392,110 @@ By using this application, you acknowledge that you understand and accept these 
         self.stats_label.config(text=f"{self.localization.t('wins')}: {stats['wins']} | {self.localization.t('losses')}: {stats['losses']} | "
                                      f"{self.localization.t('win_rate')}: {stats['win_rate']:.1f}%",
                                fg=theme['text_secondary'])
+        
+        # Update S&P 500 comparison (in background to avoid blocking UI)
+        self._update_sp500_comparison()
+    
+    def _schedule_portfolio_snapshots(self):
+        """Schedule daily portfolio snapshot updates (at midnight)"""
+        from datetime import datetime, timedelta
+        
+        def schedule_next_snapshot():
+            now = datetime.now()
+            # Calculate milliseconds until next midnight
+            tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            ms_until_midnight = int((tomorrow - now).total_seconds() * 1000)
+            
+            # Schedule snapshot update at midnight
+            self.root.after(ms_until_midnight, lambda: self._take_portfolio_snapshot())
+        
+        # Take initial snapshot if needed
+        snapshots = self.portfolio.get_portfolio_history()
+        if not snapshots:
+            self.portfolio.update_snapshot()
+        
+        # Schedule first snapshot update
+        schedule_next_snapshot()
+        
+        # After each snapshot, schedule the next one
+        def _take_and_schedule():
+            self.portfolio.update_snapshot()
+            schedule_next_snapshot()
+            # Update S&P 500 comparison after snapshot
+            self._update_sp500_comparison()
+        
+        # Store method for scheduling
+        self._take_portfolio_snapshot = _take_and_schedule
+        
+        # Start scheduling (first check after 1 hour, then daily)
+        self.root.after(3600000, schedule_next_snapshot)  # Check after 1 hour
+    
+    def _update_sp500_comparison(self):
+        """Update S&P 500 comparison display (runs in background)"""
+        def update_in_background():
+            try:
+                # Get portfolio snapshots
+                snapshots = self.portfolio.get_portfolio_history()
+                
+                if not snapshots or len(snapshots) < 2:
+                    # Not enough data yet
+                    self.root.after(0, lambda: self.sp500_label.config(
+                        text="S&P 500: Need more data",
+                        fg=self.theme_manager.get_theme()['text_secondary']
+                    ))
+                    return
+                
+                # Compare to S&P 500
+                initial_balance = self.portfolio.initial_balance
+                comparison = self.model_benchmarker.compare_portfolio_to_sp500(snapshots, initial_balance)
+                
+                # Update UI on main thread
+                def update_ui():
+                    theme = self.theme_manager.get_theme()
+                    if 'error' in comparison:
+                        self.sp500_label.config(
+                            text=f"S&P 500: {comparison.get('error', 'Error')}",
+                            fg=theme['text_secondary']
+                        )
+                    elif comparison.get('comparison_available', False):
+                        portfolio_return = comparison['portfolio']['return_pct']
+                        sp500_return = comparison['sp500']['return_pct']
+                        outperformance = comparison['comparison']['outperformance_pct']
+                        
+                        # Format text with color coding
+                        if outperformance > 0:
+                            color = '#4CAF50'  # Green for outperforming
+                            icon = "📈"
+                        elif outperformance < 0:
+                            color = '#F44336'  # Red for underperforming
+                            icon = "📉"
+                        else:
+                            color = theme['text_secondary']
+                            icon = "➡️"
+                        
+                        text = f"{icon} Portfolio: {portfolio_return:+.1f}% | S&P 500: {sp500_return:+.1f}%"
+                        if abs(outperformance) > 0.1:  # Only show if significant difference
+                            text += f" ({outperformance:+.1f}%)"
+                        
+                        self.sp500_label.config(text=text, fg=color)
+                    else:
+                        self.sp500_label.config(
+                            text="S&P 500: Calculating...",
+                            fg=theme['text_secondary']
+                        )
+                
+                self.root.after(0, update_ui)
+                
+            except Exception as e:
+                logger.error(f"Error updating S&P 500 comparison: {e}")
+                self.root.after(0, lambda: self.sp500_label.config(
+                    text="S&P 500: Error",
+                    fg=self.theme_manager.get_theme()['text_secondary']
+                ))
+        
+        # Run in background thread to avoid blocking UI
+        thread = threading.Thread(target=update_in_background, daemon=True)
+        thread.start()
     
     def _close_app(self):
         """Close the application"""

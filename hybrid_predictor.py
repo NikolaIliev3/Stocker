@@ -52,8 +52,8 @@ class HybridStockPredictor:
             try:
                 with open(self.ensemble_weights_file, 'r') as f:
                     return json.load(f)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Error loading ensemble weights: {e}")
         return {'rule': 0.5, 'ml': 0.5}
     
     def _save_ensemble_weights(self):
@@ -75,8 +75,8 @@ class HybridStockPredictor:
                         'ml_based': [],
                         'hybrid': []
                     })
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Error loading performance history: {e}")
         return {
             'weight_based': [],
             'ml_based': [],

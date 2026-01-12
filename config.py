@@ -86,12 +86,3 @@ BACKTESTING_CPU_CORES = -1  # Use all cores for backtesting (-1 = all, or specif
 HYPERPARAMETER_TUNING_PARALLEL_TRIALS = None  # None = auto (uses all cores), or specify number
 # Note: Setting to -1 uses all available CPU cores, which maximizes speed but uses more resources
 # If you want to leave some cores free for other tasks, set to a lower number (e.g., 4 or 6)
-
-# CPU/Performance Configuration
-# Set to -1 to use all available CPU cores, or specify a number (e.g., 4 for 4 cores)
-# For intensive tasks (ML training, backtesting), using all cores significantly speeds up processing
-ML_TRAINING_CPU_CORES = -1  # Use all cores for ML training (-1 = all, or specify number)
-BACKTESTING_CPU_CORES = -1  # Use all cores for backtesting (-1 = all, or specify number)
-HYPERPARAMETER_TUNING_PARALLEL_TRIALS = None  # None = auto (uses all cores), or specify number
-# Note: Setting to -1 uses all available CPU cores, which maximizes speed but uses more resources
-# If you want to leave some cores free for other tasks, set to a lower number (e.g., 4 or 6)
