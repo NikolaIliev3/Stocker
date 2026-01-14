@@ -47,6 +47,9 @@ from momentum_monitor import MomentumMonitor
 from trend_change_predictor import TrendChangePredictor
 from ai_researcher import SeekerAI
 from config import SEEKER_AI_ENABLED
+from scrollable_notebook import TwoRowNotebook
+from llm_ai_predictor import LLMAIPredictor
+from price_move_predictor import PriceMovePredictor
 
 # Import new modules
 try:
@@ -113,13 +116,22 @@ class StockerApp:
         
         # Initialize components
         self.data_fetcher = StockDataFetcher()
-        self.trading_analyzer = TradingAnalyzer(data_fetcher=self.data_fetcher)
+        self.learning_tracker = LearningTracker(APP_DATA_DIR)  # Track all learning sources
+        self.price_move_predictor = PriceMovePredictor(APP_DATA_DIR)  # Predict magnitude of moves
+        
+        self.trading_analyzer = TradingAnalyzer(
+            data_fetcher=self.data_fetcher,
+            calibration_manager=self.learning_tracker.calibration_manager
+        )
         self.investing_analyzer = InvestingAnalyzer()
         self.mixed_analyzer = MixedAnalyzer()
         self.chart_generator = ChartGenerator()
         self.portfolio = Portfolio(APP_DATA_DIR)
         self.model_benchmarker = ModelBenchmarker(APP_DATA_DIR, data_fetcher=self.data_fetcher)  # S&P 500 comparison
-        self.predictions_tracker = PredictionsTracker(APP_DATA_DIR)
+        
+        # Pass price_move_predictor to predictions_tracker so it can learn from outcomes
+        self.predictions_tracker = PredictionsTracker(APP_DATA_DIR, price_move_predictor=self.price_move_predictor)
+
         self.theme_manager = ThemeManager()
         self.preferences = UserPreferences(APP_DATA_DIR)
         self.market_scanner = MarketScanner(
@@ -132,13 +144,18 @@ class StockerApp:
         
         # Initialize hybrid AI system
         self.data_dir = APP_DATA_DIR
+        # Get SeekerAI instance if available
+        seeker_ai_instance = getattr(self, 'seeker_ai', None) if hasattr(self, 'seeker_ai') else None
         self.hybrid_predictors = {
             'trading': HybridStockPredictor(APP_DATA_DIR, 'trading', 
-                                            trading_analyzer=self.trading_analyzer),
+                                            trading_analyzer=self.trading_analyzer,
+                                            seeker_ai=seeker_ai_instance),
             'mixed': HybridStockPredictor(APP_DATA_DIR, 'mixed',
-                                         mixed_analyzer=self.mixed_analyzer),
+                                         mixed_analyzer=self.mixed_analyzer,
+                                         seeker_ai=seeker_ai_instance),
             'investing': HybridStockPredictor(APP_DATA_DIR, 'investing',
-                                            investing_analyzer=self.investing_analyzer)
+                                            investing_analyzer=self.investing_analyzer,
+                                            seeker_ai=seeker_ai_instance)
         }
         self.training_manager = MLTrainingPipeline(self.data_fetcher, APP_DATA_DIR, app=self)
         self.model_tester = ModelTester(APP_DATA_DIR, self.data_fetcher)
@@ -158,8 +175,11 @@ class StockerApp:
             )
             logger.info(f"Loaded auto-learner settings: interval={saved_interval}h, predictions={saved_predictions}, confidence={saved_confidence}%")
         
-        self.learning_tracker = LearningTracker(APP_DATA_DIR)  # Track all learning sources
+        # self.learning_tracker moved up
         self.backtester = ContinuousBacktester(self, APP_DATA_DIR)  # Continuous backtesting system
+        
+        # ML configuration manager (for save/load configs)
+        self._saved_training_config = None  # Stores loaded config for next training run
         
         # Initialize ML Scheduler
         try:
@@ -189,8 +209,12 @@ class StockerApp:
         self.trend_change_predictor = TrendChangePredictor(data_dir=APP_DATA_DIR)  # Predict trend changes
         from trend_change_tracker import TrendChangeTracker
         self.trend_change_tracker = TrendChangeTracker(APP_DATA_DIR)  # Track trend change predictions for learning
+        self.llm_ai_predictor = LLMAIPredictor(APP_DATA_DIR)  # AI Predictor for buy opportunities and reasoning
         
-        # Initialize Seeker AI
+        # Initialize momentum changes history from persistent storage
+        self.momentum_changes_history = self.momentum_monitor.history
+        
+        # Initialize Seeker AI (before hybrid predictors so they can use it)
         if SEEKER_AI_ENABLED:
             try:
                 self.seeker_ai = SeekerAI(APP_DATA_DIR)
@@ -241,11 +265,17 @@ class StockerApp:
         # Start periodic peak/bottom detection verification
         self._start_peak_bottom_verification()
         
+        # Start periodic buy opportunity verification
+        self._start_buy_opportunity_verification()
+        
         # Verify trend change predictions at startup (after a short delay)
         self.root.after(5000, self._verify_trend_changes_at_startup)
         
         # Verify peak/bottom detections at startup (after a short delay)
         self.root.after(5000, self._verify_peak_bottom_detections_at_startup)
+        
+        # Verify buy opportunities at startup
+        self.root.after(7000, self._verify_buy_opportunities_at_startup)
         
         # Schedule automatic training checks
         self._schedule_auto_training()
@@ -273,6 +303,9 @@ class StockerApp:
         # Track last detected peak/bottom/trend changes to avoid duplicate notifications
         self._last_peak_bottom = {}  # {symbol: {'type': 'peak'|'bottom', 'price': float, 'time': str}}
         self._last_trend_change = {}  # {symbol: {'trend': str, 'time': str}}
+        self.monitoring_status = {}  # {symbol: {price, status, time, change_pct, action}}
+        self.monitoring_events = []  # Batch events for single notification
+        self.is_monitoring_batch_active = False # Flag to suppress individual popups
         
         # Start periodic checking of monitored stocks for peaks/bottoms/trend changes
         self.root.after(120000, self._start_monitored_stocks_checking)  # Start after 2 minutes
@@ -384,8 +417,8 @@ class StockerApp:
                         stderr_output = self.backend_process.stderr.read().decode('utf-8', errors='ignore')
                         if stderr_output:
                             logger.warning(f"Backend server may not have started properly. Error output: {stderr_output[:500]}")
-                    except:
-                        pass
+                    except (IOError, OSError, AttributeError) as e:
+                        logger.debug(f"Could not read backend stderr: {e}")
                     logger.warning("Backend server may not have started properly - port 5000 not responding")
                     
             except Exception as e:
@@ -457,9 +490,17 @@ class StockerApp:
                         # Record learning events for verified predictions
                         for pred in newly_verified:
                             if pred.get('was_correct') is not None:
+                                # Create outcome dict
+                                outcome = {
+                                    'was_correct': pred.get('was_correct', False),
+                                    'actual_price_change': pred.get('actual_price_change', 0.0),
+                                    'target_hit': pred.get('was_correct', False) and pred.get('action') in ['BUY', 'SELL'],
+                                }
                                 self.learning_tracker.record_verified_prediction(
                                     pred.get('was_correct', False),
-                                    pred.get('strategy', 'trading')
+                                    pred.get('strategy', 'trading'),
+                                    prediction_data=pred,
+                                    actual_outcome=outcome
                                 )
                         self.root.after(0, self._show_verification_notifications, newly_verified)
                         self.root.after(0, self._update_predictions_display)
@@ -609,6 +650,9 @@ class StockerApp:
                         self.root.after(0, self._trigger_auto_training)
                         # Update ML status
                         self.root.after(0, self._update_ml_status)
+                        # Update trend change display to show verified predictions are gone
+                        if hasattr(self, 'trend_change_tree'):
+                            self.root.after(0, self._update_trend_change_display)
                 except Exception as e:
                     logger.error(f"Error in trend change verification: {e}")
             
@@ -740,6 +784,10 @@ class StockerApp:
                     if verified_predictions:
                         logger.info(f"🧠 Learning from {len(verified_predictions)} verified trend change predictions...")
                         self.trend_change_predictor.learn_from_verified_predictions(verified_predictions)
+                    
+                    # Update trend change display to show verified predictions are gone
+                    if hasattr(self, 'trend_change_tree'):
+                        self.root.after(0, self._update_trend_change_display)
                     
                     # Trigger auto-training
                     self.root.after(0, self._trigger_auto_training)
@@ -924,6 +972,80 @@ class StockerApp:
         
         # Start first check after initial delay (12 hours)
         self.root.after(check_interval_ms, periodic_check)
+
+    def _start_buy_opportunity_verification(self):
+        """Start periodic automatic verification of buy opportunity predictions (Megamind)"""
+        # Check every 12 hours (43200000 milliseconds)
+        check_interval_ms = 43200000
+        
+        def periodic_check():
+            def verify_in_background():
+                try:
+                    logger.info("Periodic verification of buy opportunity predictions...")
+                    pending = self.learning_tracker.data.get('pending_buy_opportunities', [])
+                    if not pending:
+                        return
+                        
+                    for record in pending:
+                        if record.get('verified'):
+                            continue
+                            
+                        symbol = record['symbol']
+                        stock_data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=False)
+                        if 'error' in stock_data:
+                            continue
+                            
+                        current_price = stock_data.get('price', 0)
+                        result = self.learning_tracker.verify_buy_opportunity(record, current_price)
+                        
+                        if result:
+                            self.learning_tracker.record_verified_buy_opportunity(record, result)
+                    
+                    self.root.after(0, self._update_ml_status)
+                except Exception as e:
+                    logger.error(f"Error in buy opportunity verification: {e}")
+            
+            thread = threading.Thread(target=verify_in_background)
+            thread.daemon = True
+            thread.start()
+            
+            # Schedule next check
+            self.root.after(check_interval_ms, periodic_check)
+        
+        # Start first check after 1 hour instead of 12 to verify existing ones
+        self.root.after(3600000, periodic_check)
+
+    def _verify_buy_opportunities_at_startup(self):
+        """Verify buy opportunity predictions at startup"""
+        def verify_in_background():
+            try:
+                logger.info("Verifying buy opportunity predictions at startup...")
+                pending = self.learning_tracker.data.get('pending_buy_opportunities', [])
+                if not pending:
+                    return
+                    
+                for record in pending:
+                    if record.get('verified'):
+                        continue
+                        
+                    symbol = record['symbol']
+                    stock_data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=False)
+                    if 'error' in stock_data:
+                        continue
+                        
+                    current_price = stock_data.get('price', 0)
+                    result = self.learning_tracker.verify_buy_opportunity(record, current_price)
+                    
+                    if result:
+                        self.learning_tracker.record_verified_buy_opportunity(record, result)
+                
+                self.root.after(0, self._update_ml_status)
+            except Exception as e:
+                logger.error(f"Error in startup buy opportunity verification: {e}")
+                
+        thread = threading.Thread(target=verify_in_background)
+        thread.daemon = True
+        thread.start()
     
     def _start_stock_monitoring(self):
         """Start periodic monitoring of stocks for BUY signals"""
@@ -965,8 +1087,8 @@ class StockerApp:
                             if strategy in ['mixed', 'investing']:
                                 try:
                                     financials_data = self.data_fetcher.fetch_financials(symbol)
-                                except:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(f"Could not fetch financials for {symbol}: {e}")
                             
                             # Get hybrid predictor for the strategy
                             hybrid_predictor = self.hybrid_predictors.get(strategy)
@@ -983,8 +1105,8 @@ class StockerApp:
                             new_action = recommendation.get('action', 'HOLD')
                             new_confidence = recommendation.get('confidence', 0)
                             
-                            # Check if changed to BUY
-                            if self.stock_monitor.check_for_buy_signal(symbol, new_action, new_confidence):
+                            # Check for bullish signal (SELL in inverted logic)
+                            if self.stock_monitor.check_for_bullish_signal(symbol, new_action, new_confidence):
                                 buy_signals.append({
                                     'symbol': symbol,
                                     'confidence': new_confidence,
@@ -992,7 +1114,7 @@ class StockerApp:
                                     'target_price': recommendation.get('target_price', 0),
                                     'strategy': strategy
                                 })
-                                logger.info(f"🟢 BUY SIGNAL: {symbol} changed to BUY ({new_confidence:.1f}% confidence)")
+                                logger.info(f"🟢 BULLISH SIGNAL: {symbol} changed to SELL ({new_confidence:.1f}% confidence)")
                         
                         except Exception as e:
                             logger.error(f"Error monitoring {symbol}: {e}")
@@ -1036,8 +1158,8 @@ class StockerApp:
             target_price = signal.get('target_price', 0)
             strategy = signal.get('strategy', 'mixed')
             
-            message = f"🟢 BUY SIGNAL: {symbol}\n\n"
-            message += f"Stock changed to BUY recommendation!\n"
+            message = f"🟢 BULLISH SIGNAL: {symbol}\n\n"
+            message += f"Stock changed to BULLISH (SELL) recommendation!\n"
             message += f"Confidence: {confidence:.1f}%\n"
             if entry_price > 0:
                 entry_usd = f"${entry_price:,.2f}"
@@ -1050,12 +1172,12 @@ class StockerApp:
             message += f"Strategy: {strategy.title()}\n\n"
             message += "Click OK to analyze this stock now."
             
-            messagebox.showinfo("🟢 BUY Signal Detected!", message)
-            logger.info(f"Showed BUY signal notification for {symbol}")
+            messagebox.showinfo("🟢 BULLISH Signal Detected!", message)
+            logger.info(f"Showed BULLISH signal notification for {symbol}")
         else:
             # Multiple signals - show batched notification
-            message = f"🟢 {len(buy_signals)} BUY Signals Detected!\n\n"
-            message += "Stocks with BUY recommendations:\n\n"
+            message = f"🟢 {len(buy_signals)} BULLISH Signals Detected!\n\n"
+            message += "Stocks with BULLISH (SELL) recommendations:\n\n"
             for i, signal in enumerate(buy_signals[:10], 1):  # Show max 10
                 symbol = signal['symbol']
                 confidence = signal['confidence']
@@ -1139,8 +1261,19 @@ class StockerApp:
                             logger.error(f"Error checking momentum for {symbol}: {e}")
                             continue
                     
-                    # Show notifications for momentum changes
+                    # Show notifications for momentum changes and update dedicated tab
                     if momentum_changes:
+                        # Add to history for the dedicated tab
+                        for change in momentum_changes:
+                            self.momentum_monitor.add_to_history(
+                                symbol=change['symbol'],
+                                action=change['action'], # Old action
+                                changes=change['changes'],
+                                strategy=change['strategy']
+                            )
+                        
+                        # Update display
+                        self.root.after(0, self._update_momentum_changes_display)
                         self.root.after(0, self._show_momentum_change_notifications, momentum_changes)
                 
                 except Exception as e:
@@ -1206,6 +1339,17 @@ class StockerApp:
     
     def _show_peak_notification(self, symbol: str, peak_price: float, current_price: float, confidence: float, reasoning: str, timestamp: str):
         """Show notification when peak is detected"""
+        # Batching check
+        if hasattr(self, 'is_monitoring_batch_active') and self.is_monitoring_batch_active:
+            self.monitoring_events.append({
+                'type': 'PEAK',
+                'symbol': symbol,
+                'price': peak_price,
+                'message': f"Peak at ${peak_price:.2f}"
+            })
+            logger.info(f"Batched peak notification for {symbol}")
+            return
+
         title = "🔴 PEAK DETECTED - REVERSAL INCOMING"
         message = f"📈 {symbol} - Highest Price Reached\n\n"
         message += f"Time: {timestamp}\n"
@@ -1252,6 +1396,17 @@ class StockerApp:
     
     def _show_bottom_notification(self, symbol: str, bottom_price: float, current_price: float, confidence: float, reasoning: str, timestamp: str):
         """Show notification when bottom is detected"""
+        # Batching check
+        if hasattr(self, 'is_monitoring_batch_active') and self.is_monitoring_batch_active:
+            self.monitoring_events.append({
+                'type': 'BOTTOM',
+                'symbol': symbol,
+                'price': bottom_price,
+                'message': f"Bottom at ${bottom_price:.2f}"
+            })
+            logger.info(f"Batched bottom notification for {symbol}")
+            return
+
         title = "🟢 BOTTOM DETECTED - REVERSAL INCOMING"
         message = f"📉 {symbol} - Lowest Price Reached\n\n"
         message += f"Time: {timestamp}\n"
@@ -1360,7 +1515,7 @@ class StockerApp:
             if len(significant_changes) > 5:
                 message += f"\n... and {len(significant_changes) - 5} more\n"
             
-            message += "\nView details in the Predictions tab."
+            message += "\nView details in the 🔄 Momentum Changes tab."
             messagebox.showinfo(title, message)
             logger.info(f"Showed batched momentum change notification for {len(significant_changes)} predictions")
     
@@ -2016,6 +2171,35 @@ class StockerApp:
         )
         self.backtest_btn.pack(fill=tk.X, pady=(0, 5))
         
+        # Continuous backtesting buttons
+        self.continuous_backtest_btn = ModernButton(
+            btn_frame,
+            "🔄 Start Continuous Backtesting",
+            command=self._start_continuous_backtest,
+            theme=theme
+        )
+        self.continuous_backtest_btn.pack(fill=tk.X, pady=(0, 5))
+        
+        self.stop_continuous_backtest_btn = ModernButton(
+            btn_frame,
+            "⏹️ Stop Continuous Backtesting",
+            command=self._stop_continuous_backtest,
+            theme=theme
+        )
+        self.stop_continuous_backtest_btn.pack(fill=tk.X, pady=(0, 5))
+        self.stop_continuous_backtest_btn.config(state=tk.DISABLED)  # Disabled until started
+        
+        # Continuous backtesting status label
+        self.continuous_backtest_status = tk.Label(
+            btn_frame,
+            text="",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 9),
+            wraplength=200
+        )
+        self.continuous_backtest_status.pack(fill=tk.X, pady=(5, 0))
+        
         self.view_backtest_results_btn = ModernButton(
             btn_frame,
             "📊 View Backtest Results",
@@ -2068,7 +2252,7 @@ class StockerApp:
         notebook_container = tk.Frame(results_panel, bg=theme['bg'])
         notebook_container.pack(fill=tk.BOTH, expand=True)
         
-        self.notebook = ttk.Notebook(notebook_container)
+        self.notebook = TwoRowNotebook(notebook_container, bg=theme['bg'])
         self.notebook.pack(fill=tk.BOTH, expand=True)
         
         # Bind mousewheel to notebook for smooth scrolling in tabs
@@ -2090,8 +2274,8 @@ class StockerApp:
                         elif isinstance(widget, scrolledtext.ScrolledText):
                             widget.yview_scroll(scroll_amount, "units")
                             return "break"
-            except:
-                pass
+            except (AttributeError, tk.TclError) as e:
+                logger.debug(f"Error handling notebook mousewheel: {e}")
         
         notebook_container.bind("<MouseWheel>", on_notebook_mousewheel)
         self.notebook.bind("<MouseWheel>", on_notebook_mousewheel)
@@ -2113,8 +2297,8 @@ class StockerApp:
                         sidebar_y <= y <= sidebar_y + sidebar_h):
                         on_sidebar_mousewheel(event)
                         return "break"
-                except:
-                    pass
+                except (AttributeError, tk.TclError) as e:
+                    logger.debug(f"Error checking sidebar bounds: {e}")
                 
                 # Check notebook area
                 try:
@@ -2127,10 +2311,10 @@ class StockerApp:
                         notebook_y <= y <= notebook_y + notebook_h):
                         on_notebook_mousewheel(event)
                         return "break"
-                except:
-                    pass
-            except:
-                pass
+                except (AttributeError, tk.TclError) as e:
+                    logger.debug(f"Error checking notebook bounds: {e}")
+            except (AttributeError, tk.TclError, ValueError) as e:
+                logger.debug(f"Error in universal wheel handler: {e}")
         
         # Bind to parent containers and root window to catch events when hovering
         content_frame.bind("<MouseWheel>", universal_wheel_handler)
@@ -2256,6 +2440,12 @@ class StockerApp:
         predictions_container = tk.Frame(self.notebook, bg=theme['bg'])
         self.notebook.add(predictions_container, text=self.localization.t('predictions'))
         
+        # Monitoring Tab
+        self.monitoring_frame = tk.Frame(self.notebook, bg=theme['bg'])
+        self.notebook.add(self.monitoring_frame, text="Monitoring")
+        self._create_monitoring_tab()
+        bind_tab_scrolling(self.monitoring_frame)
+        
         # Create notebook for predictions sub-tabs
         self.predictions_notebook = ttk.Notebook(predictions_container)
         self.predictions_notebook.pack(fill=tk.BOTH, expand=True)
@@ -2348,6 +2538,12 @@ class StockerApp:
         self._create_predictions_tab()
         self._create_trend_change_tab()
         self._load_trend_change_predictions()  # Load stored predictions
+        
+        # Momentum Changes tab
+        self.momentum_changes_frame = tk.Frame(self.notebook, bg=theme['frame_bg'])
+        self.notebook.add(self.momentum_changes_frame, text="🔄 Momentum Changes")
+        self._create_momentum_changes_tab()
+        
         self._create_gun_tab()
         
         # Update predictions display
@@ -2599,17 +2795,23 @@ class StockerApp:
         list_inner = tk.Frame(list_card.content_frame, bg=theme['card_bg'])
         list_inner.pack(fill=tk.BOTH, expand=True)
         
-        columns = ('ID', 'Symbol', 'Action', 'Entry', 'Target', 'Target Date', 'Status', 'Result', 'Delete')
+        columns = ('ID', 'Symbol', 'Sentiment', 'Action', 'Wait %', 'Entry', 'Target', 'Target Date', 'Status', 'Result', 'Delete')
         self.predictions_tree = ttk.Treeview(list_inner, columns=columns, show='headings', height=12)
         
         for col in columns:
             self.predictions_tree.heading(col, text=col, anchor=tk.CENTER)
-            if col == 'Target Date':
-                self.predictions_tree.column(col, width=120, anchor=tk.CENTER)
+            if col == 'ID':
+                self.predictions_tree.column(col, width=0, stretch=False) # Hide ID
+            elif col == 'Sentiment':
+                self.predictions_tree.column(col, width=100, anchor=tk.CENTER)
+            elif col == 'Wait %':
+                self.predictions_tree.column(col, width=80, anchor=tk.CENTER)
+            elif col == 'Target Date':
+                self.predictions_tree.column(col, width=110, anchor=tk.CENTER)
             elif col == 'Delete':
                 self.predictions_tree.column(col, width=50, anchor=tk.CENTER)
             else:
-                self.predictions_tree.column(col, width=100, anchor=tk.CENTER)
+                self.predictions_tree.column(col, width=90, anchor=tk.CENTER)
         
         # Bind click event on Delete column
         self.predictions_tree.bind('<Button-1>', self._on_predictions_tree_click)
@@ -2668,7 +2870,8 @@ class StockerApp:
         try:
             # Predictions tab is typically the last one
             self.notebook.select(len(self.notebook.tabs()) - 1)
-        except:
+        except (tk.TclError, IndexError) as e:
+            logger.debug(f"Could not select predictions tab by index: {e}")
             # Fallback: find by text
             for i in range(self.notebook.index("end")):
                 if self.localization.t('predictions') in self.notebook.tab(i, "text"):
@@ -2816,9 +3019,17 @@ class StockerApp:
                     # Record learning events for verified predictions
                     for pred in newly_verified:
                         if pred.get('was_correct') is not None:
+                            # Create outcome dict
+                            outcome = {
+                                'was_correct': pred.get('was_correct', False),
+                                'actual_price_change': pred.get('actual_price_change', 0.0),
+                                'target_hit': pred.get('was_correct', False) and pred.get('action') in ['BUY', 'SELL'], # simplified check
+                            }
                             self.learning_tracker.record_verified_prediction(
                                 pred.get('was_correct', False),
-                                pred.get('strategy', 'trading')
+                                pred.get('strategy', 'trading'),
+                                prediction_data=pred,
+                                actual_outcome=outcome
                             )
                     self.root.after(0, self._show_verification_results, result, newly_verified)
                     self.root.after(0, self._update_predictions_display)
@@ -3004,7 +3215,8 @@ class StockerApp:
             try:
                 last_detection_time = datetime.fromisoformat(last_detection_time_str)
                 time_since_last = (datetime.now() - last_detection_time).total_seconds() / 3600  # hours
-            except:
+            except (ValueError, AttributeError) as e:
+                logger.debug(f"Could not parse last detection time: {e}")
                 time_since_last = 999  # Force notification if parsing fails
             
             # Show peak notification (if not shown recently - within last 24 hours)
@@ -3065,12 +3277,22 @@ class StockerApp:
             try:
                 last_trend_time = datetime.fromisoformat(last_trend_time_str)
                 time_since_trend_change = (datetime.now() - last_trend_time).total_seconds() / 3600
-            except:
+            except (ValueError, AttributeError) as e:
+                logger.debug(f"Could not parse last trend change time: {e}")
                 time_since_trend_change = 999  # Force notification if parsing fails
             
             # Show trend change notification (if significant change)
             if momentum_changes.get('trend_reversed') or \
                (momentum_changes.get('momentum_changed') and len(momentum_changes.get('changes', [])) > 0):
+                
+                # Add to history
+                self.momentum_monitor.add_to_history(
+                    symbol=symbol,
+                    action='MONITOR',  # Indicated it came from background monitoring
+                    changes=momentum_changes,
+                    strategy='monitored'
+                )
+                self.root.after(0, self._update_momentum_changes_display)
                 
                 # Only notify if trend actually changed (not just momentum shift)
                 trend_change_desc = momentum_changes.get('trend_change')
@@ -3095,15 +3317,55 @@ class StockerApp:
                     
                     # Update last trend
                     self._last_trend_change[symbol] = {
-                        'trend': new_trend,
-                        'time': datetime.now().isoformat()
                     }
             
+            # UPDATE MONITORING STATUS (New Tab)
+            status_text = "Monitoring"
+            if peak_bottom_detection.get('peak_detected'):
+                status_text = "Peak Detected 🔴"
+            elif peak_bottom_detection.get('bottom_detected'):
+                status_text = "Bottom Detected 🟢"
+            elif momentum_changes.get('trend_reversed'):
+                status_text = "Trend Reversal ⚠️"
+            elif momentum_changes.get('momentum_changed'):
+                status_text = "Momentum Shift 🔄"
+                
+            # Get latest recommendation action
+            rec = momentum_changes.get('recommendation', {})
+            rec_action = rec.get('action', 'HOLD')
+            
+            # Calculate daily change if available
+            change_pct = stock_data.get('change_percent', 0.0)
+            
+            self.monitoring_status[symbol] = {
+                'symbol': symbol,
+                'price': current_price,
+                'status': status_text,
+                'last_update': timestamp,
+                'action': rec_action,
+                'change_pct': change_pct
+            }
+            
+            # Trigger display update
+            if hasattr(self, '_update_monitoring_display'):
+                self.root.after(0, self._update_monitoring_display)
         except Exception as e:
             logger.error(f"Error checking monitored stock {symbol} for changes: {e}")
     
     def _show_trend_change_notification(self, symbol: str, changes: Dict, timestamp: str):
         """Show notification when trend changes (enhanced version)"""
+        # Batching check
+        if hasattr(self, 'is_monitoring_batch_active') and self.is_monitoring_batch_active:
+            change_type = "Trend Reversal" if changes.get('trend_reversed') else "Momentum Shift"
+            self.monitoring_events.append({
+                'type': 'TREND',
+                'symbol': symbol,
+                'price': None, # Price might not be readily available in 'changes', mostly message
+                'message': f"{change_type}: {changes.get('trend_change', 'Unknown')}"
+            })
+            logger.info(f"Batched trend notification for {symbol}")
+            return
+            
         change_list = changes.get('changes', [])
         is_trend_reversal = changes.get('trend_reversed', False)
         recommendation = changes.get('recommendation', {})
@@ -3146,24 +3408,212 @@ class StockerApp:
         messagebox.showinfo(title, message)
         logger.info(f"Trend change notification for {symbol} at {timestamp}: Momentum signal {action} ({confidence}%) - Note: May differ from main analysis")
     
+    def _create_monitoring_tab(self):
+        """Create the comprehensive monitoring tab"""
+        theme = self.theme_manager.get_theme()
+        
+        # Header
+        header_frame = tk.Frame(self.monitoring_frame, bg=theme['bg'])
+        header_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        title_label = tk.Label(header_frame, text="🛡️ Live Stock Monitoring", 
+                              font=('Segoe UI', 14, 'bold'), bg=theme['bg'], fg=theme['fg'])
+        title_label.pack(side=tk.LEFT)
+        
+        # Controls
+        controls_frame = tk.Frame(header_frame, bg=theme['bg'])
+        controls_frame.pack(side=tk.RIGHT)
+        
+        refresh_btn = ModernButton(controls_frame, text="Refresh", 
+                                  command=self._update_monitoring_display, theme=theme)
+        refresh_btn.pack(side=tk.LEFT, padx=(5, 0))
+        
+        # Treeview
+        list_card = ModernCard(self.monitoring_frame, "", theme=theme, padding=15)
+        list_card.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+        
+        list_inner = tk.Frame(list_card, bg=theme['card_bg'])
+        list_inner.pack(fill=tk.BOTH, expand=True)
+        
+        columns = ('Symbol', 'Price', 'Change', 'Status', 'Action', 'Last Update')
+        self.monitoring_tree = ttk.Treeview(list_inner, columns=columns, show='headings', height=15)
+        
+        # Column config
+        self.monitoring_tree.heading('Symbol', text='Symbol')
+        self.monitoring_tree.column('Symbol', width=80, anchor=tk.CENTER)
+        
+        self.monitoring_tree.heading('Price', text='Price')
+        self.monitoring_tree.column('Price', width=100, anchor=tk.CENTER)
+        
+        self.monitoring_tree.heading('Change', text='Change')
+        self.monitoring_tree.column('Change', width=80, anchor=tk.CENTER)
+        
+        self.monitoring_tree.heading('Status', text='Status')
+        self.monitoring_tree.column('Status', width=150, anchor=tk.CENTER)
+        
+        self.monitoring_tree.heading('Action', text='Action')
+        self.monitoring_tree.column('Action', width=100, anchor=tk.CENTER)
+        
+        self.monitoring_tree.heading('Last Update', text='Last Update')
+        self.monitoring_tree.column('Last Update', width=150, anchor=tk.CENTER)
+        
+        # Scrollbar
+        scrollbar = ModernScrollbar(list_inner, command=self.monitoring_tree.yview, theme=theme)
+        self.monitoring_tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.monitoring_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Tags
+        self.monitoring_tree.tag_configure('peak', foreground='#FF4444')
+        self.monitoring_tree.tag_configure('bottom', foreground='#00C851')
+        self.monitoring_tree.tag_configure('reversal', foreground='#FFBB33')
+        
+        # Initial update
+        self._update_monitoring_display()
+
+    def _update_monitoring_display(self):
+        """Update the monitoring treeview"""
+        if not hasattr(self, 'monitoring_tree'):
+            return
+            
+        # Clear
+        for item in self.monitoring_tree.get_children():
+            self.monitoring_tree.delete(item)
+            
+        # Populate
+        if hasattr(self, 'monitoring_status'):
+            for symbol, data in self.monitoring_status.items():
+                price = f"${data.get('price', 0):.2f}"
+                change = f"{data.get('change_pct', 0):+.2f}%"
+                status = data.get('status', 'Monitoring')
+                action = data.get('action', 'HOLD')
+                last_update = data.get('last_update', '').split('T')[-1][:8] # HH:MM:SS
+                
+                # Tag
+                tags = []
+                if "Peak" in status: tags.append('peak')
+                elif "Bottom" in status: tags.append('bottom')
+                elif "Reversal" in status: tags.append('reversal')
+                
+                self.monitoring_tree.insert('', 'end', values=(
+                    symbol, price, change, status, action, last_update
+                ), tags=tuple(tags))
+
     def _start_monitored_stocks_checking(self):
         """Start periodic checking of monitored stocks (every 5 minutes)"""
         check_interval_ms = 5 * 60 * 1000  # 5 minutes
         
         def check_monitored():
-            if not hasattr(self, 'monitored_stocks') or not self.monitored_stocks:
-                # Reschedule even if no stocks monitored (in case user enables later)
+            # Init Batch
+            self.monitoring_events = []
+            self.is_monitoring_batch_active = True
+            
+            # Get all symbols to monitor:
+            # 1. Stocks with active predictions
+            # 2. Stocks manually added to monitored list
+            symbols_to_monitor = set()
+            
+            # Add active predictions
+            try:
+                active_preds = self.predictions_tracker.get_active_predictions()
+                for pred in active_preds:
+                    if pred.get('symbol'):
+                        symbols_to_monitor.add(pred['symbol'])
+            except Exception as e:
+                logger.error(f"Error getting active predictions for monitoring: {e}")
+            
+            # Add manual list
+            if hasattr(self, 'monitored_stocks') and self.monitored_stocks:
+                symbols_to_monitor.update(self.monitored_stocks)
+            
+            if not symbols_to_monitor:
+                # Reschedule even if no stocks monitored
                 self.root.after(check_interval_ms, check_monitored)
                 return
             
+            # Count active threads for this batch
+            self._monitoring_active_threads_count = len(symbols_to_monitor)
+            
+            # Wrapper to decrement counter logic
+            def check_wrapper(sym):
+                try:
+                    self._check_monitored_stock_for_changes(sym)
+                finally:
+                    # Decrement safely (in GUI thread to avoid lock complexity, or just basic atomic dec)
+                    # Since this runs in thread, we can't update GUI vars safely without after/queue.
+                    # But integers are atomic-ish in Python GIL. Let's use a safe method.
+                    # Actually, simple way: call a method on main thread to decrement.
+                    self.root.after(0, self._decrement_monitoring_thread)
+
             # Check each monitored stock
-            for symbol in list(self.monitored_stocks):
-                thread = threading.Thread(target=self._check_monitored_stock_for_changes, args=(symbol,))
+            for symbol in list(symbols_to_monitor):
+                thread = threading.Thread(target=check_wrapper, args=(symbol,))
                 thread.daemon = True
                 thread.start()
             
-            # Schedule next check
+            # Start poller to check for completion
+            self.root.after(1000, self._check_monitoring_batch_completion)
+                
+            # Schedule next cycle
             self.root.after(check_interval_ms, check_monitored)
+            
+    def _decrement_monitoring_thread(self):
+        """Decrement thread counter"""
+        if hasattr(self, '_monitoring_active_threads_count'):
+            self._monitoring_active_threads_count -= 1
+
+    def _check_monitoring_batch_completion(self):
+        """Check if all monitoring threads are done"""
+        start_time = getattr(self, '_monitoring_batch_start_time', 0)
+        
+        # Check if done
+        if getattr(self, '_monitoring_active_threads_count', 0) <= 0:
+            self._process_monitoring_batch()
+            self.is_monitoring_batch_active = False
+            return
+            
+        # Timeout safety (e.g. 60 seconds) - stop waiting
+        # Just reschedule check
+        self.root.after(1000, self._check_monitoring_batch_completion)
+
+    def _process_monitoring_batch(self):
+        """Process collected monitoring events into one summary"""
+        if not self.monitoring_events:
+            return
+            
+        count = len(self.monitoring_events)
+        
+        # De-duplicate events by symbol and type
+        unique_events = {}
+        for event in self.monitoring_events:
+            key = f"{event['symbol']}_{event['type']}"
+            unique_events[key] = event
+            
+        final_events = list(unique_events.values())
+        count = len(final_events)
+        
+        if count == 0:
+            return
+            
+        # Create summary message
+        title = f"🛡️ Monitoring Update: {count} Event{'s' if count > 1 else ''}"
+        
+        message = f"Detected {count} important event{'s' if count > 1 else ''} in your monitored stocks.\n\n"
+        
+        # Show top 3 examples
+        examples = final_events[:3]
+        for ex in examples:
+            icon = "🔴" if ex['type'] == 'PEAK' else "🟢" if ex['type'] == 'BOTTOM' else "⚠️"
+            message += f"{icon} {ex['symbol']}: {ex['message']}\n"
+            
+        if count > 3:
+            message += f"\n...and {count - 3} more.\n"
+            
+        message += "\n👉 Check the 'Monitoring' tab for full details."
+        
+        messagebox.showinfo(title, message)
+        logger.info(f"Showed batched monitoring notification for {count} events")
         
         # Start first check
         check_monitored()
@@ -3194,6 +3644,31 @@ class StockerApp:
             if pred['verified']:
                 result = f"✓ {self.localization.t('correct')}" if pred['was_correct'] else f"✗ {self.localization.t('incorrect')}"
             
+            # Determine sentiment based on action (inverted)
+            action = pred.get('action', 'HOLD')
+            sentiment = "BULLISH 🟢" if action == 'SELL' else "BEARISH 🔴" if action == 'BUY' else "NEUTRAL ⚪"
+            
+            # Set action label with hint
+            action_label = f"{action} (Inv)"
+            
+            # Calculate Wait % if active and we have current price
+            wait_pct_str = "N/A"
+            if status == 'active':
+                entry_price = pred.get('entry_price', 0)
+                # Try to find current price from current_data or fetcher
+                curr_price = 0
+                if hasattr(self, 'current_data') and self.current_data and 'price' in self.current_data:
+                    curr_price = self.current_data['price']
+                
+                if curr_price > 0 and entry_price > 0:
+                    diff = ((curr_price - entry_price) / curr_price) * 100
+                    if diff > 0 and action == 'SELL': # Price is above entry but we want to buy low
+                        wait_pct_str = f"+{diff:.1f}%"
+                    elif diff < 0 and action == 'SELL': # Price is below entry
+                        wait_pct_str = f"{diff:.1f}%"
+                    else:
+                        wait_pct_str = f"{diff:+.1f}%"
+            
             # Format target date
             target_date_str = "N/A"
             estimated_date_str = pred.get('estimated_target_date')
@@ -3205,20 +3680,22 @@ class StockerApp:
                 except:
                     target_date_str = "N/A"
             
-            # Format prices in USD for predictions tab (always USD regardless of currency setting)
+            # Format prices in USD
             entry_usd = f"${pred['entry_price']:,.2f}"
             target_usd = f"${pred['target_price']:,.2f}"
             
             values = (
                 pred['id'],
                 pred['symbol'],
-                pred['action'],
+                sentiment,
+                action_label,
+                wait_pct_str,
                 entry_usd,
                 target_usd,
                 target_date_str,
                 status.title(),
                 result,
-                '✕'  # X symbol for delete
+                '✕'
             )
             
             item = self.predictions_tree.insert('', tk.END, values=values)
@@ -4134,7 +4611,7 @@ class StockerApp:
         list_inner = tk.Frame(list_card, bg=theme['card_bg'])
         list_inner.pack(fill=tk.BOTH, expand=True)
         
-        columns = ('ID', 'Symbol', 'Current Trend', 'Predicted Change', 'Estimated Days', 'Estimated Date', 'Confidence', 'Delete')
+        columns = ('ID', 'Symbol', 'Current Trend', 'Predicted Change', 'Estimated Days', 'Estimated Date', 'Confidence', 'Status', 'Delete')
         self.trend_change_tree = ttk.Treeview(list_inner, columns=columns, show='headings', height=12)
         
         for col in columns:
@@ -4142,6 +4619,8 @@ class StockerApp:
             if col == 'ID':
                 # Hide ID column
                 self.trend_change_tree.column(col, width=0, stretch=False)
+            elif col == 'Status':
+                self.trend_change_tree.column(col, width=100, anchor=tk.CENTER)
             elif col == 'Estimated Date':
                 self.trend_change_tree.column(col, width=120, anchor=tk.CENTER)
             elif col == 'Confidence':
@@ -4153,6 +4632,8 @@ class StockerApp:
         
         # Bind click event on Delete column
         self.trend_change_tree.bind('<Button-1>', self._on_trend_change_tree_click)
+        # Bind double-click to verify prediction
+        self.trend_change_tree.bind('<Double-1>', self._on_trend_change_tree_double_click)
         # Bind motion event for hover effect on Delete column
         self.trend_change_tree.bind('<Motion>', self._on_trend_change_tree_motion)
         self.trend_change_tree.bind('<Leave>', self._on_trend_change_tree_leave)
@@ -4182,23 +4663,39 @@ class StockerApp:
         self.trend_change_predictions = []
     
     def _update_trend_change_display(self):
-        """Update the trend change predictions display"""
+        """Update the trend change predictions display with enhanced visuals"""
         theme = self.theme_manager.get_theme()
         
-        # Load active predictions from persistent storage
+        # Load all predictions from persistent storage to show history
         try:
-            active_predictions = self.trend_change_tracker.get_active_predictions()
-            # Update in-memory list with stored predictions
-            # Merge with any new predictions that haven't been saved yet
-            stored_ids = {p['id'] for p in active_predictions}
-            new_predictions = [p for p in self.trend_change_predictions if p.get('id') not in stored_ids]
-            self.trend_change_predictions = active_predictions + new_predictions
+            # Get all predictions instead of just active ones
+            all_predictions = self.trend_change_tracker.predictions
+            # Sort: Active first, then by date newest
+            active_preds = [p for p in all_predictions if p.get('status') == 'active']
+            other_preds = [p for p in all_predictions if p.get('status') != 'active']
+            
+            # Sort others by verification date or timestamp
+            other_preds.sort(key=lambda x: x.get('verification_date') or x.get('timestamp', ''), reverse=True)
+            
+            # Combine
+            self.trend_change_predictions = active_preds + other_preds
         except Exception as e:
             logger.error(f"Error loading trend change predictions: {e}")
+            self.trend_change_predictions = []
         
         # Clear tree
         for item in self.trend_change_tree.get_children():
             self.trend_change_tree.delete(item)
+        
+        # Emoji mapping for trends
+        trend_emojis = {
+            'uptrend': '📈 Uptrend',
+            'downtrend': '📉 Downtrend',
+            'sideways': '➡️ Sideways',
+            'bullish_reversal': '🔼 Bullish Rev',
+            'bearish_reversal': '🔽 Bearish Rev',
+            'continuation': '➡️ Continuation'
+        }
         
         # Add all trend change predictions
         for pred in self.trend_change_predictions:
@@ -4206,50 +4703,73 @@ class StockerApp:
             try:
                 from datetime import datetime
                 estimated_date = datetime.fromisoformat(pred['estimated_date'])
-                date_str = estimated_date.strftime("%Y-%m-%d")
-            except:
+                date_str = estimated_date.strftime("%m-%d") # Use shorter date
+            except (ValueError, KeyError, AttributeError):
                 date_str = "N/A"
             
-            # Format predicted change
-            change_type = pred['predicted_change']
-            if change_type == 'bullish_reversal':
-                change_display = "🔼 Bullish Reversal"
-            elif change_type == 'bearish_reversal':
-                change_display = "🔽 Bearish Reversal"
-            elif change_type == 'continuation':
-                change_display = "➡️ Continuation"
-            else:
-                change_display = change_type.replace('_', ' ').title()
+            # Format trends
+            curr_trend = pred.get('current_trend', 'unknown').lower()
+            curr_trend_display = trend_emojis.get(curr_trend, curr_trend.title())
+            
+            change_type = pred.get('predicted_change', 'unknown').lower()
+            change_display = trend_emojis.get(change_type, change_type.replace('_', ' ').title())
+            
+            # Visual confidence bar
+            conf = pred.get('confidence', 0)
+            bar_len = 10
+            filled = int((conf / 100) * bar_len)
+            conf_bar = "█" * filled + "░" * (bar_len - filled)
+            conf_display = f"{conf_bar} {conf}%"
+            
+            # Determine Status Display
+            status = pred.get('status', 'active').title()
+            was_correct = pred.get('was_correct')
+            
+            if status == 'Verified':
+                if was_correct:
+                    status = "Correct ✅"
+                elif was_correct is False:
+                    status = "Incorrect ❌"
             
             pred_id = pred.get('id', '')
             values = (
                 str(pred_id),  # ID column (hidden)
                 pred['symbol'],
-                pred['current_trend'].title(),
+                curr_trend_display,
                 change_display,
-                f"{pred['estimated_days']} days",
+                f"{pred.get('estimated_days', 0)}d",
                 date_str,
-                f"{pred['confidence']:.0f}%",
-                '✕'  # X symbol for delete
+                conf_display,
+                status, # Status column
+                '✕'
             )
             
             item = self.trend_change_tree.insert('', tk.END, values=values)
             
-            # Tag based on confidence
-            tags = []
-            if pred['confidence'] >= 75:
-                tags.append('high_confidence')
-            elif pred['confidence'] >= 60:
-                tags.append('medium_confidence')
-            else:
-                tags.append('low_confidence')
+            # Color coding
+            item_tags = []
+            if 'Bullish' in change_display or 'Uptrend' in change_display:
+                item_tags.append('bullish_tag')
+            elif 'Bearish' in change_display or 'Downtrend' in change_display:
+                item_tags.append('bearish_tag')
             
-            # Add delete cell tag
-            tags.append('delete_cell')
-            self.trend_change_tree.item(item, tags=tuple(tags))
+            # Tag based on confidence
+            if pred['confidence'] >= 75:
+                item_tags.append('high_confidence')
+            elif pred['confidence'] >= 60:
+                item_tags.append('medium_confidence')
+            else:
+                item_tags.append('low_confidence')
+            
+            # Add delete tag for hover effect
+            item_tags.append('delete_cell')
+            
+            self.trend_change_tree.item(item, tags=tuple(item_tags))
         
-        # Configure tags
-        self.trend_change_tree.tag_configure('high_confidence', foreground=theme['success'])
+        # Configure tags for colors
+        self.trend_change_tree.tag_configure('bullish_tag', foreground=theme['success'])
+        self.trend_change_tree.tag_configure('bearish_tag', foreground=theme['error'])
+        self.trend_change_tree.tag_configure('high_confidence', font=('Segoe UI', 9, 'bold'))
         self.trend_change_tree.tag_configure('medium_confidence', foreground=theme['warning'])
         self.trend_change_tree.tag_configure('low_confidence', foreground=theme['text_secondary'])
         self.trend_change_tree.tag_configure('delete_cell', foreground=theme['fg'])
@@ -4259,6 +4779,158 @@ class StockerApp:
         self.trend_change_tree.bind('<Button-1>', self._on_trend_change_tree_click)
         self.trend_change_tree.bind('<Motion>', self._on_trend_change_tree_motion)
         self.trend_change_tree.bind('<Leave>', self._on_trend_change_tree_leave)
+    
+    def _create_momentum_changes_tab(self):
+        """Create the dedicated momentum changes tab"""
+        theme = self.theme_manager.get_theme()
+        
+        # Header
+        header_frame = tk.Frame(self.momentum_changes_frame, bg=theme['bg'])
+        header_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        title_label = tk.Label(header_frame, text="🔄 Momentum & Action Changes", 
+                              font=('Segoe UI', 14, 'bold'), bg=theme['bg'], fg=theme['fg'])
+        title_label.pack(side=tk.LEFT)
+        
+        refresh_btn = ModernButton(header_frame, text="Refresh", 
+                                  command=self._refresh_momentum_changes, theme=theme)
+        refresh_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        
+        clear_btn = ModernButton(header_frame, text="🗑️ Clear History", 
+                                command=self._clear_momentum_changes, theme=theme)
+        clear_btn.pack(side=tk.RIGHT)
+        
+        # Info label
+        info_label = tk.Label(self.momentum_changes_frame, 
+                             text="This tab tracks recommendation changes (BUY/SELL/HOLD) and momentum shifts.\n"
+                                  "Double-click a row to analyze the stock immediately.",
+                             font=('Segoe UI', 9), bg=theme['bg'], fg=theme['text_secondary'],
+                             justify=tk.LEFT)
+        info_label.pack(fill=tk.X, pady=(0, 15))
+        
+        # Treeview for momentum changes
+        list_card = ModernCard(self.momentum_changes_frame, "", theme=theme, padding=15)
+        list_card.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+        
+        list_inner = tk.Frame(list_card, bg=theme['card_bg'])
+        list_inner.pack(fill=tk.BOTH, expand=True)
+        
+        columns = ('Time', 'Symbol', 'Type', 'From', 'To', 'Changes', 'Confidence', 'Strategy')
+        self.momentum_changes_tree = ttk.Treeview(list_inner, columns=columns, show='headings', height=15)
+        
+        for col in columns:
+            self.momentum_changes_tree.heading(col, text=col, anchor=tk.CENTER)
+            if col == 'Time':
+                self.momentum_changes_tree.column(col, width=150, anchor=tk.CENTER)
+            elif col == 'Symbol':
+                self.momentum_changes_tree.column(col, width=80, anchor=tk.CENTER)
+            elif col == 'Changes':
+                self.momentum_changes_tree.column(col, width=300, anchor=tk.W)
+            else:
+                self.momentum_changes_tree.column(col, width=100, anchor=tk.CENTER)
+        
+        # Bind double-click to analyze stock
+        self.momentum_changes_tree.bind('<Double-1>', self._on_momentum_changes_tree_double_click)
+        
+        tree_scrollbar = ModernScrollbar(list_inner, command=self.momentum_changes_tree.yview, theme=theme)
+        self.momentum_changes_tree.configure(yscrollcommand=tree_scrollbar.set)
+        
+        # Bind mousewheel to treeview for scrolling
+        def on_mom_tree_mousewheel(event):
+            delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
+            if isinstance(delta, (int, float)):
+                scroll_amount = int(-1 * (delta / 120)) * 3
+                self.momentum_changes_tree.yview_scroll(scroll_amount, "units")
+            return "break"
+        
+        self.momentum_changes_tree.bind("<MouseWheel>", on_mom_tree_mousewheel)
+        self.momentum_changes_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+        
+        # Initial display update
+        self._update_momentum_changes_display()
+
+    def _update_momentum_changes_display(self):
+        """Update the momentum changes tree with history"""
+        if not hasattr(self, 'momentum_changes_tree'):
+            return
+            
+        # Clear tree
+        for item in self.momentum_changes_tree.get_children():
+            self.momentum_changes_tree.delete(item)
+        
+        theme = self.theme_manager.get_theme()
+        
+        # Ensure we're using current history
+        self.momentum_changes_history = self.momentum_monitor.history
+        
+        # Add changes from history (newest first)
+        for change_info in reversed(self.momentum_changes_history):
+            symbol = change_info['symbol']
+            changes = change_info['changes']
+            recommendation = changes.get('recommendation', {})
+            
+            new_action = recommendation.get('action', 'HOLD')
+            prev_action = change_info.get('action', 'N/A')
+            
+            is_trend_reversal = changes.get('trend_reversed', False)
+            change_type = "Trend Reversal" if is_trend_reversal else "Momentum shift"
+            
+            timestamp = change_info.get('time', datetime.now().strftime("%H:%M:%S"))
+            
+            # Format changes list
+            detected_changes = changes.get('changes', [])
+            changes_str = ", ".join(detected_changes) if detected_changes else "No specific changes"
+            
+            values = (
+                timestamp,
+                symbol,
+                change_type,
+                prev_action,
+                new_action,
+                changes_str,
+                f"{recommendation.get('confidence', 50)}%",
+                change_info.get('strategy', 'mixed').title()
+            )
+            
+            item = self.momentum_changes_tree.insert('', tk.END, values=values)
+            
+            # Apply tags for coloring
+            if new_action == "BUY":
+                self.momentum_changes_tree.item(item, tags=('buy_action',))
+            elif new_action == "SELL":
+                self.momentum_changes_tree.item(item, tags=('sell_action',))
+            else:
+                self.momentum_changes_tree.item(item, tags=('hold_action',))
+        
+        # Configure tags
+        self.momentum_changes_tree.tag_configure('buy_action', foreground=theme['success'])
+        self.momentum_changes_tree.tag_configure('sell_action', foreground=theme['warning'])
+        self.momentum_changes_tree.tag_configure('hold_action', foreground=theme['text_secondary'])
+
+    def _on_momentum_changes_tree_double_click(self, event):
+        """Handle double-click to analyze stock from momentum changes"""
+        item = self.momentum_changes_tree.identify_row(event.y)
+        if item:
+            values = self.momentum_changes_tree.item(item, 'values')
+            if values and len(values) > 1:
+                symbol = values[1]
+                # Switch to analysis tab and analyze
+                self.symbol_entry.delete(0, tk.END)
+                self.symbol_entry.insert(0, symbol)
+                self.notebook.select(0)  # Analysis tab
+                self._analyze_stock()
+
+    def _refresh_momentum_changes(self):
+        """Refresh momentum changes display"""
+        self._update_momentum_changes_display()
+
+    def _clear_momentum_changes(self):
+        """Clear momentum changes history for this session and persistent storage"""
+        if messagebox.askyesno("Clear History", "Clear all momentum change history?"):
+            self.momentum_monitor.clear_history()
+            self.momentum_changes_history = self.momentum_monitor.history
+            self._update_momentum_changes_display()
     
     def _on_trend_change_tree_click(self, event):
         """Handle click on trend change tree, specifically for delete column"""
@@ -4295,6 +4967,203 @@ class StockerApp:
                                     messagebox.showwarning("Error", "Could not delete prediction.")
                         except (ValueError, TypeError) as e:
                             logger.error(f"Error parsing prediction ID: {e}")
+    
+    def _on_trend_change_tree_double_click(self, event):
+        """Handle double-click on trend change tree to verify prediction"""
+        region = self.trend_change_tree.identify_region(event.x, event.y)
+        
+        if region == 'cell':
+            column = self.trend_change_tree.identify_column(event.x)
+            item = self.trend_change_tree.identify_row(event.y)
+            
+            if item and column:
+                col_index = int(column.replace('#', '')) - 1
+                columns = ('ID', 'Symbol', 'Current Trend', 'Predicted Change', 'Estimated Days', 'Estimated Date', 'Confidence', 'Delete')
+                
+                # Don't open dialog if clicking on Delete column
+                if col_index < len(columns) and columns[col_index] != 'Delete':
+                    # Get prediction ID
+                    pred_id = self.trend_change_tree.set(item, 'ID')
+                    if pred_id:
+                        try:
+                            pred_id = int(pred_id)
+                            self._show_verify_trend_change_dialog(pred_id)
+                        except (ValueError, TypeError) as e:
+                            logger.error(f"Error parsing prediction ID: {e}")
+    
+    def _show_verify_trend_change_dialog(self, prediction_id: int):
+        """Show dialog to verify a trend change prediction"""
+        # Get prediction
+        prediction = self.trend_change_tracker.get_prediction_by_id(prediction_id)
+        if not prediction:
+            messagebox.showerror("Error", "Prediction not found.")
+            return
+        
+        if prediction.get('status') != 'active':
+            messagebox.showinfo("Already Verified", "This prediction has already been verified.")
+            return
+        
+        # Create dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Verify Trend Change Prediction")
+        dialog.geometry("500x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        theme = self.theme_manager.get_theme()
+        dialog.config(bg=theme['bg'])
+        
+        # Header
+        header = tk.Label(
+            dialog,
+            text="Verify Trend Change Prediction",
+            bg=theme['bg'],
+            fg=theme['accent'],
+            font=('Segoe UI', 14, 'bold')
+        )
+        header.pack(pady=20)
+        
+        # Prediction info
+        info_frame = tk.Frame(dialog, bg=theme['bg'])
+        info_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        info_text = f"""
+Symbol: {prediction['symbol']}
+Current Trend: {prediction['current_trend'].title()}
+Predicted Change: {prediction['predicted_change'].replace('_', ' ').title()}
+Estimated Date: {prediction['estimated_date'][:10]}
+Confidence: {prediction['confidence']:.0f}%
+        """
+        
+        tk.Label(
+            info_frame,
+            text=info_text.strip(),
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10),
+            justify=tk.LEFT
+        ).pack(anchor=tk.W)
+        
+        # Actual change selection
+        change_frame = tk.Frame(dialog, bg=theme['bg'])
+        change_frame.pack(pady=20, padx=20, fill=tk.X)
+        
+        tk.Label(
+            change_frame,
+            text="What actually happened?",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 11, 'bold')
+        ).pack(anchor=tk.W, pady=(0, 10))
+        
+        actual_change_var = tk.StringVar(value="bullish_reversal")
+        
+        change_options = [
+            ("🔼 Bullish Reversal", "bullish_reversal"),
+            ("🔽 Bearish Reversal", "bearish_reversal"),
+            ("➡️ Continuation", "continuation"),
+            ("↔️ No Change", "no_change")
+        ]
+        
+        for text, value in change_options:
+            rb = tk.Radiobutton(
+                change_frame,
+                text=text,
+                variable=actual_change_var,
+                value=value,
+                bg=theme['bg'],
+                fg=theme['fg'],
+                font=('Segoe UI', 10),
+                selectcolor=theme['frame_bg'],
+                activebackground=theme['bg'],
+                activeforeground=theme['fg']
+            )
+            rb.pack(anchor=tk.W, pady=5)
+        
+        # Buttons
+        btn_frame = tk.Frame(dialog, bg=theme['bg'])
+        btn_frame.pack(pady=20)
+        
+        def verify_correct():
+            actual_change = actual_change_var.get()
+            was_correct = (actual_change == prediction['predicted_change'])
+            
+            # Verify prediction
+            verified = self.trend_change_tracker.verify_prediction(
+                prediction_id,
+                actual_change,
+                was_correct
+            )
+            
+            if verified:
+                # Record for learning
+                if hasattr(self, 'learning_tracker'):
+                    self.learning_tracker.record_verified_trend_change(
+                        prediction['symbol'],
+                        prediction['predicted_change'],
+                        actual_change,
+                        was_correct
+                    )
+                
+                messagebox.showinfo(
+                    "Verified",
+                    f"Prediction marked as {'✅ CORRECT' if was_correct else '❌ INCORRECT'}!"
+                )
+                dialog.destroy()
+                self._update_trend_change_display()
+            else:
+                messagebox.showerror("Error", "Failed to verify prediction.")
+        
+        correct_btn = ModernButton(
+            btn_frame,
+            "✅ Mark as Correct",
+            command=verify_correct,
+            theme=theme
+        )
+        correct_btn.pack(side=tk.LEFT, padx=5)
+        
+        def verify_incorrect():
+            actual_change = actual_change_var.get()
+            was_correct = False  # Explicitly incorrect
+            
+            # Verify prediction
+            verified = self.trend_change_tracker.verify_prediction(
+                prediction_id,
+                actual_change,
+                was_correct
+            )
+            
+            if verified:
+                # Record for learning
+                if hasattr(self, 'learning_tracker'):
+                    self.learning_tracker.record_verified_trend_change(
+                        prediction['symbol'],
+                        prediction['predicted_change'],
+                        actual_change,
+                        was_correct
+                    )
+                
+                messagebox.showinfo("Verified", "Prediction marked as ❌ INCORRECT!")
+                dialog.destroy()
+                self._update_trend_change_display()
+            else:
+                messagebox.showerror("Error", "Failed to verify prediction.")
+        
+        incorrect_btn = ModernButton(
+            btn_frame,
+            "❌ Mark as Incorrect",
+            command=verify_incorrect,
+            theme=theme
+        )
+        incorrect_btn.pack(side=tk.LEFT, padx=5)
+        
+        cancel_btn = ModernButton(
+            btn_frame,
+            "Cancel",
+            command=dialog.destroy,
+            theme=theme
+        )
+        cancel_btn.pack(side=tk.LEFT, padx=5)
     
     def _on_trend_change_tree_motion(self, event):
         """Handle mouse motion over trend change tree for delete hover effect"""
@@ -4366,13 +5235,15 @@ class StockerApp:
             self.trend_change_predictions = []
     
     def _refresh_trend_changes(self):
-        """Refresh trend change predictions for current symbol"""
-        if not hasattr(self, 'current_symbol') or not self.current_symbol:
-            messagebox.showinfo("Info", "Please analyze a stock first to generate trend change predictions.")
-            return
-        
-        # Re-analyze current symbol to get fresh predictions
-        self._perform_analysis(self.current_symbol)
+        """Refresh trend change predictions display from storage"""
+        # Reload predictions from persistent storage and update display
+        try:
+            self._load_trend_change_predictions()
+            self._update_trend_change_display()
+            logger.info("Trend change predictions refreshed from storage")
+        except Exception as e:
+            logger.error(f"Error refreshing trend change predictions: {e}")
+            messagebox.showerror("Error", f"Failed to refresh trend change predictions: {e}")
     
     def _refresh_predictions(self):
         """Refresh predictions display"""
@@ -4539,6 +5410,7 @@ class StockerApp:
                 self.data_dir, self.current_strategy,
                 trading_analyzer=self.trading_analyzer if self.current_strategy == 'trading' else None,
                 investing_analyzer=self.investing_analyzer if self.current_strategy == 'investing' else None,
+                seeker_ai=getattr(self, 'seeker_ai', None),
                 mixed_analyzer=self.mixed_analyzer if self.current_strategy == 'mixed' else None
             )
     
@@ -4810,24 +5682,36 @@ class StockerApp:
             card = ModernCard(scroll_frame, f"{rec['symbol']} - {rec['name']}", theme=theme, padding=15)
             card.pack(fill=tk.X, padx=20, pady=10)
             
-            # Format prices in both USD and EUR
+            # Determine sentiment based on action (inverted)
+            action = rec.get('action', 'SELL') # Default to SELL for scanner
+            sentiment = "BULLISH 🟢" if action == 'SELL' else "BEARISH 🔴" if action == 'BUY' else "NEUTRAL ⚪"
+            
+            # Visual confidence bar
+            conf = rec.get('confidence', 0)
+            bar_len = 15
+            filled = int((conf / 100) * bar_len)
+            conf_bar = "█" * filled + "░" * (bar_len - filled)
+            
             price_usd = f"${rec['price']:,.2f}"
             price_eur = f"€{self.localization.convert_from_usd(rec['price'], 'EUR'):,.2f}"
-            info_text = f"Price: {price_usd} USD / {price_eur} EUR\n"
-            info_text += f"Confidence: {rec['confidence']:.1f}%\n"
+            
+            info_text = f"🔭 Market Sentiment: {sentiment}\n"
+            info_text += f"📊 Strategy Signal: {action} (Inverted Logic)\n"
+            info_text += f"🎯 Confidence: [{conf_bar}] {conf:.1f}%\n"
+            info_text += f"💰 Current Price: {price_usd} / {price_eur}\n\n"
             
             entry_usd = f"${rec['entry_price']:,.2f}"
             entry_eur = f"€{self.localization.convert_from_usd(rec['entry_price'], 'EUR'):,.2f}"
-            info_text += f"Entry: {entry_usd} USD / {entry_eur} EUR\n"
+            info_text += f"🟢 Entry Target: {entry_usd} / {entry_eur}\n"
             
             target_usd = f"${rec['target_price']:,.2f}"
             target_eur = f"€{self.localization.convert_from_usd(rec['target_price'], 'EUR'):,.2f}"
-            info_text += f"Target: {target_usd} USD / {target_eur} EUR\n"
+            info_text += f"🏁 Target Exit:  {target_usd} / {target_eur}\n"
             
             stop_usd = f"${rec['stop_loss']:,.2f}"
             stop_eur = f"€{self.localization.convert_from_usd(rec['stop_loss'], 'EUR'):,.2f}"
-            info_text += f"Stop Loss: {stop_usd} USD / {stop_eur} EUR\n\n"
-            info_text += f"Reasoning: {rec['reasoning']}"
+            info_text += f"🛑 Stop Loss:    {stop_usd} / {stop_eur}\n\n"
+            info_text += f"📝 Reasoning: {rec['reasoning']}"
             
             info_label = tk.Label(card.content_frame, text=info_text, bg=theme['card_bg'],
                                 fg=theme['fg'], font=('Segoe UI', 10), justify=tk.LEFT)
@@ -4994,6 +5878,14 @@ class StockerApp:
                 
                 # Show notification if significant changes detected
                 if momentum_changes.get('trend_reversed') or (momentum_changes.get('momentum_changed') and len(momentum_changes.get('changes', [])) > 0):
+                    # Add to history
+                    self.momentum_monitor.add_to_history(
+                        symbol=symbol,
+                        action='ANALYSIS',  # From manual analysis
+                        changes=momentum_changes,
+                        strategy=strategy
+                    )
+                    self.root.after(0, self._update_momentum_changes_display)
                     self.root.after(0, self._show_momentum_change_notification, symbol, momentum_changes)
             
             # For mixed strategy, we need to get technical indicators separately
@@ -5012,6 +5904,14 @@ class StockerApp:
                         
                         # Show notification if significant changes detected
                         if momentum_changes.get('trend_reversed') or (momentum_changes.get('momentum_changed') and len(momentum_changes.get('changes', [])) > 0):
+                            # Add to history
+                            self.momentum_monitor.add_to_history(
+                                symbol=symbol,
+                                action='ANALYSIS',
+                                changes=momentum_changes,
+                                strategy=strategy
+                            )
+                            self.root.after(0, self._update_momentum_changes_display)
                             self.root.after(0, self._show_momentum_change_notification, symbol, momentum_changes)
                 except Exception as e:
                     logger.debug(f"Could not check momentum for mixed strategy: {e}")
@@ -5103,6 +6003,38 @@ class StockerApp:
                     logger.error(f"Error getting Seeker AI research: {e}")
                     # Continue without Seeker AI if it fails
             
+            # Analyze for better buying opportunities (Buy Opportunity Data for Megamind)
+            try:
+                # Get technical indicators and price action (use trading analysis if current strategy is mixed/investing)
+                indicators_for_opp = analysis.get('indicators')
+                price_action_for_opp = analysis.get('price_action')
+                
+                if not indicators_for_opp or not price_action_for_opp:
+                    # Fallback to trading analyzer if indicators missing (common for mixed/investing)
+                    trading_fallback = self.trading_analyzer.analyze(stock_data, history_data)
+                    indicators_for_opp = trading_fallback.get('indicators')
+                    price_action_for_opp = trading_fallback.get('price_action')
+                
+                if indicators_for_opp and price_action_for_opp:
+                    buy_opp = self.llm_ai_predictor.analyze_buy_opportunity(
+                        symbol, stock_data.get('price', 0), 
+                        indicators_for_opp, price_action_for_opp, strategy
+                    )
+                    if buy_opp:
+                        analysis['buy_opportunity'] = buy_opp
+                        # Feed to Megamind (Learning Tracker)
+                        self.learning_tracker.record_buy_opportunity_prediction(
+                            symbol=symbol,
+                            current_price=stock_data.get('price', 0),
+                            predicted_price=buy_opp['predicted_price'],
+                            estimated_date=buy_opp['predicted_date'],
+                            confidence=buy_opp['confidence'],
+                            reasoning=buy_opp['reasoning']
+                        )
+                        logger.info(f"🧠 Buy opportunity detected for {symbol} and fed to Megamind for learning")
+            except Exception as e:
+                logger.error(f"Error in buy opportunity analysis: {e}")
+            
             # Update UI in main thread
             self.root.after(0, self._display_analysis, analysis, history_data, symbol)
             
@@ -5184,9 +6116,9 @@ class StockerApp:
                 (len(bearish_predictions) > 0 and any(p.get('confidence', 0) >= 60 for p in bearish_predictions))  # High confidence bearish reversal
             )
             
-            # Convert HOLD to BUY if potential gains detected
+            # Convert HOLD to SELL if potential gains detected (Bullish signal)
             if has_potential_gains and not is_overbought:
-                action = 'BUY'
+                action = 'SELL'
                 # Recalculate entry/target/stop based on current price
                 current_price = recommendation.get('entry_price', 0)
                 if not current_price or current_price <= 0:
@@ -5199,11 +6131,9 @@ class StockerApp:
                     if bullish_predictions:
                         best_pred = max(bullish_predictions, key=lambda p: p.get('confidence', 0))
                         # Try to get predicted low price from the prediction
-                        # Check if it's stored in the prediction dict
                         predicted_low = best_pred.get('predicted_low_price')
                         if not predicted_low or predicted_low <= 0:
                             # Calculate from predicted price drop percentage
-                            # Extract from reasoning or use default based on confidence
                             confidence_pred = best_pred.get('confidence', 50)
                             drop_pct = min(10, max(3, confidence_pred / 7))  # 3-10% drop based on confidence
                             predicted_low = current_price * (1 - drop_pct / 100)
@@ -5223,11 +6153,11 @@ class StockerApp:
                     confidence = max(confidence, 60)  # Boost confidence if trend reversal predicted
                     recommendation['confidence'] = confidence
                     
-                    logger.info(f"Converted HOLD to BUY for {symbol} based on bullish reversal predictions")
+                    logger.info(f"Converted HOLD to SELL (Bullish) for {symbol} based on bullish reversal predictions")
             
-            # Convert HOLD to SELL if overbought
+            # Convert HOLD to BUY if overbought (Bearish signal)
             elif is_overbought and not has_potential_gains:
-                action = 'SELL'
+                action = 'BUY'
                 current_price = recommendation.get('entry_price', 0)
                 if not current_price or current_price <= 0:
                     if hasattr(self, 'current_data') and self.current_data and 'price' in self.current_data:
@@ -5245,11 +6175,11 @@ class StockerApp:
                     confidence = max(confidence, 60)
                     recommendation['confidence'] = confidence
                     
-                    logger.info(f"Converted HOLD to SELL for {symbol} based on overbought conditions")
+                    logger.info(f"Converted HOLD to BUY (Bearish) for {symbol} based on overbought conditions")
         
-        # CRITICAL FIX: Check if BUY recommendation contradicts trend reversal predictions
-        # If trend predictions show price will drop first, convert BUY to HOLD or adjust entry
-        if action == 'BUY' and symbol:
+        # CRITICAL FIX: Check if SELL recommendation (Bullish) contradicts trend reversal predictions
+        # If trend predictions show price will drop significantly first, convert SELL to HOLD or adjust entry
+        if action == 'SELL' and symbol:
             trend_predictions = analysis.get('trend_predictions', [])
             if trend_predictions:
                 bullish_predictions = [p for p in trend_predictions if p.get('predicted_change') == 'bullish_reversal']
@@ -5286,7 +6216,7 @@ class StockerApp:
                         # If entry is at current price but significant drop is predicted, convert to HOLD
                         if drop_from_current > 5 and entry_price_diff_from_current < 3:
                             # Entry price is at current price, but drop is predicted - convert to HOLD
-                            logger.warning(f"⚠️ BUY recommendation contradicts trend prediction: price predicted to drop {drop_from_current:.1f}% to ${predicted_low:.2f} before reversal. Converting BUY to HOLD.")
+                            logger.warning(f"⚠️ SELL recommendation contradicts trend prediction: price predicted to drop {drop_from_current:.1f}% to ${predicted_low:.2f} before reversal. Converting SELL to HOLD.")
                             action = 'HOLD'
                             recommendation['action'] = 'HOLD'
                             recommendation['confidence'] = max(confidence - 10, 40)  # Reduce confidence
@@ -5294,7 +6224,7 @@ class StockerApp:
                             # Update reasoning to explain why
                             original_reasoning = analysis.get('reasoning', '')
                             analysis['reasoning'] = original_reasoning + f"\n\n⚠️ IMPORTANT: Trend reversal predictions indicate price is likely to drop to ${predicted_low:.2f} ({drop_from_current:.1f}% below current ${current_market_price:.2f}) before a bullish reversal. " + \
-                                f"Recommendation changed from BUY to HOLD - wait for entry near ${predicted_low:.2f} for optimal entry point."
+                                f"Recommendation changed from SELL to HOLD - wait for entry near ${predicted_low:.2f} for optimal entry point."
                         
                         # If entry price is already set to predicted low (or close), that's correct - just verify
                         elif entry_price_diff_from_predicted < 5 and drop_from_current > 3:
@@ -5359,10 +6289,43 @@ class StockerApp:
                     else:
                         logger.info(f"Updated existing prediction for {symbol}")
                 else:
+                    # Calculate magnitude prediction if possible
+                    predicted_move_pct = None
+                    if hasattr(self, 'price_move_predictor') and self.price_move_predictor:
+                        try:
+                            # Get required indicators
+                            indicators = analysis.get('indicators', {})
+                            
+                            # Estimate volatility (ATR if available, else fallback)
+                            atr = indicators.get('atr', 0)
+                            if atr > 0 and entry_price > 0:
+                                atr_percent = (atr / entry_price * 100)
+                            else:
+                                atr_percent = 2.0 # Default if unavailable
+                                
+                            volatility_metrics = {
+                                'atr': atr,
+                                'atr_percent': atr_percent
+                            }
+                            
+                            move_pred = self.price_move_predictor.predict_move(
+                                action, entry_price, indicators, volatility_metrics
+                            )
+                            
+                            predicted_move_pct = move_pred.get('predicted_pct')
+                            
+                            # Add this info to reasoning if it's a significant prediction
+                            if predicted_move_pct:
+                                reasoning += f"\n\n🎯 Magnitude Prediction: Price expected to {move_pred.get('direction', 'move')} by ~{predicted_move_pct:.1f}% " \
+                                             f"(Confidence: {move_pred.get('confidence')}%)"
+                        except Exception as e:
+                            logger.warn(f"Error calculating magnitude prediction: {e}")
+                    
                     # Create new prediction
                     prediction = self.predictions_tracker.add_prediction(
                         symbol, strategy, action, entry_price,
-                        target_price, stop_loss, confidence, reasoning, estimated_days
+                        target_price, stop_loss, confidence, reasoning, estimated_days,
+                        predicted_move_pct=predicted_move_pct
                     )
                     logger.info(f"Auto-saved prediction #{prediction['id']} for {symbol} (target date: {prediction.get('estimated_target_date', 'N/A')})")
                     
@@ -5435,14 +6398,28 @@ class StockerApp:
                 current_price_display = recommendation.get('entry_price', 0)
                 logger.debug(f"Using fallback price from recommendation: {current_price_display}")
         
+        # Determine sentiment and visual indicators
+        analysis_reasoning = analysis.get('reasoning', '')
+        sentiment = "BULLISH 🟢" if action == 'SELL' else "BEARISH 🔴" if action == 'BUY' else "NEUTRAL ⚪"
+        if action == 'HOLD':
+            # Check if it's a "Wait for Entry" HOLD
+            if 'trend reversal predictions indicate price is likely to drop' in analysis_reasoning.lower() or \
+               'price predicted to drop' in analysis_reasoning.lower():
+                sentiment = "BULLISH (WAITING) 🟡"
+        
+        # Visual confidence bar
+        bar_len = 20
+        filled = int((confidence / 100) * bar_len)
+        conf_bar = "█" * filled + "░" * (bar_len - filled)
+        
         header = f"{'='*60}\n"
-        header += f"RECOMMENDATION: {action} (Confidence: {confidence}%)\n"
+        header += f"🔭 MARKET SENTIMENT: {sentiment}\n"
+        header += f"📊 STRATEGY SIGNAL: {action} (Inverted Logic)\n"
+        header += f"🎯 CONFIDENCE: [{conf_bar}] {confidence}%\n"
         
         # Add warning if HOLD was recommended due to predicted price drop
-        analysis_reasoning = analysis.get('reasoning', '')
-        if action == 'HOLD' and ('trend reversal predictions indicate price is likely to drop' in analysis_reasoning.lower() or 
-                                 'price predicted to drop' in analysis_reasoning.lower()):
-            header += f"   ⚠️ WAIT FOR BETTER ENTRY - Price drop predicted before reversal\n"
+        if "WAITING" in sentiment:
+            header += f"   ⚠️ STRATEGY: Wait for lower price entry before bullish reversal\n"
         
         header += f"{'='*60}\n\n"
         
@@ -5474,6 +6451,9 @@ class StockerApp:
                         header += f"      💡 Recommendation: Wait for price to drop to entry level before buying\n"
                     else:
                         header += f"   ⚠️ ENTRY ABOVE CURRENT: Entry price (${entry_price:.2f}) is {price_diff_pct:.1f}% above current price (${current_price_display:.2f})\n"
+                else:
+                    header += f"   ✅ OPTIMAL ENTRY: Current price aligns with calculated entry target (${entry_price:.2f})\n"
+                    header += f"      💡 Recommendation: This is a favorable position according to hybrid calculations.\n"
             # Format target price
             target_usd = f"${target_price:,.2f}"
             target_eur = f"€{self.localization.convert_from_usd(target_price, 'EUR'):,.2f}"
@@ -5545,6 +6525,22 @@ class StockerApp:
         header += f"{'='*60}\n\n"
         
         self.analysis_text.insert(tk.END, header)
+        
+        # Add Buy Opportunity Data if available
+        buy_opp = analysis.get('buy_opportunity')
+        if buy_opp:
+            opp_header = f"{'='*60}\n"
+            opp_header += "💎 BUY OPPORTUNITY DATA (MEGAMIND)\n"
+            opp_header += f"{'='*60}\n\n"
+            
+            opp_header += f"   Predicted Better Entry: ${buy_opp['predicted_price']:,.2f} USD / €{self.localization.convert_from_usd(buy_opp['predicted_price'], 'EUR'):,.2f} EUR\n"
+            opp_header += f"   Estimated Date: {buy_opp['predicted_date']}\n"
+            opp_header += f"   Confidence: {buy_opp['confidence']:.1f}%\n"
+            opp_header += f"   Reasoning: {buy_opp['reasoning']}\n\n"
+            
+            opp_header += f"{'='*60}\n\n"
+            self.analysis_text.insert(tk.END, opp_header)
+            
         self.analysis_text.insert(tk.END, reasoning)
         
         # Display Seeker AI research if available
@@ -6264,8 +7260,8 @@ class StockerApp:
         if icon_path.exists():
             try:
                 dialog.iconbitmap(str(icon_path))
-            except:
-                pass
+            except (tk.TclError, OSError) as e:
+                logger.debug(f"Could not set dialog icon: {e}")
         
         # Main container
         main_frame = tk.Frame(dialog, bg=theme['bg'])
@@ -6285,8 +7281,9 @@ class StockerApp:
                 icon_label = tk.Label(icon_frame, image=photo, bg=theme['bg'])
                 icon_label.image = photo
                 icon_label.pack()
-            except:
-                icon_label = tk.Label(icon_frame, text="📈", font=('Segoe UI', 48), 
+            except (OSError, tk.TclError, AttributeError) as e:
+                logger.debug(f"Could not load icon image: {e}")
+                icon_label = tk.Label(icon_frame, text="📈", font=('Segoe UI', 48),
                                     bg=theme['bg'], fg=theme['accent'])
                 icon_label.pack()
         else:
@@ -7173,6 +8170,241 @@ By using this application, you acknowledge that you understand and accept these 
         )
         status_text.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
         
+        # Configuration save/load section
+        config_frame = tk.Frame(dialog, bg=theme['bg'])
+        config_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        config_label = tk.Label(
+            config_frame,
+            text="💾 Configuration Save Slots:",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10, 'bold')
+        )
+        config_label.pack(anchor=tk.W, pady=(0, 5))
+        
+        config_btn_frame = tk.Frame(config_frame, bg=theme['bg'])
+        config_btn_frame.pack(fill=tk.X)
+        
+        from ml_config_manager import MLConfigManager
+        config_manager = MLConfigManager(self.data_dir)
+        
+        def save_current_config():
+            """Save current ML training configuration"""
+            name_dialog = tk.Toplevel(dialog)
+            name_dialog.title("Save Configuration")
+            name_dialog.geometry("400x200")
+            name_dialog.transient(dialog)
+            name_dialog.config(bg=theme['bg'])
+            
+            tk.Label(
+                name_dialog,
+                text="Configuration Name:",
+                bg=theme['bg'],
+                fg=theme['fg'],
+                font=('Segoe UI', 10)
+            ).pack(pady=10)
+            
+            name_entry = tk.Entry(
+                name_dialog,
+                font=('Segoe UI', 10),
+                bg=theme['entry_bg'],
+                fg=theme['entry_fg'],
+                width=30
+            )
+            name_entry.pack(pady=5, padx=20, fill=tk.X)
+            name_entry.insert(0, f"config_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            
+            tk.Label(
+                name_dialog,
+                text="Description (optional):",
+                bg=theme['bg'],
+                fg=theme['fg'],
+                font=('Segoe UI', 10)
+            ).pack(pady=(10, 5))
+            
+            desc_entry = tk.Entry(
+                name_dialog,
+                font=('Segoe UI', 10),
+                bg=theme['entry_bg'],
+                fg=theme['entry_fg'],
+                width=30
+            )
+            desc_entry.pack(pady=5, padx=20, fill=tk.X)
+            desc_entry.insert(0, "Current good configuration")
+            
+            def do_save():
+                name = name_entry.get().strip()
+                if not name:
+                    messagebox.showerror("Error", "Configuration name cannot be empty!")
+                    return
+                
+                # Validate name (no special characters for filename safety)
+                import re
+                if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+                    messagebox.showerror("Error", "Configuration name can only contain letters, numbers, underscores, and hyphens!")
+                    return
+                
+                description = desc_entry.get().strip()
+                if config_manager.save_config(name, description):
+                    messagebox.showinfo(
+                        "Success",
+                        f"Configuration '{name}' saved successfully!\n\n"
+                        f"Description: {description or '(none)'}\n\n"
+                        "You can load this configuration anytime from the 'Load Config' button."
+                    )
+                    name_dialog.destroy()
+                else:
+                    messagebox.showerror("Error", f"Failed to save configuration '{name}'")
+            
+            save_btn = ModernButton(
+                name_dialog,
+                "💾 Save",
+                command=do_save,
+                theme=theme
+            )
+            save_btn.pack(pady=10)
+        
+        def load_config():
+            """Load a saved ML training configuration"""
+            configs = config_manager.list_configs()
+            
+            if not configs:
+                messagebox.showinfo("No Configurations", "No saved configurations found.\n\nSave your current configuration first!")
+                return
+            
+            load_dialog = tk.Toplevel(dialog)
+            load_dialog.title("Load Configuration")
+            load_dialog.geometry("500x400")
+            load_dialog.transient(dialog)
+            load_dialog.config(bg=theme['bg'])
+            
+            tk.Label(
+                load_dialog,
+                text="Select Configuration to Load:",
+                bg=theme['bg'],
+                fg=theme['fg'],
+                font=('Segoe UI', 12, 'bold')
+            ).pack(pady=10)
+            
+            # Listbox with scrollbar
+            list_frame = tk.Frame(load_dialog, bg=theme['bg'])
+            list_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
+            
+            scrollbar = ModernScrollbar(list_frame)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            config_listbox = tk.Listbox(
+                list_frame,
+                font=('Segoe UI', 10),
+                bg=theme['frame_bg'],
+                fg=theme['fg'],
+                selectbackground=theme['accent'],
+                yscrollcommand=scrollbar.set,
+                height=10
+            )
+            config_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.config(command=config_listbox.yview)
+            
+            # Populate list
+            for config in configs:
+                name = config.get('name', 'Unknown')
+                desc = config.get('description', '')
+                saved = config.get('saved_at', '')
+                display = f"{name}"
+                if desc:
+                    display += f" - {desc}"
+                if saved:
+                    try:
+                        saved_dt = datetime.fromisoformat(saved)
+                        display += f" ({saved_dt.strftime('%Y-%m-%d %H:%M')})"
+                    except:
+                        pass
+                config_listbox.insert(tk.END, display)
+            
+            if configs:
+                config_listbox.selection_set(0)
+            
+            selected_config = {'name': None}
+            
+            def do_load():
+                selection = config_listbox.curselection()
+                if not selection:
+                    messagebox.showwarning("No Selection", "Please select a configuration to load.")
+                    return
+                
+                selected_name = configs[selection[0]]['name']
+                config = config_manager.load_config(selected_name)
+                
+                if config:
+                    # Apply config to training (for next training run)
+                    # Store in a way that training can use it
+                    self._saved_training_config = config_manager.apply_config_to_training(config)
+                    messagebox.showinfo(
+                        "Configuration Loaded",
+                        f"Configuration '{selected_name}' loaded!\n\n"
+                        f"Description: {config.get('description', 'N/A')}\n\n"
+                        "This configuration will be used for the next training run."
+                    )
+                    load_dialog.destroy()
+                else:
+                    messagebox.showerror("Error", f"Failed to load configuration '{selected_name}'")
+            
+            def do_delete():
+                selection = config_listbox.curselection()
+                if not selection:
+                    messagebox.showwarning("No Selection", "Please select a configuration to delete.")
+                    return
+                
+                selected_name = configs[selection[0]]['name']
+                response = messagebox.askyesno(
+                    "Delete Configuration?",
+                    f"Are you sure you want to delete '{selected_name}'?\n\nThis cannot be undone."
+                )
+                
+                if response:
+                    if config_manager.delete_config(selected_name):
+                        messagebox.showinfo("Deleted", f"Configuration '{selected_name}' deleted.")
+                        load_dialog.destroy()
+                        load_config()  # Refresh list
+                    else:
+                        messagebox.showerror("Error", f"Failed to delete configuration '{selected_name}'")
+            
+            btn_frame_load = tk.Frame(load_dialog, bg=theme['bg'])
+            btn_frame_load.pack(pady=10)
+            
+            load_btn = ModernButton(
+                btn_frame_load,
+                "📂 Load",
+                command=do_load,
+                theme=theme
+            )
+            load_btn.pack(side=tk.LEFT, padx=5)
+            
+            delete_btn = ModernButton(
+                btn_frame_load,
+                "🗑️ Delete",
+                command=do_delete,
+                theme=theme
+            )
+            delete_btn.pack(side=tk.LEFT, padx=5)
+        
+        save_config_btn = ModernButton(
+            config_btn_frame,
+            "💾 Save Current Config",
+            command=save_current_config,
+            theme=theme
+        )
+        save_config_btn.pack(side=tk.LEFT, padx=5)
+        
+        load_config_btn = ModernButton(
+            config_btn_frame,
+            "📂 Load Config",
+            command=load_config,
+            theme=theme
+        )
+        load_config_btn.pack(side=tk.LEFT, padx=5)
+        
         # Buttons
         btn_frame = tk.Frame(dialog, bg=theme['bg'])
         btn_frame.pack(pady=10)
@@ -7804,10 +9036,14 @@ By using this application, you acknowledge that you understand and accept these 
         )
         close_btn.pack(pady=10)
     
-    def _run_backtest(self):
-        """Run backtest manually with strategy selection"""
+    def _start_continuous_backtest(self):
+        """Start continuous backtesting mode"""
+        if self.backtester.continuous_mode:
+            messagebox.showinfo("Continuous Backtesting", "Continuous backtesting is already running!")
+            return
+        
         if self.backtester.is_testing:
-            messagebox.showinfo("Backtest", "Backtest already in progress. Please wait...")
+            messagebox.showinfo("Backtest", "A backtest is already in progress. Please wait...")
             return
         
         # Show strategy selection dialog
@@ -7815,6 +9051,94 @@ By using this application, you acknowledge that you understand and accept these 
         if not selected_strategies:
             return  # User cancelled
         
+        # Show warning about safeguards
+        response = messagebox.askyesno(
+            "Start Continuous Backtesting?",
+            "🔄 Start non-stop continuous backtesting?\n\n"
+            "This will run backtests continuously until you click 'Stop'.\n\n"
+            "⚠️ IMPORTANT:\n"
+            "• Anti-overfitting safeguards are active\n"
+            "• Model will only retrain once per day (24h cooldown)\n"
+            "• Only fresh dates (not tested recently) will be used for training\n"
+            "• This may take hours/days to see significant improvement\n\n"
+            "Continue?"
+        )
+        
+        if not response:
+            return
+        
+        # Start continuous mode
+        strategies_str = ", ".join([s.capitalize() for s in selected_strategies])
+        self.backtester.start_continuous_mode(selected_strategies=selected_strategies)
+        
+        # Update UI
+        self.continuous_backtest_btn.config(state=tk.DISABLED)
+        self.stop_continuous_backtest_btn.config(state=tk.NORMAL)
+        self._update_continuous_backtest_status()
+        
+        messagebox.showinfo(
+            "Continuous Backtesting Started",
+            f"🔄 Continuous backtesting started!\n\n"
+            f"Strategies: {strategies_str}\n"
+            f"Running every 60 seconds...\n\n"
+            "Click 'Stop Continuous Backtesting' to terminate.\n\n"
+            "Monitor the logs to see progress and when safeguards are active."
+        )
+    
+    def _stop_continuous_backtest(self):
+        """Stop continuous backtesting mode"""
+        if not self.backtester.continuous_mode:
+            messagebox.showinfo("Continuous Backtesting", "Continuous backtesting is not running.")
+            return
+        
+        response = messagebox.askyesno(
+            "Stop Continuous Backtesting?",
+            "⏹️ Stop continuous backtesting?\n\n"
+            "The current backtest will complete, then backtesting will stop."
+        )
+        
+        if not response:
+            return
+        
+        self.backtester.stop_continuous_mode()
+        
+        # Update UI
+        self.continuous_backtest_btn.config(state=tk.NORMAL)
+        self.stop_continuous_backtest_btn.config(state=tk.DISABLED)
+        self._update_continuous_backtest_status()
+        
+        messagebox.showinfo(
+            "Continuous Backtesting Stopped",
+            "⏹️ Continuous backtesting stopped.\n\n"
+            "The current backtest will finish, then no new backtests will start."
+        )
+    
+    def _update_continuous_backtest_status(self):
+        """Update the continuous backtesting status label"""
+        if self.backtester.continuous_mode:
+            if self.backtester.is_testing:
+                status = "🔄 Running backtest..."
+            else:
+                status = "⏸️ Waiting for next run..."
+            self.continuous_backtest_status.config(text=status, fg=self.theme_manager.get_theme()['accent'])
+        else:
+            self.continuous_backtest_status.config(text="", fg=self.theme_manager.get_theme()['fg'])
+        
+        # Schedule next update if running
+        if self.backtester.continuous_mode:
+            self.root.after(5000, self._update_continuous_backtest_status)  # Update every 5 seconds
+    
+    def _run_backtest(self):
+        """Run backtest manually with strategy selection"""
+        if self.backtester.is_testing:
+            messagebox.showinfo("Backtest", "Backtest already in progress. Please wait...")
+            return
+
+        # Show strategy selection dialog
+        selected_strategies = self._show_backtest_strategy_selection()
+        if not selected_strategies:
+            return  # User cancelled
+
         # Run in background
         def run():
             success = self.backtester.run_test_now(selected_strategies=selected_strategies)
@@ -7958,8 +9282,8 @@ By using this application, you acknowledge that you understand and accept these 
             try:
                 last_test = datetime.fromisoformat(stats['last_test_date'])
                 summary_text += f"Last Test: {last_test.strftime('%Y-%m-%d %H:%M')}\n"
-            except:
-                pass
+            except (ValueError, KeyError, AttributeError) as e:
+                logger.debug(f"Could not parse last test date: {e}")
         
         summary_text += f"\n📈 STRATEGY BREAKDOWN:\n"
         summary_text += f"{'='*60}\n"

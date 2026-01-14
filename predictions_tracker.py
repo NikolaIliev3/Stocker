@@ -28,11 +28,13 @@ logger = logging.getLogger(__name__)
 class PredictionsTracker:
     """Tracks stock predictions and verifies their accuracy"""
     
-    def __init__(self, data_dir: Path):
+    
+    def __init__(self, data_dir: Path, price_move_predictor=None):
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.predictions_file = self.data_dir / "predictions.json"
         self.predictions = []
+        self.price_move_predictor = price_move_predictor
         
         # Initialize production monitors for each strategy
         self.production_monitors = {}
@@ -83,12 +85,13 @@ class PredictionsTracker:
     def add_prediction(self, symbol: str, strategy: str, action: str, 
                       entry_price: float, target_price: float, 
                       stop_loss: float, confidence: float, reasoning: str,
-                      estimated_days: int = None) -> Dict:
+                      estimated_days: int = None, predicted_move_pct: float = None) -> Dict:
         """Add a new prediction with estimated target date
         
         Args:
             estimated_days: Estimated number of days until target should be reached.
                           If None, calculated based on strategy.
+            predicted_move_pct: Predicated magnitude of the move in percentage (absolute)
         """
         # Calculate estimated target date based on strategy if not provided
         if estimated_days is None:
@@ -122,10 +125,15 @@ class PredictionsTracker:
             "estimated_days": estimated_days
         }
         
+        # Store predicted move percentage if provided (for Megamind learning)
+        if predicted_move_pct is not None:
+            prediction['predicted_move_pct'] = float(predicted_move_pct)
+        
         self.predictions.append(prediction)
         self.save()
         return prediction
     
+
     def verify_prediction(self, prediction_id: int, current_price: float) -> Optional[Dict]:
         """Verify if a prediction came true"""
         prediction = self.get_prediction_by_id(prediction_id)
@@ -172,23 +180,46 @@ class PredictionsTracker:
             else:
                 was_correct = False
         
+        # Calculate price change
+        price_change = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+        
         # Update prediction
         prediction['verified'] = True
         prediction['status'] = 'verified'
         prediction['was_correct'] = was_correct
         prediction['actual_price_at_target'] = current_price
         prediction['verification_date'] = datetime.now().isoformat()
+        prediction['actual_price_change'] = price_change
         
         # Calculate days since prediction
         pred_date = datetime.fromisoformat(prediction['timestamp'])
         days_diff = (datetime.now() - pred_date).days
         prediction['days_to_target'] = days_diff
+
+        # -------------------------------------------------------------------------
+        # MEGAMIND LEARNING INJECTION
+        # -------------------------------------------------------------------------
+        # If we have a price_move_predictor and this prediction has a predicted move,
+        # teach the system!
+        if getattr(self, 'price_move_predictor', None) and 'predicted_move_pct' in prediction:
+            try:
+                predicted_pct = prediction['predicted_move_pct']
+                actual_abs_pct = abs(price_change)
+                # Learn from this specific outcome
+                self.price_move_predictor.learn_from_outcome(
+                    predicted_pct=predicted_pct,
+                    actual_pct=actual_abs_pct,
+                    signal_type=action
+                )
+                logger.info(f"🧠 Fed prediction result to PriceMovePredictor: Pred {predicted_pct}%, Actual {actual_abs_pct}%")
+            except Exception as e:
+                logger.error(f"Failed to feed data to PriceMovePredictor: {e}")
+        # -------------------------------------------------------------------------
         
         # Record outcome in production monitor
         strategy = prediction.get('strategy', 'trading')
         if strategy in self.production_monitors:
             try:
-                price_change = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
                 self.production_monitors[strategy].record_outcome(
                     symbol=prediction['symbol'],
                     action=action,
@@ -203,7 +234,7 @@ class PredictionsTracker:
             try:
                 outcome_dict = {
                     'was_correct': was_correct,
-                    'actual_price_change': price_change if entry_price > 0 else 0
+                    'actual_price_change': price_change
                 }
                 # Add market regime and sector if available
                 prediction_with_metadata = prediction.copy()

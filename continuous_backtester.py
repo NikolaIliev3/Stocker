@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 import random
 import threading
+import time
 
 from data_fetcher import StockDataFetcher
 from hybrid_predictor import HybridStockPredictor
@@ -66,6 +67,29 @@ class ContinuousBacktester:
         
         # Track which strategies were tested in the last run (for report filtering)
         self.last_tested_strategies = []
+        
+        # Continuous backtesting mode (non-stop until stopped)
+        self.continuous_mode = False
+        self.continuous_loop_active = False
+        self.continuous_delay_seconds = 60  # Wait 60 seconds between backtest runs in continuous mode
+        
+        # Track dates tested in current run (to allow same-run training while blocking previous runs)
+        self.current_run_tested_dates = set()  # {(symbol, date_str)}
+        self.current_run_start_time = None
+        
+        # ANTI-OVERFITTING SAFEGUARDS
+        # Track which dates have been tested (symbol + date combinations)
+        # Format: {(symbol, date_str): timestamp_when_tested}
+        self.tested_dates = self._load_tested_dates()
+        
+        # Minimum cooldown between retrains (hours)
+        self.retrain_cooldown_hours = 24  # Don't retrain more than once per day
+        
+        # Maximum overlap threshold: don't retrain if >X% of samples are from recently tested dates
+        self.max_overlap_threshold = 0.3  # 30% max overlap with tested dates
+        
+        # Days to consider "recently tested" (dates tested within this window are excluded from training)
+        self.recent_test_window_days = 90  # 3 months
         
         # Initialize walk-forward backtester if available
         if HAS_WALK_FORWARD:
@@ -124,6 +148,107 @@ class ContinuousBacktester:
             'last_test_date': None,
             'strategy_results': {}  # Empty - will be populated only for tested strategies
         }
+    
+    def _load_tested_dates(self) -> Dict:
+        """Load tracked tested dates to prevent data leakage"""
+        tested_dates_file = self.data_dir / "tested_dates.json"
+        if tested_dates_file.exists():
+            try:
+                with open(tested_dates_file, 'r') as f:
+                    data = json.load(f)
+                    # Convert string keys back to tuples
+                    tested_dates = {}
+                    for key, value in data.items():
+                        # Key format: "SYMBOL|YYYY-MM-DD"
+                        if '|' in key:
+                            symbol, date_str = key.split('|', 1)
+                            tested_dates[(symbol.upper(), date_str)] = value
+                    return tested_dates
+            except Exception as e:
+                logger.error(f"Error loading tested dates: {e}")
+        
+        return {}
+    
+    def _save_tested_dates(self):
+        """Save tracked tested dates"""
+        tested_dates_file = self.data_dir / "tested_dates.json"
+        try:
+            # Convert tuple keys to strings for JSON
+            data = {}
+            for (symbol, date_str), timestamp in self.tested_dates.items():
+                key = f"{symbol}|{date_str}"
+                data[key] = timestamp
+            
+            # Keep only last 10000 entries to prevent file from growing too large
+            if len(data) > 10000:
+                # Sort by timestamp and keep most recent
+                sorted_items = sorted(data.items(), key=lambda x: x[1], reverse=True)
+                data = dict(sorted_items[:10000])
+            
+            with open(tested_dates_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving tested dates: {e}")
+    
+    def _mark_date_as_tested(self, symbol: str, test_date: datetime):
+        """Mark a date as tested to prevent using it for training"""
+        date_str = test_date.strftime('%Y-%m-%d')
+        key = (symbol.upper(), date_str)
+        self.tested_dates[key] = datetime.now().isoformat()
+    
+    def _is_date_tested(self, symbol: str, test_date: datetime) -> bool:
+        """Check if a date has been tested before"""
+        date_str = test_date.strftime('%Y-%m-%d')
+        key = (symbol.upper(), date_str)
+        return key in self.tested_dates
+    
+    def _is_date_recently_tested(self, symbol: str, test_date: datetime, allow_current_run: bool = False) -> bool:
+        """Check if a date was tested recently (within recent_test_window_days)
+        
+        Args:
+            symbol: Stock symbol
+            test_date: Historical date that was tested
+            allow_current_run: If True, allow dates from current run (for same-run training)
+        """
+        date_str = test_date.strftime('%Y-%m-%d')
+        key = (symbol.upper(), date_str)
+        
+        # If allowing current run, check if this date is from current run first
+        if allow_current_run and key in self.current_run_tested_dates:
+            return False  # Not "recently tested" if from current run (allow it)
+        
+        if key not in self.tested_dates:
+            return False
+        
+        try:
+            tested_timestamp = datetime.fromisoformat(self.tested_dates[key])
+            days_ago = (datetime.now() - tested_timestamp).days
+            return days_ago < self.recent_test_window_days
+        except Exception as e:
+            logger.debug(f"Error checking if date recently tested: {e}")
+            return False
+    
+    def _calculate_overlap_with_tested_dates(self, samples: List[Dict]) -> float:
+        """Calculate what percentage of samples are from recently tested dates
+        (excluding current run dates, as those are allowed for training)"""
+        if not samples:
+            return 0.0
+        
+        recently_tested_count = 0
+        for sample in samples:
+            symbol = sample.get('symbol', '').upper()
+            date_str = sample.get('date', '')
+            
+            if symbol and date_str:
+                try:
+                    sample_date = datetime.fromisoformat(date_str) if 'T' in date_str else datetime.strptime(date_str, '%Y-%m-%d')
+                    # Allow current run dates (allow_current_run=True)
+                    if self._is_date_recently_tested(symbol, sample_date, allow_current_run=True):
+                        recently_tested_count += 1
+                except Exception as e:
+                    logger.debug(f"Error parsing date in sample: {e}")
+        
+        return recently_tested_count / len(samples) if samples else 0.0
     
     def save_results(self, tested_strategies: List[str] = None):
         """Save backtest results
@@ -189,7 +314,59 @@ class ContinuousBacktester:
     def stop(self):
         """Stop continuous backtesting"""
         self.is_running = False
+        self.continuous_mode = False
+        self.continuous_loop_active = False
         logger.info("Continuous backtester stopped")
+    
+    def start_continuous_mode(self, selected_strategies: List[str] = None):
+        """Start non-stop continuous backtesting until manually stopped"""
+        if self.continuous_mode:
+            logger.info("Continuous mode already running")
+            return
+        
+        self.continuous_mode = True
+        self.is_running = True
+        self.continuous_loop_active = True
+        
+        logger.info("🔄 Continuous backtesting mode started")
+        logger.info(f"   • Will run backtests continuously every {self.continuous_delay_seconds} seconds")
+        logger.info(f"   • Anti-overfitting safeguards are active")
+        logger.info(f"   • Click 'Stop Continuous Backtesting' to terminate")
+        
+        # Start the continuous loop in a background thread
+        thread = threading.Thread(target=self._continuous_backtest_loop, args=(selected_strategies,))
+        thread.daemon = True
+        thread.start()
+    
+    def stop_continuous_mode(self):
+        """Stop non-stop continuous backtesting"""
+        if not self.continuous_mode:
+            return
+        
+        self.continuous_mode = False
+        self.continuous_loop_active = False
+        logger.info("⏹️ Continuous backtesting mode stopped")
+    
+    def _continuous_backtest_loop(self, selected_strategies: List[str] = None):
+        """Main loop for continuous backtesting"""
+        run_count = 0
+        
+        while self.continuous_loop_active and self.is_running:
+            run_count += 1
+            logger.info(f"🔄 Continuous backtest run #{run_count}...")
+            
+            # Run backtest
+            self._run_backtest(selected_strategies)
+            
+            # Wait before next run (unless stopped)
+            if self.continuous_loop_active:
+                # Check every second if we should continue
+                for _ in range(self.continuous_delay_seconds):
+                    if not self.continuous_loop_active:
+                        break
+                    time.sleep(1)
+        
+        logger.info(f"Continuous backtesting loop ended (completed {run_count} runs)")
     
     def _schedule_next_test(self):
         """Schedule next backtest"""
@@ -252,6 +429,10 @@ class ContinuousBacktester:
         # Default to all strategies if none specified
         if selected_strategies is None:
             selected_strategies = ['trading', 'mixed', 'investing']
+        
+        # Track dates tested in this run (reset for each new run)
+        self.current_run_tested_dates = set()
+        self.current_run_start_time = datetime.now()
         
         try:
             logger.info("🧪 Starting continuous backtest...")
@@ -686,6 +867,12 @@ class ContinuousBacktester:
             
             self.results['test_details'].append(test_result)
             
+            # ANTI-OVERFITTING: Mark this date as tested
+            # Track in current run (for same-run training) and permanent (for future runs)
+            date_str = test_date.strftime('%Y-%m-%d')
+            self.current_run_tested_dates.add((symbol.upper(), date_str))
+            self._mark_date_as_tested(symbol, test_date)
+            
             return test_result
             
         except Exception as e:
@@ -837,6 +1024,13 @@ class ContinuousBacktester:
             tested_strategies = list(self.results['strategy_results'].keys())
             self.save_results(tested_strategies=tested_strategies)
             
+            # ANTI-OVERFITTING: Save tested dates
+            self._save_tested_dates()
+            
+            # Clear current run tracking (dates are now in permanent storage)
+            self.current_run_tested_dates = set()
+            self.current_run_start_time = None
+            
         except Exception as e:
             logger.error(f"Error learning from backtest results: {e}", exc_info=True)
     
@@ -892,15 +1086,74 @@ class ContinuousBacktester:
             logger.debug(f"Error adjusting weights from backtest: {e}")
     
     def _use_backtest_results_as_training_data(self, strategy: str, results: List[Dict]):
-        """Convert backtest results to training samples and retrain model"""
+        """Convert backtest results to training samples and retrain model
+        
+        ANTI-OVERFITTING SAFEGUARDS:
+        - Only uses dates that haven't been tested recently (prevents data leakage)
+        - Checks cooldown period between retrains
+        - Limits overlap with tested dates to prevent memorization
+        """
         try:
             if not hasattr(self.app, 'training_manager'):
                 return
             
-            # Convert backtest results to training samples
-            training_samples = []
+            # SAFEGUARD 1: Check cooldown period
+            last_retrain = self.last_retrain_time.get(strategy)
+            if last_retrain:
+                try:
+                    last_retrain_dt = datetime.fromisoformat(last_retrain)
+                    hours_since_retrain = (datetime.now() - last_retrain_dt).total_seconds() / 3600
+                    if hours_since_retrain < self.retrain_cooldown_hours:
+                        logger.info(
+                            f"⏸️ Retrain cooldown active ({strategy}): "
+                            f"{hours_since_retrain:.1f}h < {self.retrain_cooldown_hours}h. "
+                            f"Skipping retrain to prevent overfitting."
+                        )
+                        return
+                except Exception as e:
+                    logger.debug(f"Error checking retrain cooldown: {e}")
+            
+            # SAFEGUARD 2: Filter out recently tested dates (prevent data leakage)
+            # Only use results from dates that haven't been tested recently
+            fresh_results = []
+            skipped_recent = 0
             
             for result in results:
+                symbol = result.get('symbol', '').upper()
+                test_date_str = result.get('test_date')
+                
+                if symbol and test_date_str:
+                    try:
+                        test_date = datetime.fromisoformat(test_date_str)
+                        # Skip if this date was tested recently (within recent_test_window_days)
+                        # BUT allow dates from current run (allow_current_run=True)
+                        if self._is_date_recently_tested(symbol, test_date, allow_current_run=True):
+                            skipped_recent += 1
+                            continue
+                    except Exception as e:
+                        logger.debug(f"Error checking if date recently tested: {e}")
+                
+                fresh_results.append(result)
+            
+            if skipped_recent > 0:
+                logger.info(
+                    f"🛡️ Anti-overfitting: Skipped {skipped_recent}/{len(results)} results "
+                    f"from recently tested dates ({strategy})"
+                )
+            
+            # Need at least 20 fresh results to retrain
+            if len(fresh_results) < 20:
+                logger.info(
+                    f"⏸️ Insufficient fresh results for retraining ({strategy}): "
+                    f"{len(fresh_results)} fresh (need 20). "
+                    f"Skipped {skipped_recent} recently tested dates."
+                )
+                return
+            
+            # Convert fresh backtest results to training samples
+            training_samples = []
+            
+            for result in fresh_results:
                 try:
                     symbol = result.get('symbol', '').upper()
                     test_date_str = result.get('test_date')
@@ -1002,13 +1255,26 @@ class ContinuousBacktester:
                     logger.debug(f"Error converting backtest result to training sample: {e}")
                     continue
             
+            # SAFEGUARD 3: Check overlap with tested dates
+            overlap_ratio = self._calculate_overlap_with_tested_dates(training_samples)
+            if overlap_ratio > self.max_overlap_threshold:
+                logger.warning(
+                    f"🛡️ Anti-overfitting: Overlap too high ({strategy}): "
+                    f"{overlap_ratio*100:.1f}% > {self.max_overlap_threshold*100:.1f}%. "
+                    f"Skipping retrain to prevent memorization."
+                )
+                return
+            
             # Log distribution of labels for diagnostics
             if len(training_samples) > 0:
                 label_counts = {}
                 for sample in training_samples:
                     label = sample.get('label', 'UNKNOWN')
                     label_counts[label] = label_counts.get(label, 0) + 1
-                logger.info(f"Backtest training samples distribution: {label_counts}")
+                logger.info(
+                    f"Backtest training samples ({strategy}): {len(training_samples)} samples, "
+                    f"overlap: {overlap_ratio*100:.1f}%, distribution: {label_counts}"
+                )
             
             # If we have samples, try to combine with verified predictions to meet minimum requirement
             # Reduced minimum to 30 to allow more frequent retraining from backtest results
@@ -1046,6 +1312,20 @@ class ContinuousBacktester:
                 
                 # Only attempt training if we have enough samples
                 if len(combined_samples) >= 100:
+                    # SAFEGUARD 4: Final overlap check on combined samples
+                    combined_overlap = self._calculate_overlap_with_tested_dates(combined_samples)
+                    if combined_overlap > self.max_overlap_threshold:
+                        logger.warning(
+                            f"🛡️ Anti-overfitting: Combined overlap too high ({strategy}): "
+                            f"{combined_overlap*100:.1f}% > {self.max_overlap_threshold*100:.1f}%. "
+                            f"Skipping retrain."
+                        )
+                        return
+                    
+                    # SAFEGUARD 5: Update retrain timestamp before training
+                    # (This prevents multiple simultaneous retrains)
+                    self.last_retrain_time[strategy] = datetime.now().isoformat()
+                    
                     # Use training pipeline to retrain with combined data
                     from ml_training import StockPredictionML
                     ml_model = StockPredictionML(self.data_dir, strategy)
@@ -1086,15 +1366,23 @@ class ContinuousBacktester:
             logger.error(f"Error using backtest results as training data: {e}", exc_info=True)
     
     def _trigger_auto_retrain(self, strategy: str, results: List[Dict]):
-        """Automatically retrain model when accuracy drops"""
+        """Automatically retrain model when accuracy drops (with anti-overfitting safeguards)"""
         try:
-            # Throttle: Don't retrain more than once per day per strategy
+            # SAFEGUARD: Check cooldown period (same as in _use_backtest_results_as_training_data)
             last_retrain = self.last_retrain_time.get(strategy)
             if last_retrain:
-                hours_since = (datetime.now() - last_retrain).total_seconds() / 3600
-                if hours_since < 24:
-                    logger.debug(f"Skipping auto-retrain for {strategy}: Retrained {hours_since:.1f} hours ago")
-                    return
+                try:
+                    last_retrain_dt = datetime.fromisoformat(last_retrain) if isinstance(last_retrain, str) else last_retrain
+                    hours_since = (datetime.now() - last_retrain_dt).total_seconds() / 3600
+                    if hours_since < self.retrain_cooldown_hours:
+                        logger.info(
+                            f"⏸️ Auto-retrain cooldown active ({strategy}): "
+                            f"{hours_since:.1f}h < {self.retrain_cooldown_hours}h. "
+                            f"Skipping to prevent overfitting."
+                        )
+                        return
+                except Exception as e:
+                    logger.debug(f"Error checking retrain cooldown: {e}")
             
             if not hasattr(self.app, 'training_manager'):
                 return
@@ -1126,8 +1414,8 @@ class ContinuousBacktester:
                             f"Combined backtest + verified predictions"
                         )
             
-            # Update last retrain time
-            self.last_retrain_time[strategy] = datetime.now()
+            # Update retrain timestamp (use ISO format for consistency)
+            self.last_retrain_time[strategy] = datetime.now().isoformat()
             
         except Exception as e:
             logger.error(f"Error in auto-retrain: {e}", exc_info=True)

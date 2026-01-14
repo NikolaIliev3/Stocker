@@ -1,0 +1,13 @@
+{
+  "multipliers": {
+    "bullish": 1.1,
+    "bearish": 1.0,
+    "volatility_factor": 1.0
+  },
+  "history": [],
+  "stats": {
+    "total_predictions": 2,
+    "avg_error_pct": 0.0,
+    "last_updated": "2026-01-14T13:12:18.728936"
+  }
+}

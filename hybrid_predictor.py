@@ -14,6 +14,14 @@ from ml_training import StockPredictionML, FeatureExtractor
 from trading_analyzer import TradingAnalyzer
 from investing_analyzer import InvestingAnalyzer
 from mixed_analyzer import MixedAnalyzer
+from prediction_cache import get_cache
+
+# Import configuration
+from config import (ML_HIGH_ACCURACY_THRESHOLD, ML_VERY_HIGH_ACCURACY_THRESHOLD,
+                   ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD, ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL,
+                   ML_PERFORMANCE_HISTORY_LIMIT, ML_RECENT_PERFORMANCE_WINDOW,
+                   ML_ENSEMBLE_WEIGHT_UPDATE_THRESHOLD, ML_ENSEMBLE_WEIGHT_MAX,
+                   AI_PREDICTOR_ENABLED, LLM_AI_PREDICTOR_ENABLED)
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +32,8 @@ class HybridStockPredictor:
     def __init__(self, data_dir: Path, strategy: str, 
                  trading_analyzer: TradingAnalyzer = None,
                  investing_analyzer: InvestingAnalyzer = None,
-                 mixed_analyzer: MixedAnalyzer = None):
+                 mixed_analyzer: MixedAnalyzer = None,
+                 seeker_ai = None):
         self.data_dir = data_dir
         self.strategy = strategy
         
@@ -38,7 +47,11 @@ class HybridStockPredictor:
         self.investing_analyzer = investing_analyzer or InvestingAnalyzer()
         self.mixed_analyzer = mixed_analyzer or MixedAnalyzer()
         
-        # Ensemble weights
+        # AI components removed
+        self.ai_predictor = None
+        self.llm_ai_predictor = None
+        
+        # Ensemble weights (now includes AI)
         self.ensemble_weights_file = data_dir / f"ensemble_weights_{strategy}.json"
         self.ensemble_weights = self._load_ensemble_weights()
         
@@ -54,14 +67,16 @@ class HybridStockPredictor:
                     return json.load(f)
             except Exception as e:
                 logger.debug(f"Error loading ensemble weights: {e}")
-        return {'rule': 0.5, 'ml': 0.5}
+        # Ensemble weights: Rules and ML only
+        default_weights = {'rule': 0.5, 'ml': 0.5, 'ai': 0.0}
+        return default_weights
     
-    def _save_ensemble_weights(self):
+    def _save_ensemble_weights(self) -> None:
         """Save ensemble weights"""
         try:
             with open(self.ensemble_weights_file, 'w') as f:
                 json.dump(self.ensemble_weights, f, indent=2)
-        except Exception as e:
+        except (IOError, OSError, json.JSONEncodeError) as e:
             logger.error(f"Error saving ensemble weights: {e}")
     
     def _load_performance(self) -> Dict:
@@ -83,7 +98,7 @@ class HybridStockPredictor:
             'hybrid': []
         }
     
-    def _save_performance(self):
+    def _save_performance(self) -> None:
         """Save performance history"""
         try:
             all_performance = {}
@@ -91,16 +106,16 @@ class HybridStockPredictor:
                 try:
                     with open(self.performance_file, 'r') as f:
                         all_performance = json.load(f)
-                except:
-                    pass
+                except (IOError, OSError, json.JSONDecodeError):
+                    logger.debug("Could not load existing performance data, starting fresh")
             
             all_performance[self.strategy] = self.performance_history
             
-            # Keep only last 1000 entries
+            # Keep only last N entries (from config)
             for method in ['weight_based', 'ml_based', 'hybrid']:
-                if len(all_performance[self.strategy][method]) > 1000:
+                if len(all_performance[self.strategy][method]) > ML_PERFORMANCE_HISTORY_LIMIT:
                     all_performance[self.strategy][method] = \
-                        all_performance[self.strategy][method][-1000:]
+                        all_performance[self.strategy][method][-ML_PERFORMANCE_HISTORY_LIMIT:]
             
             with open(self.performance_file, 'w') as f:
                 json.dump(all_performance, f, indent=2)
@@ -110,6 +125,15 @@ class HybridStockPredictor:
     def predict(self, stock_data: dict, history_data: dict, 
                 financials_data: dict = None) -> Dict:
         """Make prediction using hybrid approach"""
+        # Check cache first
+        symbol = stock_data.get('symbol', '')
+        if symbol:
+            cache = get_cache()
+            cached_prediction = cache.get(symbol, self.strategy)
+            if cached_prediction:
+                logger.debug(f"⚡ Using cached prediction for {symbol} ({self.strategy})")
+                return cached_prediction
+        
         # 1. Get rule-based prediction
         if self.strategy == "trading":
             base_analysis = self.trading_analyzer.analyze(stock_data, history_data)
@@ -128,7 +152,11 @@ class HybridStockPredictor:
         # Apply learned weights to rule-based prediction
         rule_prediction = self._apply_learned_weights(base_analysis)
         
-        # 2. Get ML prediction (if available)
+        # AI prediction removed
+        ai_prediction = None
+        ai_available = False
+        
+        # 3. Get ML prediction (if available)
         ml_prediction = None
         ml_available = self.ml_predictor.is_trained()
         
@@ -183,25 +211,33 @@ class HybridStockPredictor:
                 ml_available = False
                 ml_prediction = None
         
-        # 3. Calculate dynamic ensemble weights
-        if ml_available:
-            ensemble_weights = self._calculate_dynamic_weights(
-                rule_prediction, ml_prediction
-            )
-        else:
-            ensemble_weights = {'rule': 1.0, 'ml': 0.0}
+        # Consensus and AI updates removed
         
-        # 4. Combine predictions
+        # 4. Calculate dynamic ensemble weights (Rule and ML only)
+        if ml_available:
+            ensemble_weights = self._calculate_dynamic_weights(rule_prediction, ml_prediction)
+        else:
+            ensemble_weights = {'rule': 1.0, 'ml': 0.0, 'ai': 0.0}
+        
+        # 5. Combine predictions (Rules and ML)
         final_prediction = self._ensemble_predictions(
             rule_prediction, ml_prediction, ensemble_weights, base_analysis
         )
         
         # Diagnostic logging for backtesting
         if ml_available and ml_prediction:
-            logger.debug(f"Hybrid prediction: rule={rule_prediction.get('action')} ({rule_prediction.get('confidence', 0):.1f}%), "
-                        f"ml={ml_prediction.get('action')} ({ml_prediction.get('confidence', 0):.1f}%), "
-                        f"final={final_prediction.get('recommendation', {}).get('action')} "
-                        f"(weights: rule={ensemble_weights.get('rule', 0):.2f}, ml={ensemble_weights.get('ml', 0):.2f})")
+            log_parts = [f"Hybrid prediction: rule={rule_prediction.get('action')} ({rule_prediction.get('confidence', 0):.1f}%)"]
+            if ml_available and ml_prediction:
+                log_parts.append(f"ml={ml_prediction.get('action')} ({ml_prediction.get('confidence', 0):.1f}%)")
+            log_parts.append(f"final={final_prediction.get('recommendation', {}).get('action')} "
+                           f"(weights: rule={ensemble_weights.get('rule', 0):.2f}, ml={ensemble_weights.get('ml', 0):.2f})")
+            logger.debug(", ".join(log_parts))
+        
+        # Store in cache for future use
+        if symbol:
+            cache = get_cache()
+            cache.set(symbol, self.strategy, final_prediction)
+            logger.debug(f"💾 Cached prediction for {symbol} ({self.strategy})")
         
         return final_prediction
     
@@ -218,112 +254,80 @@ class HybridStockPredictor:
             'stop_loss': recommendation.get('stop_loss', 0)
         }
     
-    def _calculate_dynamic_weights(self, rule_pred: Dict, ml_pred: Dict) -> Dict:
-        """Calculate dynamic ensemble weights"""
+    def _calculate_dynamic_weights(self, rule_pred: Dict, ml_pred: Optional[Dict]) -> Dict:
+        """Calculate dynamic ensemble weights (Rule and ML only)"""
+        # Determine if ML is available
+        has_ml = ml_pred is not None
+        
+        if not has_ml:
+            return {'rule': 1.0, 'ml': 0.0, 'ai': 0.0}
+        
+        # Initialize balanced weights
         rule_weight = 0.5
         ml_weight = 0.5
         
-        # Check if ML model has high training accuracy (from metadata)
-        ml_high_accuracy = False
+        # Check if ML model has high training accuracy
         ml_test_acc = 0
         try:
             if self.ml_predictor and self.ml_predictor.metadata:
+                from config import ML_HIGH_ACCURACY_THRESHOLD, ML_VERY_HIGH_ACCURACY_THRESHOLD
                 ml_test_acc = self.ml_predictor.metadata.get('test_accuracy', 0)
-                if ml_test_acc >= 0.60:  # 60%+ validation accuracy
-                    ml_high_accuracy = True
-                    # When ML has high accuracy, favor it MUCH more aggressively
-                    if ml_test_acc >= 0.62:  # 62%+ = very high accuracy
-                        ml_weight = 0.85  # Strongly favor ML
+                if ml_test_acc >= ML_HIGH_ACCURACY_THRESHOLD:
+                    if ml_test_acc >= ML_VERY_HIGH_ACCURACY_THRESHOLD:
+                        ml_weight = 0.85
                         rule_weight = 0.15
-                    else:  # 60-62%
+                    else:
                         ml_weight = 0.75
                         rule_weight = 0.25
-                    logger.info(f"🎯 ML model has high accuracy ({ml_test_acc*100:.1f}%) - strongly favoring ML (weight: {ml_weight:.2f})")
-        except:
-            pass
+                    logger.info(f"🎯 ML model has high accuracy ({ml_test_acc*100:.1f}%) - favoring ML (ML: {ml_weight:.2f}, Rule: {rule_weight:.2f})")
+        except Exception as e:
+            logger.debug(f"Could not check ML accuracy metadata: {e}")
         
-        # Adjust based on historical performance (only if ML doesn't have high accuracy)
-        if not ml_high_accuracy:
+        # Adjust based on historical performance if ML isn't dominant
+        if ml_weight < 0.8:
             rule_perf = self._get_recent_performance('weight_based')
             ml_perf = self._get_recent_performance('ml_based')
             
             if rule_perf and ml_perf:
+                from config import ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD
                 rule_acc = rule_perf.get('accuracy', 50)
                 ml_acc = ml_perf.get('accuracy', 50)
                 
-                if abs(rule_acc - ml_acc) > 10:
+                if abs(rule_acc - ml_acc) > ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD:
                     if rule_acc > ml_acc:
-                        rule_weight = 0.7
-                        ml_weight = 0.3
+                        rule_weight = min(0.7, rule_weight + 0.1)
+                        ml_weight = max(0.3, ml_weight - 0.1)
                     else:
-                        rule_weight = 0.3
-                        ml_weight = 0.7
+                        rule_weight = max(0.3, rule_weight - 0.1)
+                        ml_weight = min(0.7, ml_weight + 0.1)
+
+        # Adjust based on confidence differences
+        rule_confidence = rule_pred.get('confidence', 50)
+        ml_confidence = ml_pred.get('confidence', 50)
         
-        # When ML has high accuracy, be more conservative about confidence adjustments
-        if ml_high_accuracy:
-            # Only make small adjustments based on confidence, don't override ML preference
-            rule_confidence = rule_pred.get('confidence', 50)
-            ml_confidence = ml_pred.get('confidence', 50)
-            
-            confidence_diff = abs(rule_confidence - ml_confidence)
-            if confidence_diff > 30:  # Only adjust if confidence difference is very large
-                if rule_confidence > ml_confidence:
-                    rule_weight += 0.05  # Small adjustment
-                    ml_weight -= 0.05
-                else:
-                    rule_weight -= 0.05
-                    ml_weight += 0.05
-            
-            # When predictions disagree and ML has high accuracy, favor ML unless rule confidence is MUCH higher
-            if rule_pred.get('action') != ml_pred.get('action'):
-                if rule_confidence > ml_confidence + 25:  # Rule must be 25%+ more confident
-                    rule_weight = 0.6
-                    ml_weight = 0.4
-                else:
-                    # Default to ML when it has high accuracy
-                    rule_weight = 0.3
-                    ml_weight = 0.7
-        else:
-            # Original logic for when ML doesn't have high accuracy
-            rule_confidence = rule_pred.get('confidence', 50)
-            ml_confidence = ml_pred.get('confidence', 50)
-            
-            confidence_diff = abs(rule_confidence - ml_confidence)
-            if confidence_diff > 20:
-                if rule_confidence > ml_confidence:
-                    rule_weight += 0.1
-                    ml_weight -= 0.1
-                else:
-                    rule_weight -= 0.1
-                    ml_weight += 0.1
-            
-            # Adjust based on agreement
-            if rule_pred.get('action') != ml_pred.get('action'):
-                if rule_confidence > ml_confidence:
-                    rule_weight = 0.7
-                    ml_weight = 0.3
-                else:
-                    rule_weight = 0.3
-                    ml_weight = 0.7
+        from config import ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL
+        confidence_diff = abs(rule_confidence - ml_confidence)
+        if confidence_diff > ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL:
+            if rule_confidence > ml_confidence:
+                rule_weight = min(0.7, rule_weight + 0.05)
+                ml_weight = max(0.3, ml_weight - 0.05)
+            else:
+                rule_weight = max(0.3, rule_weight - 0.05)
+                ml_weight = min(0.7, ml_weight + 0.05)
         
-        # Clamp weights (but preserve ML preference when it has high accuracy)
-        if ml_high_accuracy:
-            rule_weight = max(0.1, min(0.4, rule_weight))  # Keep rule weight low
-            ml_weight = 1.0 - rule_weight
-        else:
-            rule_weight = max(0.2, min(0.8, rule_weight))
-            ml_weight = 1.0 - rule_weight
-        
-        return {'rule': rule_weight, 'ml': ml_weight}
+        return {'rule': rule_weight, 'ml': ml_weight, 'ai': 0.0}
     
     def _ensemble_predictions(self, rule_pred: Dict, ml_pred: Optional[Dict],
                              weights: Dict, base_analysis: Dict) -> Dict:
         """Combine rule-based and ML predictions"""
-        if ml_pred is None:
+        # Determine if ML is available
+        has_ml = ml_pred is not None
+        
+        if not has_ml:
             return {
                 **base_analysis,
                 'method': 'rule_based_only',
-                'ensemble_weights': {'rule': 1.0, 'ml': 0.0}
+                'ensemble_weights': {'rule': 1.0, 'ml': 0.0, 'ai': 0.0}
             }
         
         rule_action = rule_pred.get('action', 'HOLD')
@@ -333,30 +337,38 @@ class HybridStockPredictor:
         
         # Weighted confidence
         final_confidence = (
-            rule_confidence * weights['rule'] + 
-            ml_confidence * weights['ml']
+            rule_confidence * weights.get('rule', 0) + 
+            ml_confidence * weights.get('ml', 0)
         )
         
-        # Action selection
+        # Action selection (weighted confidence wins)
+        action_counts = {}
+        action_counts[rule_action] = action_counts.get(rule_action, 0) + weights.get('rule', 0)
+        action_counts[ml_action] = action_counts.get(ml_action, 0) + weights.get('ml', 0)
+        
+        # Get action with highest weighted count
+        final_action = max(action_counts.items(), key=lambda x: x[1])[0]
+        
+        # Boost confidence if they agree
         if rule_action == ml_action:
-            final_action = rule_action
             final_confidence = min(95, final_confidence * 1.1)
-        else:
-            rule_weighted_conf = rule_confidence * weights['rule']
-            ml_weighted_conf = ml_confidence * weights['ml']
-            final_action = rule_action if rule_weighted_conf > ml_weighted_conf else ml_action
         
         # Use rule-based prices (they're more detailed)
         recommendation = base_analysis.get('recommendation', {})
         
         # Generate reasoning
         reasoning = base_analysis.get('reasoning', '')
-        reasoning += f"\n\n🤖 HYBRID AI ANALYSIS:\n"
+        reasoning += f"\n\n🤖 HYBRID ANALYSIS (Rules + ML):\n"
         reasoning += f"Rule-based: {rule_action} ({rule_confidence:.1f}%)\n"
         reasoning += f"ML Model: {ml_action} ({ml_confidence:.1f}%)\n"
-        reasoning += f"Ensemble Weights: Rule {weights['rule']*100:.0f}% / ML {weights['ml']*100:.0f}%\n"
+        
+        weight_parts = [f"Rule {weights.get('rule', 0)*100:.0f}%"]
+        if weights.get('ml', 0) > 0:
+            weight_parts.append(f"ML {weights.get('ml', 0)*100:.0f}%")
+        reasoning += f"Ensemble Weights: {' / '.join(weight_parts)}\n"
         reasoning += f"Final Prediction: {final_action} ({final_confidence:.1f}% confidence)\n"
         
+        # Agreement analysis
         if rule_action == ml_action:
             reasoning += "✓ Both methods agree - high confidence\n"
         else:
@@ -390,7 +402,7 @@ class HybridStockPredictor:
         if not history:
             return None
         
-        recent = history[-50:] if len(history) > 50 else history
+        recent = history[-ML_RECENT_PERFORMANCE_WINDOW:] if len(history) > ML_RECENT_PERFORMANCE_WINDOW else history
         correct = sum(1 for h in recent if h.get('was_correct') is True)
         total = len(recent)
         accuracy = (correct / total * 100) if total > 0 else 0
@@ -401,7 +413,7 @@ class HybridStockPredictor:
             'correct': correct
         }
     
-    def update_performance(self, prediction: Dict, actual_outcome: bool):
+    def update_performance(self, prediction: Dict, actual_outcome: bool) -> None:
         """Update performance tracking after prediction is verified"""
         method = prediction.get('method', 'hybrid')
         
@@ -434,22 +446,25 @@ class HybridStockPredictor:
             # Update ensemble weights based on performance
             self._update_ensemble_weights()
     
-    def _update_ensemble_weights(self):
+    def _update_ensemble_weights(self) -> None:
         """Update ensemble weights based on recent performance"""
         rule_perf = self._get_recent_performance('weight_based')
         ml_perf = self._get_recent_performance('ml_based')
         
+        # Two-way comparison (rule vs ML)
         if rule_perf and ml_perf and rule_perf.get('total', 0) >= 10:
             rule_acc = rule_perf.get('accuracy', 50)
             ml_acc = ml_perf.get('accuracy', 50)
             
-            if abs(rule_acc - ml_acc) > 5:
+            if abs(rule_acc - ml_acc) > ML_ENSEMBLE_WEIGHT_UPDATE_THRESHOLD:
                 if rule_acc > ml_acc:
-                    self.ensemble_weights['rule'] = min(0.8, self.ensemble_weights['rule'] + 0.05)
+                    self.ensemble_weights['rule'] = min(ML_ENSEMBLE_WEIGHT_MAX, self.ensemble_weights.get('rule', 0.5) + 0.05)
                     self.ensemble_weights['ml'] = 1.0 - self.ensemble_weights['rule']
+                    self.ensemble_weights['ai'] = 0.0
                 else:
-                    self.ensemble_weights['ml'] = min(0.8, self.ensemble_weights['ml'] + 0.05)
+                    self.ensemble_weights['ml'] = min(ML_ENSEMBLE_WEIGHT_MAX, self.ensemble_weights.get('ml', 0.5) + 0.05)
                     self.ensemble_weights['rule'] = 1.0 - self.ensemble_weights['ml']
+                    self.ensemble_weights['ai'] = 0.0
                 
                 self._save_ensemble_weights()
 

@@ -459,12 +459,36 @@ class MLTrainingPipeline:
         if progress_callback:
             progress_callback("Training ML model...")
         
+        # Check if a saved configuration should be used
+        training_params = {}
+        if self.app and hasattr(self.app, '_saved_training_config') and self.app._saved_training_config:
+            training_params = self.app._saved_training_config.copy()
+            logger.info(f"Using saved configuration for training")
+            # Clear after use (one-time use)
+            self.app._saved_training_config = None
+        
         # Use binary classification mode for better accuracy (60-75% vs 45-48%)
         # Binary mode removes ambiguous HOLD class and focuses on clear UP/DOWN signals
+        # Apply saved config parameters if available, otherwise use defaults
+        train_kwargs = {
+            'use_binary_classification': training_params.get('use_binary_classification', True),
+            'use_regime_models': training_params.get('use_regime_models', True),
+            'feature_selection_method': training_params.get('feature_selection_method', 'importance'),
+            'model_family': training_params.get('model_family', 'voting'),
+        }
+        
+        # Add optional hyperparameters if provided in config
+        for param in ['rf_n_estimators', 'rf_max_depth', 'rf_min_samples_split', 'rf_min_samples_leaf',
+                      'gb_n_estimators', 'gb_max_depth', 'lgb_reg_alpha', 'lgb_reg_lambda',
+                      'lgb_subsample', 'lgb_colsample_bytree', 'lgb_min_child_samples',
+                      'xgb_reg_alpha', 'xgb_reg_lambda', 'xgb_subsample', 'xgb_colsample_bytree',
+                      'xgb_min_child_weight', 'xgb_gamma']:
+            if training_params.get(param) is not None:
+                train_kwargs[param] = training_params[param]
+        
         results = ml_model.train(
             all_samples,
-            use_binary_classification=True,  # Enable binary mode for better accuracy
-            model_family='voting'  # Use voting ensemble (RF + GB)
+            **train_kwargs
         )
         
         results['total_samples'] = len(all_samples)

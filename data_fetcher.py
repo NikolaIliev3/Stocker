@@ -167,6 +167,44 @@ class StockDataFetcher:
             force_refresh: If True, bypasses cache to get fresh data
             check_quality: If True, perform data quality checks
         """
+        # Try backend first if available (prioritized for better reliability/workarounds)
+        if self._check_backend_available():
+            try:
+                url = f"{self.base_url}/stock/{symbol}"
+                params = {}
+                if force_refresh:
+                    # Add cache-busting parameter to force fresh data
+                    import time
+                    params['_refresh'] = str(int(time.time() * 1000))
+                
+                response = self.session.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                
+                data = response.json()
+                
+                # Validate data integrity
+                if not DataValidator.validate_stock_data(data):
+                    raise SecurityError("Invalid stock data received from server")
+                
+                # Perform quality check if requested
+                if check_quality and self.quality_checker:
+                    history_data = self.fetch_stock_history(symbol)
+                    if history_data and 'data' in history_data:
+                        quality_report = self.quality_checker.check_stock_data_quality(
+                            data, history_data
+                        )
+                        data['quality_report'] = quality_report
+                
+                return data
+            
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Backend request failed: {e}, falling back to other providers")
+                # Don't mark as unavailable here, just continue to other providers
+            except SecurityError as e:
+                logger.warning(f"Security error from backend: {e}, falling back to other providers")
+            except Exception as e:
+                logger.warning(f"Backend error: {e}, falling back to other providers")
+
         # Try using data provider abstraction if available
         if self.data_provider:
             try:
@@ -201,47 +239,7 @@ class StockDataFetcher:
                     
                     return data
             except Exception as e:
-                logger.debug(f"Data provider failed, falling back to backend: {e}")
-        
-        # Try backend first if available
-        if self._check_backend_available():
-            try:
-                url = f"{self.base_url}/stock/{symbol}"
-                params = {}
-                if force_refresh:
-                    # Add cache-busting parameter to force fresh data
-                    import time
-                    params['_refresh'] = str(int(time.time() * 1000))
-                
-                response = self.session.get(url, params=params, timeout=10)
-                response.raise_for_status()
-                
-                data = response.json()
-                
-                # Validate data integrity
-                if not DataValidator.validate_stock_data(data):
-                    raise SecurityError("Invalid stock data received from server")
-                
-                # Perform quality check if requested
-                if check_quality and self.quality_checker:
-                    history_data = self.fetch_stock_history(symbol)
-                    if history_data and 'data' in history_data:
-                        quality_report = self.quality_checker.check_stock_data_quality(
-                            data, history_data
-                        )
-                        data['quality_report'] = quality_report
-                
-                return data
-            
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"Backend request failed: {e}, falling back to direct yfinance")
-                self._backend_available = False  # Mark backend as unavailable
-            except SecurityError as e:
-                logger.warning(f"Security error from backend: {e}, falling back to direct yfinance")
-                self._backend_available = False
-            except Exception as e:
-                logger.warning(f"Backend error: {e}, falling back to direct yfinance")
-                self._backend_available = False
+                logger.debug(f"Data provider failed: {e}")
         
         # Fallback to direct yfinance
         return self._fetch_direct_yfinance(symbol)

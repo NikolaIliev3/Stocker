@@ -7,6 +7,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import logging
+from calibration_manager import CalibrationManager
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,7 @@ class LearningTracker:
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.learning_file = self.data_dir / "learning_tracker.json"
+        self.calibration_manager = CalibrationManager(data_dir)
         self.data = self._load_data()
     
     def _load_data(self) -> Dict:
@@ -57,6 +59,7 @@ class LearningTracker:
             'learning_history': [],
             'pending_peak_verifications': [],  # Peak detections waiting to be verified
             'pending_bottom_verifications': [],  # Bottom detections waiting to be verified
+            'pending_buy_opportunities': [],  # Buy opportunities waiting to be verified
             'first_learning_date': None,
             'last_learning_date': None
         }
@@ -99,10 +102,15 @@ class LearningTracker:
         self.save()
         logger.info(f"🔍 Learning: Auto-scan recorded ({predictions_made} predictions)")
     
-    def record_verified_prediction(self, was_correct: bool, strategy: str):
+    def record_verified_prediction(self, was_correct: bool, strategy: str, 
+                                  prediction_data: Dict = None, actual_outcome: Dict = None):
         """Record a verified prediction"""
         self.data['data_sources']['verified_predictions'] += 1
         self.data['knowledge']['total_predictions_verified'] += 1
+        
+        # Update calibration if data is available
+        if prediction_data and actual_outcome:
+            self.calibration_manager.update_from_verified_prediction(prediction_data, actual_outcome)
         
         # Track accuracy improvements
         if was_correct:
@@ -351,6 +359,7 @@ class LearningTracker:
                 'manual_analyses': self.data['data_sources'].get('manual_analyses', 0),
                 'auto_scans': self.data['data_sources'].get('auto_scans', 0),
                 'verified_predictions': self.data['data_sources'].get('verified_predictions', 0),
+                'buy_opportunities': self.data['data_sources'].get('buy_opportunity_predictions', 0),
                 'background_trainings': self.data['data_sources'].get('background_trainings', 0),
                 'unique_stocks': self.data['knowledge'].get('total_stocks_learned', 0)
             },
@@ -730,4 +739,121 @@ class LearningTracker:
             'bottom_accuracy': bottom_accuracy,
             'overall_accuracy': overall_accuracy
         }
+    
+    def record_buy_opportunity_prediction(self, symbol: str, current_price: float, predicted_price: float, 
+                                          estimated_date: str, confidence: float, reasoning: str):
+        """Record a predicted future buy opportunity for Megamind learning
+        
+        Args:
+            symbol: Stock symbol
+            current_price: Current price when prediction was made
+            predicted_price: Predicted future better entry price
+            estimated_date: Estimated date for the opportunity (ISO format)
+            confidence: Confidence in the prediction (0-100)
+            reasoning: Reasoning behind the prediction
+        """
+        if not self.data['data_sources'].get('first_learning_date'):
+            self.data['data_sources']['first_learning_date'] = datetime.now().isoformat()
+        
+        # Ensure pending_buy_opportunities exists
+        if 'pending_buy_opportunities' not in self.data:
+            self.data['pending_buy_opportunities'] = []
+            
+        self.data['data_sources']['buy_opportunity_predictions'] = self.data['data_sources'].get('buy_opportunity_predictions', 0) + 1
+        self._add_symbol(symbol)
+        
+        opportunity_id = len(self.data['pending_buy_opportunities']) + 1
+        prediction_record = {
+            'id': opportunity_id,
+            'symbol': symbol.upper(),
+            'current_price_at_prediction': current_price,
+            'predicted_price': predicted_price,
+            'estimated_date': estimated_date,
+            'confidence': confidence,
+            'reasoning': reasoning,
+            'prediction_date': datetime.now().isoformat(),
+            'verified': False
+        }
+        self.data['pending_buy_opportunities'].append(prediction_record)
+        
+        # Keep only last 500 pending
+        if len(self.data['pending_buy_opportunities']) > 500:
+            self.data['pending_buy_opportunities'] = self.data['pending_buy_opportunities'][-500:]
+            
+        self._add_learning_event('buy_opportunity_prediction', {
+            'symbol': symbol,
+            'predicted_price': predicted_price,
+            'estimated_date': estimated_date,
+            'confidence': confidence
+        })
+        self.save()
+        logger.info(f"🧠 Learning: Buy opportunity for {symbol} recorded (${predicted_price:.2f} by {estimated_date})")
+
+    def verify_buy_opportunity(self, prediction_record: Dict, current_price: float) -> Optional[Dict]:
+        """Verify if a predicted buy opportunity was correct (did price reach the target?)"""
+        target_price = prediction_record.get('predicted_price', 0)
+        if target_price == 0:
+            return None
+            
+        # Target is reached if current price <= target_price (since it's a better buying opportunity)
+        # Note: We consider it "correct" if it hit the target price at ANY point, 
+        # but here we check against CURRENT price when verification runs.
+        hit_target = current_price <= target_price
+        
+        # We also check if the date has passed
+        try:
+            est_date = datetime.fromisoformat(prediction_record.get('estimated_date', ''))
+            now = datetime.now()
+            date_passed = now >= est_date
+        except:
+            date_passed = False
+            
+        # If it hit the target, it's correct regardless of date (early hit is good)
+        if hit_target:
+            return {
+                'was_correct': True,
+                'target_hit': True,
+                'target_price': target_price,
+                'actual_price': current_price,
+                'verification_date': datetime.now().isoformat()
+            }
+        
+        # If date passed and target NOT hit, it's incorrect
+        if date_passed:
+            return {
+                'was_correct': False,
+                'target_hit': False,
+                'target_price': target_price,
+                'actual_price': current_price,
+                'verification_date': datetime.now().isoformat()
+            }
+            
+        # Otherwise wait
+        return None
+
+    def record_verified_buy_opportunity(self, prediction_record: Dict, result: Dict):
+        """Record verified buy opportunity for learning"""
+        if 'buy_opportunity_accuracy' not in self.data['knowledge']:
+            self.data['knowledge']['buy_opportunity_accuracy'] = []
+            
+        was_correct = result.get('was_correct', False)
+        
+        self.data['knowledge']['buy_opportunity_accuracy'].append({
+            'timestamp': result.get('verification_date', datetime.now().isoformat()),
+            'symbol': prediction_record.get('symbol', ''),
+            'was_correct': was_correct,
+            'predicted_price': prediction_record.get('predicted_price', 0),
+            'actual_price': result.get('actual_price', 0),
+            'confidence': prediction_record.get('confidence', 0)
+        })
+        
+        prediction_record['verified'] = True
+        prediction_record['verification_result'] = result
+        
+        self._add_learning_event('verified_buy_opportunity', {
+            'symbol': prediction_record.get('symbol', ''),
+            'was_correct': was_correct
+        })
+        self.save()
+        logger.info(f"✅ Learning: Buy opportunity verified for {prediction_record.get('symbol', '')} - {'CORRECT' if was_correct else 'INCORRECT'}")
 

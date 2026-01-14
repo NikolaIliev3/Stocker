@@ -66,7 +66,7 @@ class MarketScanner:
                         investing_analyzer=self.investing_analyzer
                     )
                 }
-                logger.info("Market scanner initialized with hybrid predictors (trained AI enabled)")
+                logger.info("Market scanner initialized with hybrid predictors (Rules + ML)")
             except Exception as e:
                 logger.warning(f"Could not initialize hybrid predictors: {e}, using basic analyzers")
                 self.hybrid_predictors = {}
@@ -154,8 +154,9 @@ class MarketScanner:
                 action = recommendation.get('action', 'HOLD')
                 confidence = recommendation.get('confidence', 0)
                 
-                # Only include BUY recommendations with decent confidence
-                if action == 'BUY' and confidence >= 50:
+                # Only include recommendations with decent confidence
+                # INVERTED LOGIC: SELL is now bullish/entry signal
+                if action == 'SELL' and confidence >= 50:
                     recommendations.append({
                         'symbol': symbol,
                         'name': stock_data.get('name', symbol),

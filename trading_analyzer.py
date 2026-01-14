@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 class TradingAnalyzer:
     """Analyzes stocks using trading/technical analysis approach"""
     
-    def __init__(self, data_fetcher=None):
+    def __init__(self, data_fetcher=None, calibration_manager=None):
+        self.calibration_manager = calibration_manager
         self.rsi_oversold = 30
         self.rsi_overbought = 70
         self.regime_detector = MarketRegimeDetector()
@@ -891,6 +892,12 @@ class TradingAnalyzer:
                     confidence = max(40, confidence - 3)
                     reasons.append(f"↔️ Mixed timeframe signals - neutral stance")
             else:  # HOLD
+                # Add trend context to reasoning instead of action string
+                if trend == "uptrend":
+                    reasons.append("**Price is currently rising** - monitoring for entry opportunity")
+                elif trend == "downtrend":
+                    reasons.append("**Price is currently falling** - monitoring for support")
+                
                 # For HOLD, mixed signals are expected
                 if alignment == 'mixed':
                     reasons.append(f"↔️ Mixed timeframe signals - appropriate for HOLD")
@@ -983,6 +990,17 @@ class TradingAnalyzer:
         # Trading strategy: Short-term targets (2-5% gains, 2-3% stop loss)
         entry_price = current_price
         
+        # Get dynamic multipliers if available
+        target_mult = 1.0
+        stop_mult = 1.0
+        if self.calibration_manager:
+            multipliers = self.calibration_manager.get_multipliers('trading')
+            target_mult = multipliers.get('target_mult', 1.0)
+            stop_mult = multipliers.get('stop_loss_mult', 1.0)
+            if target_mult != 1.0 or stop_mult != 1.0:
+                logger.debug(f"Direct Calibration: Applying multipliers T={target_mult:.2f}, SL={stop_mult:.2f}")
+        
+        
         if action == "BUY":
             # Use volume-weighted resistance level if available
             resistance = support_resistance.get('resistance', None)
@@ -1012,7 +1030,10 @@ class TradingAnalyzer:
                 # For BUY: use abs(score) since score is negative, higher abs(score) = higher target
                 # Increased range to allow higher targets
                 base_target_percent = 3.0 + (min(abs(score), 5) * 1.4)  # 3% to 10% (increased from 2-8%)
-                target_price = current_price * (1 + base_target_percent / 100)
+                
+                # Apply dynamic multiplier
+                adjusted_target_percent = base_target_percent * target_mult
+                target_price = current_price * (1 + adjusted_target_percent / 100)
             
             # Stop loss: Use volume-weighted support if available
             if support and support < current_price:
@@ -1029,7 +1050,10 @@ class TradingAnalyzer:
                 min_stop = current_price * 0.97
                 stop_loss = max(stop_loss, min_stop)
             else:
-                stop_loss = current_price * 0.97  # 3% stop loss for short-term
+                # Standard stop loss (3%) adjusted by multiplier
+                base_stop_pct = 3.0
+                adjusted_stop_pct = base_stop_pct * stop_mult
+                stop_loss = current_price * (1 - (adjusted_stop_pct / 100))
             
         elif action == "SELL":
             # NOTE: System uses INVERTED logic - SELL = bullish (expecting price to go UP)
@@ -1060,7 +1084,10 @@ class TradingAnalyzer:
                 # Calculate target based on momentum and volatility (3-10% for short-term)
                 # For SELL (bullish): use abs(score) since score is positive, higher abs(score) = higher target
                 base_target_percent = 3.0 + (min(abs(score), 5) * 1.4)  # 3% to 10%
-                target_price = current_price * (1 + base_target_percent / 100)
+                
+                # Apply dynamic multiplier
+                adjusted_target_percent = base_target_percent * target_mult
+                target_price = current_price * (1 + adjusted_target_percent / 100)
             
             # Stop loss: Use volume-weighted support if available (BELOW entry for bullish SELL)
             if support and support < current_price:
@@ -1077,7 +1104,10 @@ class TradingAnalyzer:
                 min_stop = current_price * 0.97
                 stop_loss = max(stop_loss, min_stop)
             else:
-                stop_loss = current_price * 0.97  # 3% stop loss for short-term
+                # Standard stop loss (3%) adjusted by multiplier
+                base_stop_pct = 3.0
+                adjusted_stop_pct = base_stop_pct * stop_mult
+                stop_loss = current_price * (1 - (adjusted_stop_pct / 100))
             
         else:  # HOLD
             entry_price = current_price
