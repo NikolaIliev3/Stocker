@@ -79,11 +79,11 @@ class StockMonitor:
         """Get monitoring info for a stock"""
         return self.monitored_stocks.get(symbol.upper())
     
-    def check_for_buy_signal(self, symbol: str, new_action: str, confidence: float = 0) -> bool:
-        """Check if stock changed from non-BUY to BUY
+    def check_for_bullish_signal(self, symbol: str, new_action: str, confidence: float = 0) -> bool:
+        """Check if stock changed from non-bullish to bullish (SELL in inverted logic)
         
         Returns:
-            True if changed from HOLD/AVOID/SELL to BUY
+            True if changed from HOLD/AVOID/BUY to SELL
         """
         symbol_upper = symbol.upper()
         if symbol_upper not in self.monitored_stocks:
@@ -91,8 +91,9 @@ class StockMonitor:
         
         old_action = self.monitored_stocks[symbol_upper].get('last_action', 'UNKNOWN')
         
-        # Check if changed from non-BUY to BUY
-        if old_action in ['HOLD', 'AVOID', 'SELL'] and new_action == 'BUY':
+        # INVERTED logic: SELL action means bullish (buy opportunity)
+        # Check if changed from non-SELL to SELL
+        if old_action in ['HOLD', 'AVOID', 'BUY'] and new_action == 'SELL':
             # Update the action
             self.update_stock_action(symbol_upper, new_action, confidence)
             return True
@@ -100,6 +101,10 @@ class StockMonitor:
         # Update even if no signal (to track current state)
         self.update_stock_action(symbol_upper, new_action, confidence)
         return False
+    
+    # Alias for backward compatibility if needed, but we should use the new name
+    def check_for_buy_signal(self, symbol: str, new_action: str, confidence: float = 0) -> bool:
+        return self.check_for_bullish_signal(symbol, new_action, confidence)
     
     def remove_stock(self, symbol: str):
         """Remove a stock from monitoring"""

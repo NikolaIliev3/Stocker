@@ -208,9 +208,10 @@ class SeekerAI:
         self.anomaly_detector = AnomalyDetector()
         self.retention_manager = DataRetentionManager(data_dir)
         
+        
         # API endpoints (use HTTPS only)
         self.news_api_url = "https://newsapi.org/v2/everything"
-        self.openai_api_url = "https://api.openai.com/v1/chat/completions"
+        # self.openai_api_url = "https://api.openai.com/v1/chat/completions" # Removed
         
         # Audit log
         self.audit_log_file = data_dir / "api_audit.log"
@@ -250,9 +251,20 @@ class SeekerAI:
             
             symbol = symbol.upper().strip()
             
-            # SECURITY: Validate stock data
-            if not DataValidator.validate_stock_data(stock_data):
-                SecureLogger.warning(f"Invalid stock data for {symbol}")
+            # SECURITY: Validate stock data (more lenient for AI - allow missing volume)
+            # Check required fields
+            if 'symbol' not in stock_data or 'price' not in stock_data:
+                SecureLogger.warning(f"Missing required fields (symbol/price) for {symbol}")
+                return {'error': 'Invalid stock data'}
+            
+            # Add default volume if missing (for historical data reconstruction)
+            if 'volume' not in stock_data:
+                stock_data['volume'] = 0  # Default volume for historical points
+                logger.debug(f"Volume missing for {symbol}, using default 0")
+            
+            # Validate price
+            if not DataValidator.validate_price(stock_data.get('price', 0)):
+                SecureLogger.warning(f"Invalid price for {symbol}")
                 return {'error': 'Invalid stock data'}
             
             # Check cache first (cache for configured hours)
@@ -557,131 +569,14 @@ class SeekerAI:
     def _generate_ai_summary(self, symbol: str, stock_data: dict,
                             articles: List[Dict], sentiment: Dict, 
                             reputation: Dict) -> Dict:
-        """Generate AI summary using LLM (OpenAI/Anthropic)"""
-        try:
-            # Get API key securely
-            openai_key = self.credential_manager.get_api_key('openai')
-            
-            if not openai_key:
-                return {
-                    'summary': self._generate_fallback_summary(symbol, sentiment, reputation),
-                    'insights': [],
-                    'risks': [],
-                    'opportunities': []
-                }
-            
-            # Prepare context
-            news_summary = "\n".join([f"- {InputValidator.sanitize_string(a['title'], 100)}" for a in articles[:10]])
-            
-            prompt = f"""Analyze the stock {symbol} based on the following information:
-
-Stock Data:
-- Current Price: ${stock_data.get('price', 0):.2f}
-- Change: {stock_data.get('change_percent', 0):.2f}%
-
-Recent News Headlines:
-{news_summary}
-
-Sentiment Analysis:
-- Score: {sentiment['score']:.2f}
-- Label: {sentiment['label']}
-
-Reputation Analysis:
-- Score: {reputation['score']:.2f}
-
-Please provide:
-1. A concise summary (2-3 sentences)
-2. Key insights (3-5 bullet points)
-3. Risk factors (2-3 items)
-4. Opportunities (2-3 items)
-
-Format as JSON with keys: summary, insights (array), risks (array), opportunities (array)
-"""
-            
-            # SECURITY: Sanitize prompt
-            prompt = InputValidator.sanitize_string(prompt, 2000)
-            
-            headers = {
-                'Authorization': f'Bearer {openai_key}',
-                'Content-Type': 'application/json'
-            }
-            
-            payload = {
-                'model': 'gpt-4',
-                'messages': [
-                    {'role': 'system', 'content': 'You are a financial analyst providing stock research.'},
-                    {'role': 'user', 'content': prompt}
-                ],
-                'temperature': 0.7,
-                'max_tokens': 500
-            }
-            
-            # SECURITY: Use secure API client
-            response = self.api_client.post(
-                self.openai_api_url,
-                headers=headers,
-                json=payload
-            )
-            
-            # Validate response
-            if not ResponseValidator.validate_response(response):
-                SecureLogger.warning("Invalid response from OpenAI API")
-                return {
-                    'summary': self._generate_fallback_summary(symbol, sentiment, reputation),
-                    'insights': [],
-                    'risks': [],
-                    'opportunities': []
-                }
-            
-            if response.status_code == 200:
-                data = response.json()
-                result_text = data['choices'][0]['message']['content']
-                
-                # Try to parse as JSON
-                try:
-                    result = json.loads(result_text)
-                    # Validate JSON structure
-                    if ResponseValidator.validate_json_structure(result):
-                        return result
-                    else:
-                        SecureLogger.warning("Invalid JSON structure from LLM")
-                except json.JSONDecodeError:
-                    # Not JSON, return as summary
-                    return {
-                        'summary': InputValidator.sanitize_string(result_text, 1000),
-                        'insights': [],
-                        'risks': [],
-                        'opportunities': []
-                    }
-            else:
-                error_msg = f"API returned status {response.status_code}"
-                SecureLogger.warning(error_msg)
-                self._log_api_call('openai', symbol, False, error_msg)
-                return {
-                    'summary': self._generate_fallback_summary(symbol, sentiment, reputation),
-                    'insights': [],
-                    'risks': [],
-                    'opportunities': []
-                }
-                
-        except requests.exceptions.SSLError as e:
-            SecureLogger.error(f"SSL error calling LLM API: {e}")
-            self._log_api_call('openai', symbol, False, "SSL error")
-            return {
-                'summary': self._generate_fallback_summary(symbol, sentiment, reputation),
-                'insights': [],
-                'risks': [],
-                'opportunities': []
-            }
-        except Exception as e:
-            SecureLogger.error(f"Error calling LLM API: {e}")
-            self._log_api_call('openai', symbol, False, "Request failed")
-            return {
-                'summary': self._generate_fallback_summary(symbol, sentiment, reputation),
-                'insights': [],
-                'risks': [],
-                'opportunities': []
-            }
+        """Generate AI summary - DEPRECATED (OpenAI Removed)"""
+        # Always use fallback
+        return {
+            'summary': self._generate_fallback_summary(symbol, sentiment, reputation),
+            'insights': [],
+            'risks': [],
+            'opportunities': []
+        }
     
     def _load_from_cache(self, symbol: str) -> Optional[Dict]:
         """Load research from cache"""

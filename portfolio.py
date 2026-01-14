@@ -61,11 +61,18 @@ class Portfolio:
                     self.trades = data.get('trades', [])
                     self.wins = data.get('wins', 0)
                     self.losses = data.get('losses', 0)
+                    self.snapshots = data.get('snapshots', [])
+                    self.start_date = data.get('start_date', datetime.now().isoformat())
+                    
+                    # If no snapshots exist, create initial snapshot
+                    if not self.snapshots:
+                        self._take_snapshot()
             except Exception as e:
                 logger.error(f"Error loading portfolio: {e}")
                 self._initialize_default()
         else:
             self._initialize_default()
+            self._take_snapshot()  # Create initial snapshot
     
     def _initialize_default(self):
         """Initialize portfolio with default values"""
@@ -74,6 +81,8 @@ class Portfolio:
         self.trades = []
         self.wins = 0
         self.losses = 0
+        self.snapshots = []  # Track portfolio value over time
+        self.start_date = datetime.now().isoformat()  # Track when tracking started
     
     def save(self):
         """Save portfolio data to file"""
@@ -84,12 +93,33 @@ class Portfolio:
                 'trades': self.trades,
                 'wins': self.wins,
                 'losses': self.losses,
+                'snapshots': self.snapshots,
+                'start_date': self.start_date,
                 'last_updated': datetime.now().isoformat()
             }
             with open(self.portfolio_file, 'w') as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
             logger.error(f"Error saving portfolio: {e}")
+    
+    def _take_snapshot(self):
+        """Take a snapshot of current portfolio value"""
+        snapshot = {
+            'timestamp': datetime.now().isoformat(),
+            'balance': self.balance,
+            'return_pct': ((self.balance - self.initial_balance) / self.initial_balance * 100) if self.initial_balance > 0 else 0
+        }
+        self.snapshots.append(snapshot)
+        
+        # Keep only last 365 snapshots (1 year of daily snapshots)
+        if len(self.snapshots) > 365:
+            self.snapshots = self.snapshots[-365:]
+        
+        self.save()
+    
+    def update_snapshot(self):
+        """Update portfolio snapshot (call this periodically, e.g., daily)"""
+        self._take_snapshot()
     
     def set_balance(self, balance: float):
         """Set initial balance"""
@@ -256,7 +286,8 @@ class Portfolio:
         else:
             self.losses += 1
         
-        self.save()
+        # Take snapshot after each trade
+        self._take_snapshot()
         
         return trade
     
@@ -307,4 +338,15 @@ class Portfolio:
     def get_recent_trades(self, limit: int = 10) -> List[Dict]:
         """Get recent trades"""
         return self.trades[-limit:] if self.trades else []
+    
+    def get_portfolio_history(self) -> List[Dict]:
+        """Get portfolio value history (snapshots)"""
+        return self.snapshots if self.snapshots else []
+    
+    def get_start_date(self) -> datetime:
+        """Get the date when portfolio tracking started"""
+        try:
+            return datetime.fromisoformat(self.start_date)
+        except:
+            return datetime.now()
 

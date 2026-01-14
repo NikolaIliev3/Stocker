@@ -69,7 +69,7 @@ ENABLE_ANOMALY_DETECTION = True
 ANOMALY_ALERT_THRESHOLD = 10  # alerts before blocking
 
 # Seeker AI Security Configuration
-SEEKER_AI_ENABLED = True
+SEEKER_AI_ENABLED = False
 SEEKER_AI_RATE_LIMIT = 60  # Calls per minute
 SEEKER_AI_CACHE_HOURS = 1
 SEEKER_AI_AUDIT_LOGGING = True
@@ -87,11 +87,41 @@ HYPERPARAMETER_TUNING_PARALLEL_TRIALS = None  # None = auto (uses all cores), or
 # Note: Setting to -1 uses all available CPU cores, which maximizes speed but uses more resources
 # If you want to leave some cores free for other tasks, set to a lower number (e.g., 4 or 6)
 
-# CPU/Performance Configuration
-# Set to -1 to use all available CPU cores, or specify a number (e.g., 4 for 4 cores)
-# For intensive tasks (ML training, backtesting), using all cores significantly speeds up processing
-ML_TRAINING_CPU_CORES = -1  # Use all cores for ML training (-1 = all, or specify number)
-BACKTESTING_CPU_CORES = -1  # Use all cores for backtesting (-1 = all, or specify number)
-HYPERPARAMETER_TUNING_PARALLEL_TRIALS = None  # None = auto (uses all cores), or specify number
-# Note: Setting to -1 uses all available CPU cores, which maximizes speed but uses more resources
-# If you want to leave some cores free for other tasks, set to a lower number (e.g., 4 or 6)
+# ML Model Configuration
+ML_FEATURE_SELECTION_THRESHOLD = 0.005  # Threshold for feature selection importance
+ML_RF_N_ESTIMATORS = 80  # Random Forest number of estimators
+ML_RF_MAX_DEPTH = 4  # Random Forest max depth (anti-overfitting)
+ML_RF_MIN_SAMPLES_SPLIT = 30  # Random Forest min samples split
+ML_RF_MIN_SAMPLES_LEAF = 15  # Random Forest min samples leaf
+ML_GB_N_ESTIMATORS = 150  # Gradient Boosting number of estimators
+ML_GB_MAX_DEPTH = 4  # Gradient Boosting max depth
+ML_GB_LEARNING_RATE = 0.03  # Gradient Boosting learning rate
+ML_HIGH_ACCURACY_THRESHOLD = 0.60  # Threshold for considering ML model "high accuracy" (60%)
+ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.62  # Threshold for "very high accuracy" (62%)
+ML_MIN_TRAINING_SAMPLES = 100  # Minimum samples required for training
+ML_MIN_BINARY_SAMPLES = 30  # Minimum samples for binary classification
+ML_PERFORMANCE_HISTORY_LIMIT = 1000  # Maximum entries in performance history
+ML_RECENT_PERFORMANCE_WINDOW = 50  # Window size for recent performance calculation
+ML_ENSEMBLE_WEIGHT_UPDATE_THRESHOLD = 5  # Minimum accuracy difference to update ensemble weights
+ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD = 10  # Accuracy difference threshold for weight adjustment
+ML_ENSEMBLE_WEIGHT_MAX = 0.8  # Maximum ensemble weight
+ML_ENSEMBLE_WEIGHT_MIN = 0.1  # Minimum ensemble weight for high-accuracy ML
+ML_CONFIDENCE_DIFF_THRESHOLD_HIGH = 30  # Confidence difference threshold for high-accuracy ML
+ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL = 20  # Confidence difference threshold for normal ML
+ML_RULE_CONFIDENCE_ADVANTAGE_THRESHOLD = 25  # Rule confidence advantage threshold over ML
+
+# AI Predictor Configuration
+AI_PREDICTOR_ENABLED = False  # Disable SeekerAI (not helpful per testing)
+AI_PREDICTOR_DEFAULT_WEIGHT = 0.2  # Default weight for AI predictions (20%)
+AI_PREDICTOR_MIN_CONFIDENCE = 40.0  # Minimum confidence to use AI prediction
+AI_PREDICTOR_SENTIMENT_WEIGHT = 0.4  # Weight of sentiment in AI score calculation
+AI_PREDICTOR_REPUTATION_WEIGHT = 0.3  # Weight of reputation in AI score calculation
+AI_PREDICTOR_INSIGHT_WEIGHT = 0.3  # Weight of insights in AI score calculation
+
+# LLM AI Predictor Configuration (more useful than SeekerAI)
+LLM_AI_PREDICTOR_ENABLED = False  # Enable LLM-based AI predictor
+LLM_AI_PREDICTOR_DEFAULT_WEIGHT = 0.25  # Default weight for LLM AI predictions (25%)
+LLM_AI_PREDICTOR_MIN_CONFIDENCE = 45.0  # Minimum confidence to use LLM AI prediction
+LLM_AI_USE_OPENAI = True  # Use OpenAI GPT if API key available
+LLM_AI_MODEL = "gpt-4o-mini"  # OpenAI model to use
+LLM_AI_FALLBACK_ENABLED = False  # Use advanced rule-based fallback if no LLM

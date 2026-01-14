@@ -18,7 +18,9 @@ class MomentumMonitor:
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.momentum_file = self.data_dir / "momentum_states.json"
+        self.history_file = self.data_dir / "momentum_history.json"
         self.momentum_states = self._load_states()
+        self.history = self._load_history()
     
     def _load_states(self) -> Dict:
         """Load momentum states from file"""
@@ -37,6 +39,71 @@ class MomentumMonitor:
                 json.dump(self.momentum_states, f, indent=2, default=str)
         except Exception as e:
             logger.error(f"Error saving momentum states: {e}")
+            
+    def _load_history(self) -> List:
+        """Load momentum change history from file"""
+        if self.history_file.exists():
+            try:
+                with open(self.history_file, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Error loading momentum history: {e}")
+        return []
+        
+    def save_history(self):
+        """Save momentum change history to file"""
+        try:
+            # Keep only last 100 entries to prevent file bloat
+            if len(self.history) > 100:
+                self.history = self.history[-100:]
+                
+            with open(self.history_file, 'w') as f:
+                json.dump(self.history, f, indent=2, default=str)
+        except Exception as e:
+            logger.error(f"Error saving momentum history: {e}")
+            
+    def add_to_history(self, symbol: str, action: str, changes: dict, strategy: str = 'mixed'):
+        """Add a momentum change event to history"""
+        
+        # Check for duplicates (same symbol, same changes, same recommendation)
+        # This prevents spamming the history with identical updates if the analyzer runs frequently
+        for i in range(len(self.history) - 1, -1, -1):
+            entry = self.history[i]
+            if entry['symbol'] == symbol.upper():
+                # Found last entry for this symbol
+                last_changes = entry.get('changes', {})
+                last_changes_list = last_changes.get('changes', [])
+                new_changes_list = changes.get('changes', [])
+                
+                last_reco_action = last_changes.get('recommendation', {}).get('action')
+                new_reco_action = changes.get('recommendation', {}).get('action')
+                
+                # Check if identical content
+                if (last_changes_list == new_changes_list and 
+                    last_reco_action == new_reco_action):
+                    logger.debug(f"Skipping duplicate momentum history for {symbol}")
+                    return
+                break
+        
+        entry = {
+            'symbol': symbol.upper(),
+            'action': action,  # Previous action or signal
+            'changes': changes,
+            'strategy': strategy,
+            'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        self.history.append(entry)
+        self.save_history()
+        
+    def clear_history(self):
+        """Clear momentum history"""
+        self.history = []
+        if self.history_file.exists():
+            try:
+                self.history_file.unlink()
+            except Exception as e:
+                logger.error(f"Error deleting history file: {e}")
+        self.save_history()
     
     def _get_stock_key(self, symbol: str) -> str:
         """Get normalized stock key"""
@@ -234,7 +301,7 @@ class MomentumMonitor:
     
     def _determine_recommendation(self, previous_state: dict, current_state: dict, 
                                   trend_reversed: bool, momentum_changed: bool) -> dict:
-        """Determine BUY/SELL/HOLD recommendation based on trend and momentum changes"""
+        """Determine recommendation based on trend and momentum changes (INVERTED logic)"""
         if not previous_state:
             return {'action': 'HOLD', 'confidence': 50, 'reason': 'Initial state'}
         
@@ -251,78 +318,82 @@ class MomentumMonitor:
         confidence = 50
         reasons = []
         
+        # INVERTED LOGIC:
+        # Bullish (Stock rising/recovering) -> SELL (Target: Take Profits)
+        # Bearish (Stock falling/overbought) -> BUY (Target: Buy at Discount)
+        
         # Trend reversal analysis
         if trend_reversed:
             if prev_trend == 'downtrend' and curr_trend == 'uptrend':
-                action = 'BUY'
+                action = 'SELL'  # Bullish reversal
                 confidence = 70
-                reasons.append("Trend reversed from downtrend to uptrend")
+                reasons.append("Trend reversed from downtrend to uptrend (Bullish)")
             elif prev_trend == 'uptrend' and curr_trend == 'downtrend':
-                action = 'SELL'
+                action = 'BUY'  # Bearish reversal
                 confidence = 70
-                reasons.append("Trend reversed from uptrend to downtrend")
+                reasons.append("Trend reversed from uptrend to downtrend (Bearish)")
         
         # Golden Cross / Death Cross
         if golden_cross and not previous_state.get('golden_cross', False):
-            action = 'BUY'
+            action = 'SELL'  # Bullish
             confidence = max(confidence, 75)
             reasons.append("Golden Cross detected - strong bullish signal")
         elif death_cross and not previous_state.get('death_cross', False):
-            action = 'SELL'
+            action = 'BUY'  # Bearish
             confidence = max(confidence, 75)
             reasons.append("Death Cross detected - strong bearish signal")
         
         # RSI analysis
         if curr_rsi < 30:
             if action == 'HOLD':
-                action = 'BUY'
+                action = 'SELL'  # Bullish (Oversold recovery)
                 confidence = 65
-            reasons.append(f"RSI oversold ({curr_rsi:.1f}) - potential buy opportunity")
+            reasons.append(f"RSI oversold ({curr_rsi:.1f}) - potential recovery")
         elif curr_rsi > 70:
             if action == 'HOLD':
-                action = 'SELL'
+                action = 'BUY'  # Bearish (Overbought exhaustion)
                 confidence = 65
-            reasons.append(f"RSI overbought ({curr_rsi:.1f}) - potential sell signal")
+            reasons.append(f"RSI overbought ({curr_rsi:.1f}) - potential pullback")
         
         # MFI analysis
         if curr_mfi < 20:
             if action == 'HOLD':
-                action = 'BUY'
+                action = 'SELL'  # Bullish
                 confidence = max(confidence, 60)
             reasons.append(f"MFI oversold ({curr_mfi:.1f}) - buying pressure")
         elif curr_mfi > 80:
             if action == 'HOLD':
-                action = 'SELL'
+                action = 'BUY'  # Bearish
                 confidence = max(confidence, 60)
             reasons.append(f"MFI overbought ({curr_mfi:.1f}) - selling pressure")
         
         # MACD analysis
         if curr_macd_diff > 0:
             if action == 'HOLD' and curr_momentum > 0:
-                action = 'BUY'
+                action = 'SELL'  # Bullish
                 confidence = max(confidence, 55)
             reasons.append("MACD bullish - upward momentum")
         elif curr_macd_diff < 0:
             if action == 'HOLD' and curr_momentum < 0:
-                action = 'SELL'
+                action = 'BUY'  # Bearish
                 confidence = max(confidence, 55)
             reasons.append("MACD bearish - downward momentum")
         
         # Momentum score
         if curr_momentum >= 3:
             if action == 'HOLD':
-                action = 'BUY'
+                action = 'SELL'  # Bullish
                 confidence = max(confidence, 60)
             reasons.append("Strong bullish momentum")
         elif curr_momentum <= -3:
             if action == 'HOLD':
-                action = 'SELL'
+                action = 'BUY'  # Bearish
                 confidence = max(confidence, 60)
             reasons.append("Strong bearish momentum")
         
         # If conflicting signals, reduce confidence
-        if (action == 'BUY' and (curr_rsi > 70 or curr_mfi > 80)) or \
-           (action == 'SELL' and (curr_rsi < 30 or curr_mfi < 20)):
+        if (action == 'SELL' and (curr_rsi > 70 or curr_mfi > 80)) or \
+           (action == 'BUY' and (curr_rsi < 30 or curr_mfi < 20)):
             confidence = max(50, confidence - 15)
             reasons.append("⚠️ Conflicting signals - reduced confidence")
         

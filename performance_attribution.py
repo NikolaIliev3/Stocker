@@ -269,3 +269,48 @@ class PerformanceAttribution:
             'recent_periods': {k: v.get('accuracy', 0) for k, v in recent_periods.items()},
             'period_count': len(recent_periods)
         }
+    
+    def get_regime_specific_accuracy(self, regime: str = None) -> Dict[str, float]:
+        """Get accuracy by predictor type for a specific market regime
+        
+        Args:
+            regime: Market regime (bull, bear, sideways). If None, returns overall accuracy.
+            
+        Returns:
+            Dict with accuracy for each predictor type: {'rule_based': 0.65, 'ml': 0.70, 'ai': 0.60}
+        """
+        # This is a simplified implementation
+        # In a full implementation, you'd track predictions by predictor type AND regime
+        # For now, return regime-specific accuracy if available
+        
+        if regime and regime in self.attribution_data['by_regime']:
+            regime_data = self.attribution_data['by_regime'][regime]
+            regime_accuracy = regime_data.get('accuracy', 50) / 100
+            
+            # Return same accuracy for all predictors (simplified)
+            # In practice, you'd want separate tracking
+            return {
+                'rule_based': regime_accuracy,
+                'ml': regime_accuracy,
+                'ai': regime_accuracy
+            }
+        
+        # Fallback to overall accuracy by action type as proxy
+        by_action = self.attribution_data.get('by_action', {})
+        
+        # Estimate predictor performance based on action accuracy
+        # This is a rough approximation
+        total_accuracy = 0
+        count = 0
+        for action_data in by_action.values():
+            if action_data.get('total', 0) > 0:
+                total_accuracy += action_data.get('accuracy', 50)
+                count += 1
+        
+        avg_accuracy = (total_accuracy / count / 100) if count > 0 else 0.5
+        
+        return {
+            'rule_based': avg_accuracy,
+            'ml': avg_accuracy,
+            'ai': avg_accuracy
+        }

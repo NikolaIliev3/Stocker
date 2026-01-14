@@ -90,7 +90,11 @@ except ImportError:
     logger.warning("Prediction quality scorer not available")
 
 try:
-    from config import ML_TRAINING_CPU_CORES, HYPERPARAMETER_TUNING_PARALLEL_TRIALS
+    from config import (ML_TRAINING_CPU_CORES, HYPERPARAMETER_TUNING_PARALLEL_TRIALS,
+                       ML_FEATURE_SELECTION_THRESHOLD, ML_RF_N_ESTIMATORS, ML_RF_MAX_DEPTH,
+                       ML_RF_MIN_SAMPLES_SPLIT, ML_RF_MIN_SAMPLES_LEAF, ML_GB_N_ESTIMATORS,
+                       ML_GB_MAX_DEPTH, ML_GB_LEARNING_RATE, ML_MIN_TRAINING_SAMPLES,
+                       ML_MIN_BINARY_SAMPLES)
 except ImportError:
     # Fallback if not in config
     # Windows-specific: limit to 4 cores to prevent deadlocks
@@ -99,6 +103,16 @@ except ImportError:
     else:
         ML_TRAINING_CPU_CORES = -1  # Use all cores on non-Windows
     HYPERPARAMETER_TUNING_PARALLEL_TRIALS = None
+    ML_FEATURE_SELECTION_THRESHOLD = 0.005
+    ML_RF_N_ESTIMATORS = 80
+    ML_RF_MAX_DEPTH = 4
+    ML_RF_MIN_SAMPLES_SPLIT = 30
+    ML_RF_MIN_SAMPLES_LEAF = 15
+    ML_GB_N_ESTIMATORS = 150
+    ML_GB_MAX_DEPTH = 4
+    ML_GB_LEARNING_RATE = 0.03
+    ML_MIN_TRAINING_SAMPLES = 100
+    ML_MIN_BINARY_SAMPLES = 30
 
 # Helper function to safely get n_jobs value (Windows-specific fix)
 def get_safe_n_jobs(requested_cores):
@@ -276,15 +290,80 @@ class FeatureExtractor:
         current_price = stock_data.get('price', 0)
         features.append(current_price)
         
-        # ===== ENHANCED FEATURES =====
+        # ===== ADVANCED TIME-SERIES FEATURES =====
+        if history_data and history_data.get('data'):
+            try:
+                df = pd.DataFrame(history_data['data'])
+                # Ensure date column exists
+                if 'date' in df.columns:
+                    df['date'] = pd.to_datetime(df['date'])
+                    df = df.sort_values('date')
+                else:
+                    df['date'] = pd.date_range(end=pd.Timestamp.now(), periods=len(df), freq='D')
+                
+                # Ensure column names are lowercase (required by extraction methods)
+                df.columns = [col.lower() if isinstance(col, str) else col for col in df.columns]
+                
+                if len(df) > 0 and 'close' in df.columns:
+                    ts_features = self._extract_time_series_features(df)
+                    ts_feature_list = list(ts_features.values())
+                    if len(ts_feature_list) > 0:
+                        features.extend(ts_feature_list)
+                        logger.debug(f"Extracted {len(ts_feature_list)} time-series features")
+                    else:
+                        # Add default values if extraction returned empty
+                        features.extend([0.0] * 58)  # Actual count: 58 TS features
+                else:
+                    # Add default values for time-series features
+                    features.extend([0.0] * 58)  # Actual count: 58 TS features
+            except Exception as e:
+                logger.warning(f"Error extracting time-series features: {e}")
+                features.extend([0.0] * 58)  # Actual count: 58 TS features
+        else:
+            features.extend([0.0] * 58)  # Actual count: 58 TS features
+        
+        # ===== PATTERN DETECTION FEATURES =====
+        if history_data and history_data.get('data'):
+            try:
+                df = pd.DataFrame(history_data['data'])
+                # Ensure column names are lowercase
+                df.columns = [col.lower() if isinstance(col, str) else col for col in df.columns]
+                
+                if len(df) >= 2 and all(col in df.columns for col in ['open', 'high', 'low', 'close']):
+                    pattern_features = self._extract_pattern_features(df)
+                    pattern_feature_list = list(pattern_features.values())
+                    if len(pattern_feature_list) > 0:
+                        features.extend(pattern_feature_list)
+                        logger.debug(f"Extracted {len(pattern_feature_list)} pattern features")
+                    else:
+                        features.extend([0.0] * 10)  # Actual count: 10 pattern features
+                else:
+                    features.extend([0.0] * 10)  # Actual count: 10 pattern features
+            except Exception as e:
+                logger.warning(f"Error extracting pattern features: {e}")
+                features.extend([0.0] * 10)  # Actual count: 10 pattern features
+        else:
+            features.extend([0.0] * 10)  # Actual count: 10 pattern features
+
+        # ===== ENHANCED FEATURES (Moved to end to preserve index alignment) =====
         # Extract additional enhanced features if available
+        # Always add exactly 15 enhanced features to maintain consistency
+        enhanced_feature_names = [
+            'avg_spread', 'spread_volatility', 'price_volume_correlation', 'liquidity_proxy',
+            'intraday_volatility', 'volume_trend', 'volume_ma_ratio',
+            'sector_relative_strength', 'sector_correlation',
+            'news_sentiment', 'news_volume', 'market_cap_category',
+            'sector_type', 'beta', 'dividend_yield'
+        ]
+        
         if self.enhanced_extractor:
             try:
                 enhanced_features = self.enhanced_extractor.extract_all_enhanced_features(
                     stock_data, history_data, news_data
                 )
-                # Add enhanced features to feature vector
-                for key, value in enhanced_features.items():
+                # Add enhanced features in fixed order
+                for name in enhanced_feature_names:
+                    value = enhanced_features.get(name, 0.0)
                     if isinstance(value, (int, float)):
                         features.append(float(value))
                     elif isinstance(value, bool):
@@ -293,6 +372,11 @@ class FeatureExtractor:
                         features.append(0.0)
             except Exception as e:
                 logger.debug(f"Could not extract enhanced features: {e}")
+                # Add zeros for all enhanced features if extraction fails
+                features.extend([0.0] * len(enhanced_feature_names))
+        else:
+            # Add zeros for all enhanced features if extractor not available
+            features.extend([0.0] * len(enhanced_feature_names))
         
         # 1. Market Regime Indicator (3 features: bull, bear, sideways as one-hot encoded)
         if market_regime:
@@ -409,61 +493,6 @@ class FeatureExtractor:
         else:
             features.extend([0.0, 0.0])
         
-        # ===== ADVANCED TIME-SERIES FEATURES =====
-        if history_data and history_data.get('data'):
-            try:
-                df = pd.DataFrame(history_data['data'])
-                # Ensure date column exists
-                if 'date' in df.columns:
-                    df['date'] = pd.to_datetime(df['date'])
-                    df = df.sort_values('date')
-                else:
-                    df['date'] = pd.date_range(end=pd.Timestamp.now(), periods=len(df), freq='D')
-                
-                # Ensure column names are lowercase (required by extraction methods)
-                df.columns = [col.lower() if isinstance(col, str) else col for col in df.columns]
-                
-                if len(df) > 0 and 'close' in df.columns:
-                    ts_features = self._extract_time_series_features(df)
-                    ts_feature_list = list(ts_features.values())
-                    if len(ts_feature_list) > 0:
-                        features.extend(ts_feature_list)
-                        logger.debug(f"Extracted {len(ts_feature_list)} time-series features")
-                    else:
-                        # Add default values if extraction returned empty
-                        features.extend([0.0] * 58)  # Actual count: 58 TS features
-                else:
-                    # Add default values for time-series features
-                    features.extend([0.0] * 58)  # Actual count: 58 TS features
-            except Exception as e:
-                logger.warning(f"Error extracting time-series features: {e}")
-                features.extend([0.0] * 58)  # Actual count: 58 TS features
-        else:
-            features.extend([0.0] * 58)  # Actual count: 58 TS features
-        
-        # ===== PATTERN DETECTION FEATURES =====
-        if history_data and history_data.get('data'):
-            try:
-                df = pd.DataFrame(history_data['data'])
-                # Ensure column names are lowercase
-                df.columns = [col.lower() if isinstance(col, str) else col for col in df.columns]
-                
-                if len(df) >= 2 and all(col in df.columns for col in ['open', 'high', 'low', 'close']):
-                    pattern_features = self._extract_pattern_features(df)
-                    pattern_feature_list = list(pattern_features.values())
-                    if len(pattern_feature_list) > 0:
-                        features.extend(pattern_feature_list)
-                        logger.debug(f"Extracted {len(pattern_feature_list)} pattern features")
-                    else:
-                        features.extend([0.0] * 10)  # Actual count: 10 pattern features
-                else:
-                    features.extend([0.0] * 10)  # Actual count: 10 pattern features
-            except Exception as e:
-                logger.warning(f"Error extracting pattern features: {e}")
-                features.extend([0.0] * 10)  # Actual count: 10 pattern features
-        else:
-            features.extend([0.0] * 10)  # Actual count: 10 pattern features
-        
         return np.array(features, dtype=np.float32)
     
     def _extract_time_series_features(self, df: pd.DataFrame) -> Dict:
@@ -550,7 +579,8 @@ class FeatureExtractor:
                 try:
                     autocorr = close.autocorr(lag=lag)
                     features[f'autocorr_{lag}'] = float(autocorr) if not pd.isna(autocorr) else 0.0
-                except:
+                except (ValueError, AttributeError, IndexError) as e:
+                    logger.debug(f"Could not calculate autocorrelation for lag {lag}: {e}")
                     features[f'autocorr_{lag}'] = 0.0
             else:
                 features[f'autocorr_{lag}'] = 0.0
@@ -577,7 +607,8 @@ class FeatureExtractor:
                 try:
                     slope = np.polyfit(x, window_data.values, 1)[0]
                     features[f'trend_strength_{window}'] = float(slope / window_data.iloc[-1]) if window_data.iloc[-1] > 0 else 0.0
-                except:
+                except (ValueError, np.linalg.LinAlgError, IndexError) as e:
+                    logger.debug(f"Could not calculate trend strength for window {window}: {e}")
                     features[f'trend_strength_{window}'] = 0.0
             else:
                 features[f'trend_strength_{window}'] = 0.0
@@ -591,7 +622,8 @@ class FeatureExtractor:
                 try:
                     corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
                     features['price_volume_correlation'] = float(corr) if not pd.isna(corr) else 0.0
-                except:
+                except (ValueError, AttributeError, IndexError) as e:
+                    logger.debug(f"Could not calculate price-volume correlation: {e}")
                     features['price_volume_correlation'] = 0.0
             else:
                 features['price_volume_correlation'] = 0.0
@@ -607,7 +639,8 @@ class FeatureExtractor:
                     features['momentum_acceleration'] = float(roc_5 - roc_10)
                 else:
                     features['momentum_acceleration'] = 0.0
-            except:
+            except (ValueError, IndexError, AttributeError) as e:
+                logger.debug(f"Could not calculate momentum acceleration: {e}")
                 features['momentum_acceleration'] = 0.0
         else:
             features['momentum_acceleration'] = 0.0
@@ -820,7 +853,17 @@ class FeatureExtractor:
             'price_to_sales', 'dividend_yield', 'debt_to_equity',
             'roe', 'roa', 'profit_margin',
             'log_market_cap', 'current_price',
-            # Enhanced features
+        ]
+        
+        # New Features (Moved to end to preserve index alignment)
+        momentum_enhanced_features = [
+            # Enhanced features from enhanced_extractor (always 15 features)
+            'avg_spread', 'spread_volatility', 'price_volume_correlation', 'liquidity_proxy',
+            'intraday_volatility', 'volume_trend', 'volume_ma_ratio',
+            'sector_relative_strength', 'sector_correlation',
+            'news_sentiment', 'news_volume', 'market_cap_category',
+            'sector_type', 'beta', 'dividend_yield',
+            # Market regime and other enhanced features
             'market_regime_bull', 'market_regime_bear', 'market_regime_sideways', 'market_regime_strength',
             'relative_strength_ratio', 'relative_strength_outperformance',
             'timeframe_alignment_score', 'timeframe_confidence',
@@ -854,7 +897,7 @@ class FeatureExtractor:
             'double_top', 'double_bottom', 'triangle', 'resistance_break', 'support_break'
         ]
         
-        return base_features + time_series_features + pattern_features
+        return base_features + time_series_features + pattern_features + momentum_enhanced_features
 
 
 class StockPredictionML:
@@ -879,7 +922,7 @@ class StockPredictionML:
         self.label_encoder = LabelEncoder()
         self.feature_importance = {}
         self.selected_features = None  # Indices of selected features
-        self.feature_selection_threshold = 0.005  # Reduced from 0.01 - keep more features but still filter noise
+        self.feature_selection_threshold = ML_FEATURE_SELECTION_THRESHOLD
         self.metadata = {}
         self.train_accuracy = 0.0
         self.test_accuracy = 0.0
@@ -1073,7 +1116,14 @@ class StockPredictionML:
               model_family: str = 'voting',  # 'rf' | 'voting' - voting is default for better accuracy
               hold_confidence_threshold: float = 0.0,
               # Binary classification mode (UP/DOWN only, no HOLD) - achieves ~65% accuracy
-              use_binary_classification: bool = False) -> Dict:
+              use_binary_classification: bool = False,
+              # Regularization parameters (for config manager)
+              lgb_reg_alpha: float = None, lgb_reg_lambda: float = None,
+              lgb_subsample: float = None, lgb_colsample_bytree: float = None,
+              lgb_min_child_samples: int = None,
+              xgb_reg_alpha: float = None, xgb_reg_lambda: float = None,
+              xgb_subsample: float = None, xgb_colsample_bytree: float = None,
+              xgb_min_child_weight: int = None, xgb_gamma: float = None) -> Dict:
         """Train ML model on historical data"""
         if len(training_samples) < 100:
             return {"error": f"Insufficient training samples: {len(training_samples)} < 100"}
@@ -1161,8 +1211,9 @@ class StockPredictionML:
                     try:
                         with open(self.metadata_file, 'r') as f:
                             current_metadata = json.load(f)
-                    except:
-                        pass
+                    except (IOError, OSError, json.JSONDecodeError) as e:
+                        logger.debug(f"Could not load current metadata for backup: {e}")
+                        current_metadata = {}
                 
                 version_number = self.version_manager.generate_version_number()
                 backup_created = self.version_manager.create_version_backup(version_number, current_metadata)
@@ -1192,8 +1243,8 @@ class StockPredictionML:
                 # Skip HOLD
             
             # Reduced minimum from 100 to 30 for incremental training scenarios (backtest results)
-            if len(binary_mask) < 30:
-                return {"error": f"Not enough binary samples after filtering HOLD: {len(binary_mask)} < 30"}
+            if len(binary_mask) < ML_MIN_BINARY_SAMPLES:
+                return {"error": f"Not enough binary samples after filtering HOLD: {len(binary_mask)} < {ML_MIN_BINARY_SAMPLES}"}
             
             X = X[binary_mask]
             y = np.array(binary_labels)
@@ -1252,8 +1303,8 @@ class StockPredictionML:
             if unique_labels.issubset({'UP', 'DOWN'}):
                 # Labels are already binary - skip conversion
                 logger.info("Labels are already in binary format (UP/DOWN). Skipping conversion.")
-                if len(y) < 30:
-                    logger.warning(f"Not enough binary samples ({len(y)} < 30). "
+                if len(y) < ML_MIN_BINARY_SAMPLES:
+                    logger.warning(f"Not enough binary samples ({len(y)} < {ML_MIN_BINARY_SAMPLES}). "
                                  f"Label distribution: {dict(label_dist)}. "
                                  f"Falling back to 3-class classification.")
                     use_binary_classification = False
@@ -1363,7 +1414,9 @@ class StockPredictionML:
                 disable_feature_selection, use_smote, use_interactions,
                 model_family, hold_confidence_threshold, use_binary_classification,
                 rf_n_estimators, rf_max_depth, rf_min_samples_split, rf_min_samples_leaf,
-                gb_n_estimators, gb_max_depth
+                gb_n_estimators, gb_max_depth,
+                lgb_reg_alpha, lgb_reg_lambda, lgb_subsample, lgb_colsample_bytree, lgb_min_child_samples,
+                xgb_reg_alpha, xgb_reg_lambda, xgb_subsample, xgb_colsample_bytree, xgb_min_child_weight, xgb_gamma
             )
             
             # If regime training failed, fall back to single model
@@ -1376,10 +1429,66 @@ class StockPredictionML:
         # Encode labels
         y_encoded = self.label_encoder.fit_transform(y)
         
-        # Split data (using random split - original method that gave 47% accuracy)
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y_encoded, test_size=test_size, random_state=random_seed, stratify=y_encoded
-        )
+        # TEMPORAL SPLIT: Use date-based split instead of random to prevent data leakage
+        # This ensures model doesn't see "future" patterns during training
+        use_temporal_split = True
+        if use_temporal_split and training_samples and len(training_samples) > 0:
+            # Extract dates from training samples
+            try:
+                from datetime import datetime
+                sample_dates = []
+                for sample in training_samples:
+                    date_str = sample.get('date', '')
+                    if date_str:
+                        try:
+                            sample_dates.append(datetime.strptime(date_str, '%Y-%m-%d'))
+                        except:
+                            sample_dates.append(None)
+                    else:
+                        sample_dates.append(None)
+                
+                # If we have dates for most samples, use temporal split
+                valid_dates = [d for d in sample_dates if d is not None]
+                if len(valid_dates) >= len(training_samples) * 0.8:  # At least 80% have dates
+                    # Sort by date
+                    sorted_indices = sorted(range(len(sample_dates)), 
+                                          key=lambda i: sample_dates[i] if sample_dates[i] else datetime.min)
+                    
+                    # Split temporally: use first (1-test_size) for training, last test_size for testing
+                    split_idx = int(len(sorted_indices) * (1 - test_size))
+                    train_indices = sorted_indices[:split_idx]
+                    test_indices = sorted_indices[split_idx:]
+                    
+                    X_train = X[train_indices]
+                    X_test = X[test_indices]
+                    y_train = y_encoded[train_indices]
+                    y_test = y_encoded[test_indices]
+                    
+                    # Log temporal split info
+                    if valid_dates:
+                        train_dates = [sample_dates[i] for i in train_indices if sample_dates[i]]
+                        test_dates = [sample_dates[i] for i in test_indices if sample_dates[i]]
+                        if train_dates and test_dates:
+                            logger.info(f"📅 Temporal split: Train={min(train_dates).date()} to {max(train_dates).date()} "
+                                      f"({len(train_indices)} samples), "
+                                      f"Test={min(test_dates).date()} to {max(test_dates).date()} ({len(test_indices)} samples)")
+                else:
+                    # Fallback to random split if dates not available
+                    logger.warning("⚠️ Less than 80% of samples have dates, using random split (may cause data leakage)")
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X, y_encoded, test_size=test_size, random_state=random_seed, stratify=y_encoded
+                    )
+            except Exception as e:
+                logger.warning(f"⚠️ Temporal split failed: {e}. Falling back to random split.")
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y_encoded, test_size=test_size, random_state=random_seed, stratify=y_encoded
+                )
+        else:
+            # Fallback to random split if temporal split disabled or no samples
+            logger.warning("⚠️ Using random split (temporal split disabled or no samples). This may cause data leakage.")
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y_encoded, test_size=test_size, random_state=random_seed, stratify=y_encoded
+            )
         
         # Apply SMOTE for class balancing if enabled and binary classification is used
         if use_smote and use_binary_classification:
@@ -1564,10 +1673,10 @@ class StockPredictionML:
         # Create model - ANTI-OVERFITTING configuration
         # Reduced complexity and increased regularization to prevent overfitting
         rf_params = {
-            'n_estimators': rf_n_estimators if rf_n_estimators is not None else 80,  # Reduced from 100
-            'max_depth': rf_max_depth if rf_max_depth is not None else 4,  # Reduced from 5 to prevent overfitting
-            'min_samples_split': rf_min_samples_split if rf_min_samples_split is not None else 30,  # Increased from 20
-            'min_samples_leaf': rf_min_samples_leaf if rf_min_samples_leaf is not None else 15,  # Increased from 10
+            'n_estimators': rf_n_estimators if rf_n_estimators is not None else ML_RF_N_ESTIMATORS,
+            'max_depth': rf_max_depth if rf_max_depth is not None else ML_RF_MAX_DEPTH,
+            'min_samples_split': rf_min_samples_split if rf_min_samples_split is not None else ML_RF_MIN_SAMPLES_SPLIT,
+            'min_samples_leaf': rf_min_samples_leaf if rf_min_samples_leaf is not None else ML_RF_MIN_SAMPLES_LEAF,
             'max_features': 'sqrt',
             'class_weight': 'balanced',
             'random_state': random_seed,
@@ -1578,8 +1687,8 @@ class StockPredictionML:
             from sklearn import __version__ as sklearn_version
             if tuple(map(int, sklearn_version.split('.')[:2])) >= (0, 22):
                 rf_params['max_samples'] = 0.8  # Use only 80% of samples per tree (bootstrap sampling)
-        except:
-            pass  # Skip if version check fails
+        except (ValueError, AttributeError, ImportError) as e:
+            logger.debug(f"Could not check sklearn version for max_samples: {e}")
         
         # Apply tuned parameters if available (only if not overridden)
         if best_params and 'rf' in best_params:
@@ -1594,14 +1703,14 @@ class StockPredictionML:
             # Use LightGBM if available, otherwise XGBoost, otherwise fallback to GradientBoosting
             if HAS_LIGHTGBM:
                 gb_params = {
-                    'n_estimators': gb_n_estimators if gb_n_estimators is not None else 150,  # Reduced from 200
-                    'max_depth': gb_max_depth if gb_max_depth is not None else 4,  # Reduced from 6 to prevent overfitting
-                    'learning_rate': 0.03,  # Reduced from 0.05 for more conservative learning
-                    'subsample': 0.7,  # Reduced from 0.8 for more randomness
-                    'colsample_bytree': 0.7,  # Reduced from 0.8 for more feature randomness
-                    'min_child_samples': 30,  # Increased from 20 to prevent overfitting
-                    'reg_alpha': 0.5,  # Increased L1 regularization from 0.1
-                    'reg_lambda': 2.0,  # Increased L2 regularization from 1.0
+                    'n_estimators': gb_n_estimators if gb_n_estimators is not None else ML_GB_N_ESTIMATORS,
+                    'max_depth': gb_max_depth if gb_max_depth is not None else ML_GB_MAX_DEPTH,
+                    'learning_rate': ML_GB_LEARNING_RATE,
+                    'subsample': lgb_subsample if lgb_subsample is not None else 0.6,  # Configurable
+                    'colsample_bytree': lgb_colsample_bytree if lgb_colsample_bytree is not None else 0.6,  # Configurable
+                    'min_child_samples': lgb_min_child_samples if lgb_min_child_samples is not None else 50,  # Configurable
+                    'reg_alpha': lgb_reg_alpha if lgb_reg_alpha is not None else 1.0,  # Configurable
+                    'reg_lambda': lgb_reg_lambda if lgb_reg_lambda is not None else 3.0,  # Configurable
                     'random_state': random_seed,
                     'verbose': -1
                 }
@@ -1612,15 +1721,15 @@ class StockPredictionML:
                 logger.info("Using LightGBM in ensemble")
             elif HAS_XGBOOST:
                 gb_params = {
-                    'n_estimators': gb_n_estimators if gb_n_estimators is not None else 150,  # Reduced from 200
-                    'max_depth': gb_max_depth if gb_max_depth is not None else 4,  # Reduced from 6 to prevent overfitting
-                    'learning_rate': 0.03,  # Reduced from 0.05 for more conservative learning
-                    'subsample': 0.7,  # Reduced from 0.8 for more randomness
-                    'colsample_bytree': 0.7,  # Reduced from 0.8 for more feature randomness
-                    'min_child_weight': 3,  # Increased from 1 to prevent overfitting
-                    'gamma': 0.1,  # Added minimum loss reduction (regularization)
-                    'reg_alpha': 0.5,  # Increased L1 regularization from 0.1
-                    'reg_lambda': 2.0,  # Increased L2 regularization from 1.0
+                    'n_estimators': gb_n_estimators if gb_n_estimators is not None else ML_GB_N_ESTIMATORS,
+                    'max_depth': gb_max_depth if gb_max_depth is not None else ML_GB_MAX_DEPTH,
+                    'learning_rate': ML_GB_LEARNING_RATE,
+                    'subsample': xgb_subsample if xgb_subsample is not None else 0.6,  # Configurable
+                    'colsample_bytree': xgb_colsample_bytree if xgb_colsample_bytree is not None else 0.6,  # Configurable
+                    'min_child_weight': xgb_min_child_weight if xgb_min_child_weight is not None else 5,  # Configurable
+                    'gamma': xgb_gamma if xgb_gamma is not None else 0.2,  # Configurable
+                    'reg_alpha': xgb_reg_alpha if xgb_reg_alpha is not None else 1.0,  # Configurable
+                    'reg_lambda': xgb_reg_lambda if xgb_reg_lambda is not None else 3.0,  # Configurable
                     'random_state': random_seed,
                     'eval_metric': 'mlogloss'
                 }
@@ -1632,8 +1741,8 @@ class StockPredictionML:
             else:
                 # Fallback to sklearn GradientBoosting
                 gb = GradientBoostingClassifier(
-                    n_estimators=gb_n_estimators if gb_n_estimators is not None else 150,
-                    max_depth=gb_max_depth if gb_max_depth is not None else 4,
+                    n_estimators=gb_n_estimators if gb_n_estimators is not None else ML_GB_N_ESTIMATORS,
+                    max_depth=gb_max_depth if gb_max_depth is not None else ML_GB_MAX_DEPTH,
                     learning_rate=0.05,
                     min_samples_split=20,
                     min_samples_leaf=10,
@@ -1770,12 +1879,14 @@ class StockPredictionML:
             logger.debug(f"Could not compute final feature importances: {e}")
         
         # Cross-validation (suppress feature name warnings)
-        # Note: StackingClassifier already uses CV internally, so we do a simpler validation
+        # NOTE: CV runs on training set (X_train_scaled, y_train) which is correct
+        # The temporal split above ensures no data leakage between train/test
+        # CV scores may still be optimistic due to overfitting, but test_score is the real metric
         cv_scores = np.array([test_score])  # Default to test score
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.utils.validation')
-                logger.info("Running 5-fold cross-validation...")
+                logger.info("Running cross-validation on training set...")
                 # Use fewer folds for StackingClassifier to avoid nested CV issues
                 cv_folds = 3 if isinstance(self.model, StackingClassifier) else 5
                 cv_scores = cross_val_score(self.model, X_train_scaled, y_train, cv=cv_folds, scoring='accuracy', n_jobs=get_safe_n_jobs(ML_TRAINING_CPU_CORES))
@@ -1882,7 +1993,13 @@ class StockPredictionML:
                             use_smote: bool, use_interactions: bool, model_family: str,
                             hold_confidence_threshold: float, use_binary_classification: bool,
                             rf_n_estimators: int, rf_max_depth: int, rf_min_samples_split: int,
-                            rf_min_samples_leaf: int, gb_n_estimators: int, gb_max_depth: int) -> Dict:
+                            rf_min_samples_leaf: int, gb_n_estimators: int, gb_max_depth: int,
+                            lgb_reg_alpha: float = None, lgb_reg_lambda: float = None,
+                            lgb_subsample: float = None, lgb_colsample_bytree: float = None,
+                            lgb_min_child_samples: int = None,
+                            xgb_reg_alpha: float = None, xgb_reg_lambda: float = None,
+                            xgb_subsample: float = None, xgb_colsample_bytree: float = None,
+                            xgb_min_child_weight: int = None, xgb_gamma: float = None) -> Dict:
         """Train separate models for each market regime"""
         from algorithm_improvements import MarketRegimeDetector
         import yfinance as yf
@@ -2189,7 +2306,13 @@ class StockPredictionML:
                     rf_min_samples_split=rf_min_samples_split,
                     rf_min_samples_leaf=rf_min_samples_leaf,
                     gb_n_estimators=gb_n_estimators,
-                    gb_max_depth=gb_max_depth
+                    gb_max_depth=gb_max_depth,
+                    lgb_reg_alpha=lgb_reg_alpha, lgb_reg_lambda=lgb_reg_lambda,
+                    lgb_subsample=lgb_subsample, lgb_colsample_bytree=lgb_colsample_bytree,
+                    lgb_min_child_samples=lgb_min_child_samples,
+                    xgb_reg_alpha=xgb_reg_alpha, xgb_reg_lambda=xgb_reg_lambda,
+                    xgb_subsample=xgb_subsample, xgb_colsample_bytree=xgb_colsample_bytree,
+                    xgb_min_child_weight=xgb_min_child_weight, xgb_gamma=xgb_gamma
                 )
                 
                 if 'error' in regime_result:

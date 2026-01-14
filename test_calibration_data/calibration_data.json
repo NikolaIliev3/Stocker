@@ -1,0 +1,23 @@
+{
+  "trading": {
+    "wins": [],
+    "losses": [],
+    "target_multiplier": 1.0,
+    "stop_loss_multiplier": 1.0,
+    "samples_count": 0
+  },
+  "mixed": {
+    "wins": [],
+    "losses": [],
+    "target_multiplier": 1.0,
+    "stop_loss_multiplier": 1.0,
+    "samples_count": 0
+  },
+  "investing": {
+    "wins": [],
+    "losses": [],
+    "target_multiplier": 1.0,
+    "stop_loss_multiplier": 1.0,
+    "samples_count": 0
+  }
+}
