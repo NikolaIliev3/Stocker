@@ -101,6 +101,7 @@ ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.62  # Threshold for "very high accuracy" (62
 ML_MIN_TRAINING_SAMPLES = 100  # Minimum samples required for training
 ML_MIN_BINARY_SAMPLES = 30  # Minimum samples for binary classification
 ML_PERFORMANCE_HISTORY_LIMIT = 1000  # Maximum entries in performance history
+ML_BINARY_HOLD_THRESHOLD = 0.60  # Confidence threshold for binary (UP/DOWN) predictions to be considered valid. Below this = HOLD.
 ML_RECENT_PERFORMANCE_WINDOW = 50  # Window size for recent performance calculation
 ML_ENSEMBLE_WEIGHT_UPDATE_THRESHOLD = 5  # Minimum accuracy difference to update ensemble weights
 ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD = 10  # Accuracy difference threshold for weight adjustment

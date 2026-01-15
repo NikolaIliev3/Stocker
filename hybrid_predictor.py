@@ -336,15 +336,40 @@ class HybridStockPredictor:
         ml_confidence = ml_pred.get('confidence', 50)
         
         # Weighted confidence
+        # AGGRESSIVE LOGIC UPDATE: Action > Inaction
+        # If Rule Analyzer gives an Aggressive Signal (BUY/SELL) and ML gives HOLD (or low conf),
+        # we trust the specific rule-based logic (Accumulation/Scale Out) over the generic ML indecision.
+        
+        rule_weight = weights.get('rule', 0)
+        ml_weight = weights.get('ml', 0)
+        
+        # Scenario 1: Rule says Action, ML says HOLD (or unsure)
+        if rule_action != 'HOLD' and (ml_action == 'HOLD' or ml_confidence < 60):
+             logger.debug(f"⚖️ Boosting Rule weight for Aggressive Signal (Rule: {rule_action}, ML: {ml_action})")
+             # Force Rule to have majority to pass the signal through
+             rule_weight = max(rule_weight, 0.75) 
+             ml_weight = 1.0 - rule_weight
+             
+        # Scenario 2: Rule says HOLD (Unsure), ML says Action
+        elif rule_action == 'HOLD' and ml_action != 'HOLD':
+             if ml_confidence > 70:
+                 # If ML is confident, let it swing the vote
+                 pass 
+             else:
+                 # If ML is weak and Rule is Unsure, stay Safe (HOLD)
+                 logger.debug(f"⚖️ Boosting Rule weight for Safety (Rule: HOLD, ML: Weak {ml_action})")
+                 rule_weight = max(rule_weight, 0.6)
+                 ml_weight = 1.0 - rule_weight
+            
         final_confidence = (
-            rule_confidence * weights.get('rule', 0) + 
-            ml_confidence * weights.get('ml', 0)
+            rule_confidence * rule_weight + 
+            ml_confidence * ml_weight
         )
         
         # Action selection (weighted confidence wins)
         action_counts = {}
-        action_counts[rule_action] = action_counts.get(rule_action, 0) + weights.get('rule', 0)
-        action_counts[ml_action] = action_counts.get(ml_action, 0) + weights.get('ml', 0)
+        action_counts[rule_action] = action_counts.get(rule_action, 0) + rule_weight
+        action_counts[ml_action] = action_counts.get(ml_action, 0) + ml_weight
         
         # Get action with highest weighted count
         final_action = max(action_counts.items(), key=lambda x: x[1])[0]

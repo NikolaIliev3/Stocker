@@ -154,11 +154,11 @@ class PredictionsTracker:
             elif current_price <= stop_loss:
                 was_correct = False
         elif action == "SELL":
-            # SELL prediction (inverted logic: bullish, expecting price to go UP)
-            # Correct if price reached target (went UP) before stop loss (went DOWN)
-            if current_price >= target_price:
+            # SELL prediction (standard logic: bearish, expecting price to go DOWN)
+            # Correct if price reached target (went DOWN) before stop loss (went UP)
+            if current_price <= target_price:
                 was_correct = True
-            elif current_price <= stop_loss:
+            elif current_price >= stop_loss:
                 was_correct = False
         elif action in ["HOLD", "AVOID"]:
             # For HOLD/AVOID, we check if price moved in expected direction
@@ -456,4 +456,12 @@ class PredictionsTracker:
             "avg_days_to_target": avg_days_to_target,
             "recent_verified_count": len(recent_preds)
         }
+
+    def get_all_tracked_symbols(self) -> List[str]:
+        """Get list of unique symbols from all predictions"""
+        symbols = set()
+        for p in self.predictions:
+            if 'symbol' in p:
+                symbols.add(p['symbol'])
+        return list(symbols)
 

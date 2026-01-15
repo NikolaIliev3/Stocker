@@ -1950,7 +1950,20 @@ class StockerApp:
         self.strategy_buttons['investing'] = self.investing_btn_frame
         
         # Update visual feedback for saved strategy
+        # Update visual feedback for saved strategy
         self._update_strategy_visual_feedback()
+        
+        # Scan Market Button (New Feature)
+        self.sidebar_scan_frame = tk.Frame(self.strategy_card.content_frame, bg=theme['card_bg'])
+        self.sidebar_scan_frame.pack(fill=tk.X, pady=(15, 0))
+        
+        self.sidebar_scan_btn = ModernButton(
+            self.sidebar_scan_frame, 
+            "🔍 Analyze Predictions", 
+            command=self._scan_market,
+            theme=theme
+        )
+        self.sidebar_scan_btn.pack(fill=tk.X)
         
         # Budget Card
         self.budget_card = ModernCard(sidebar, self.localization.t('investment_budget'), theme=theme, padding=20)
@@ -2700,7 +2713,7 @@ class StockerApp:
                                    command=self._analyze_stock, theme=theme)
         self.analyze_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         
-        self.scan_market_btn = ModernButton(btn_frame, self.localization.t('scan_market'), 
+        self.scan_market_btn = ModernButton(btn_frame, "🔍 Analyze Predictions", 
                                         command=self._scan_market, theme=theme)
         self.scan_market_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
         
@@ -3756,7 +3769,46 @@ class StockerApp:
                              font=('Segoe UI', 11))
         desc_label.pack(pady=(0, 20))
         
-        # Magazine card
+        # === CONTROLS SECTION (always visible at top) ===
+        controls_frame = tk.Frame(gun_container, bg=theme['frame_bg'])
+        controls_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        # Strategy selection
+        strategy_label = tk.Label(controls_frame, text="Strategy:", 
+                                 bg=theme['frame_bg'], fg=theme['fg'],
+                                 font=('Segoe UI', 10, 'bold'))
+        strategy_label.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.gun_strategy_var = tk.StringVar(value=self.strategy_var.get())
+        
+        for strategy in ['trading', 'mixed', 'investing']:
+            radio = tk.Radiobutton(controls_frame, 
+                                  text=strategy.title(),
+                                  variable=self.gun_strategy_var,
+                                  value=strategy,
+                                  bg=theme['frame_bg'], fg=theme['fg'],
+                                  selectcolor=theme['accent'],
+                                  activebackground=theme['frame_bg'],
+                                  activeforeground=theme['fg'],
+                                  font=('Segoe UI', 10))
+            radio.pack(side=tk.LEFT, padx=5)
+        
+        # FIRE button (prominent, always visible)
+        self.fire_btn = ModernButton(controls_frame, "🔥 FIRE", 
+                                     command=self._fire_bullets,
+                                     theme=theme,
+                                     font=('Segoe UI', 14, 'bold'))
+        self.fire_btn.config(padx=30, pady=10)
+        self.fire_btn.pack(side=tk.RIGHT, padx=(20, 0))
+        
+        # Status label
+        self.gun_status_label = tk.Label(controls_frame,
+                                        text="Ready to fire",
+                                        bg=theme['frame_bg'], fg=theme['text_secondary'],
+                                        font=('Segoe UI', 11))
+        self.gun_status_label.pack(side=tk.RIGHT, padx=(15, 10))
+        
+        # === MAGAZINE SECTION (expandable) ===
         chamber_card = ModernCard(gun_container, "Magazine", theme=theme, padding=20)
         chamber_card.pack(fill=tk.BOTH, expand=True)
         
@@ -3769,7 +3821,7 @@ class StockerApp:
         
         # Bullets input area (text widget for multiple lines)
         bullets_frame = tk.Frame(chamber_card.content_frame, bg=theme['card_bg'])
-        bullets_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+        bullets_frame.pack(fill=tk.BOTH, expand=True)
         
         bullets_label = tk.Label(bullets_frame, text="Bullets:", 
                                 bg=theme['card_bg'], fg=theme['fg'],
@@ -3777,7 +3829,7 @@ class StockerApp:
         bullets_label.pack(anchor=tk.W, pady=(0, 5))
         
         self.bullets_text = scrolledtext.ScrolledText(bullets_frame, 
-                                                      wrap=tk.WORD, height=12,  # Reduced height to make room for button
+                                                      wrap=tk.WORD, height=15,
                                                       font=('Consolas', 10),
                                                       bg=theme['entry_bg'], fg=theme['entry_fg'],
                                                       relief=tk.FLAT, bd=2,
@@ -3790,51 +3842,6 @@ class StockerApp:
         # Example text
         example_text = "AAPL\nMSFT\nGOOGL\nTSLA\nAMZN\n\nOr: AAPL, MSFT, GOOGL, TSLA, AMZN"
         self.bullets_text.insert('1.0', example_text)
-        
-        # Strategy selection for predictions
-        strategy_frame = tk.Frame(chamber_card.content_frame, bg=theme['card_bg'])
-        strategy_frame.pack(fill=tk.X, pady=(0, 15))
-        
-        strategy_label = tk.Label(strategy_frame, text="Strategy:", 
-                                 bg=theme['card_bg'], fg=theme['fg'],
-                                 font=('Segoe UI', 10, 'bold'))
-        strategy_label.pack(side=tk.LEFT, padx=(0, 10))
-        
-        self.gun_strategy_var = tk.StringVar(value=self.strategy_var.get())
-        strategy_radio_frame = tk.Frame(strategy_frame, bg=theme['card_bg'])
-        strategy_radio_frame.pack(side=tk.LEFT)
-        
-        for strategy in ['trading', 'mixed', 'investing']:
-            radio = tk.Radiobutton(strategy_radio_frame, 
-                                  text=strategy.title(),
-                                  variable=self.gun_strategy_var,
-                                  value=strategy,
-                                  bg=theme['card_bg'], fg=theme['fg'],
-                                  selectcolor=theme['accent'],
-                                  activebackground=theme['card_bg'],
-                                  activeforeground=theme['fg'],
-                                  font=('Segoe UI', 10))
-            radio.pack(side=tk.LEFT, padx=5)
-        
-        # Fire button - make it more prominent
-        fire_btn_frame = tk.Frame(chamber_card.content_frame, bg=theme['card_bg'])
-        fire_btn_frame.pack(fill=tk.X, pady=(15, 0))  # Added padding to make it more visible
-        
-        # Create a more prominent fire button
-        self.fire_btn = ModernButton(fire_btn_frame, "FIRE", 
-                                     command=self._fire_bullets,
-                                     theme=theme,
-                                     font=('Segoe UI', 16, 'bold'))
-        # Make button larger by configuring after creation
-        self.fire_btn.config(padx=40, pady=15)
-        self.fire_btn.pack(side=tk.LEFT, padx=(0, 15), pady=5)
-        
-        # Status label
-        self.gun_status_label = tk.Label(fire_btn_frame,
-                                        text="Ready to fire",
-                                        bg=theme['card_bg'], fg=theme['text_secondary'],
-                                        font=('Segoe UI', 11))
-        self.gun_status_label.pack(side=tk.LEFT, padx=(15, 0), pady=5)
         
         # Store reference
         self.gun_frame = gun_frame
@@ -5473,17 +5480,23 @@ Confidence: {prediction['confidence']:.0f}%
         else:
             self.loading_screen = LoadingScreen(self.root, theme)
         
-        processes = ["Scanning market stocks..."]
-        # Market scan takes longer - estimate 60 seconds for 10 stocks
+        processes = ["Preparing to scan stocks..."]
+        # Estimate time based on number of predictions (approx 3-5s per stock)
+        tracked_count = len(self.predictions_tracker.get_active_predictions()) # Estimate
+        est_time = max(60, tracked_count * 5)
+        
         self.loading_screen.show(
-            self.localization.t('scanning_market'), 
+            "Scanning Your Predictions", 
             processes=processes,
             cancel_callback=self._cancel_market_scan,
-            estimated_time=60
+            estimated_time=est_time
         )
         
-        # Disable button during scan
-        self.scan_market_btn.config(state='disabled')
+        # Disable buttons during scan
+        if hasattr(self, 'scan_market_btn'):
+            self.scan_market_btn.config(state='disabled')
+        if hasattr(self, 'sidebar_scan_btn'):
+            self.sidebar_scan_btn.config(state='disabled')
         
         # Run scan in thread
         thread = threading.Thread(target=self._perform_market_scan)
@@ -5504,10 +5517,50 @@ Confidence: {prediction['confidence']:.0f}%
             
             if self.market_scan_cancelled:
                 return
+                
+            # FEATURE UPDATE: Verify existing predictions first
+            verify_processes = ["Checking past predictions..."]
+            self.root.after(0, lambda: self.loading_screen.update_processes(verify_processes) if self.loading_screen else None)
+            
+            # Verify ALL active predictions
+            verification_results = self.predictions_tracker.verify_all_active_predictions(
+                self.data_fetcher, check_all=True
+            )
+            
+            # If verification happened, feed Megamind and update stats
+            verified_count = verification_results.get('verified', 0)
+            if verified_count > 0:
+                logger.info(f"Verified {verified_count} predictions during scan")
+                verify_processes.append(f"Verified {verified_count} predictions")
+                self.root.after(0, lambda: self.loading_screen.update_processes(verify_processes) if self.loading_screen else None)
+                
+                # Feed Data to Megamind (Auto-Train)
+                if hasattr(self, 'learning_tracker'):
+                    self._update_performance_tracking(verification_results.get('newly_verified', []))
+                    
+                    # Trigger training in background
+                    train_thread = threading.Thread(target=self._trigger_auto_training)
+                    train_thread.daemon = True
+                    train_thread.start()
+            
+            # Refresh predictions display in main UI
+            self.root.after(0, self._update_predictions_display)
+            
+            # FEATURE UPDATE: Scan ALL tracked predictions instead of just POPULAR_STOCKS
+            tracked_symbols = self.predictions_tracker.get_all_tracked_symbols()
+            
+            # If no tracked symbols, fallback to popular stocks (for new users)
+            custom_tickers = tracked_symbols if tracked_symbols else None
+            
+            scan_msg = f"Scanning {len(tracked_symbols)} tracked stocks..." if tracked_symbols else "Scanning market stocks..."
+            processes = [scan_msg]
+            self.root.after(0, lambda: self.loading_screen.update_processes(processes) if self.loading_screen else None)
             
             recommendations = self.market_scanner.scan_market(
-                strategy, max_results=10, 
-                predictions_tracker=self.predictions_tracker
+                strategy, 
+                max_results=100 if custom_tickers else 10,  # Allow many results for tracked stocks
+                predictions_tracker=self.predictions_tracker,
+                custom_tickers=custom_tickers
             )
             
             if self.market_scan_cancelled:
@@ -5515,6 +5568,12 @@ Confidence: {prediction['confidence']:.0f}%
             
             processes.append(f"Found {len(recommendations)} recommendations")
             self.root.after(0, lambda: self.loading_screen.update_processes(processes) if self.loading_screen else None)
+            
+            # Update UI in main thread IMMEDIATELY found results
+            self.root.after(0, lambda: self._display_market_recommendations(
+                recommendations, 
+                title="Prediction Analysis Results" if custom_tickers else None
+            ))
             
             # Generate trend change predictions for scanned stocks
             if strategy in ['trading', 'mixed']:
@@ -5609,8 +5668,6 @@ Confidence: {prediction['confidence']:.0f}%
                     # Update trend change display
                     self.root.after(0, self._update_trend_change_display)
             
-            # Update UI in main thread
-            self.root.after(0, self._display_market_recommendations, recommendations)
         except Exception as e:
             if not self.market_scan_cancelled:
                 logger.error(f"Error in market scan: {e}")
@@ -5618,26 +5675,92 @@ Confidence: {prediction['confidence']:.0f}%
         finally:
             # Hide loading screen and re-enable button
             self.root.after(0, lambda: self.loading_screen.hide() if self.loading_screen else None)
-            self.root.after(0, lambda: self.scan_market_btn.config(state='normal'))
+            
+            def enable_buttons():
+                if hasattr(self, 'scan_market_btn'):
+                    self.scan_market_btn.config(state='normal')
+                if hasattr(self, 'sidebar_scan_btn'):
+                    self.sidebar_scan_btn.config(state='normal')
+            
+            self.root.after(0, enable_buttons)
     
-    def _display_market_recommendations(self, recommendations: list):
+    def _display_market_recommendations(self, recommendations: list, title: str = None):
         """Display market recommendations"""
+        display_title = title if title else self.localization.t('market_recommendations')
+        
         if not recommendations:
-            messagebox.showinfo(self.localization.t('market_recommendations'), 
+            messagebox.showinfo(display_title, 
                               self.localization.t('no_recommendations'))
             return
         
         # Create a new window to display recommendations
         theme = self.theme_manager.get_theme()
         rec_window = tk.Toplevel(self.root)
-        rec_window.title(self.localization.t('market_recommendations'))
+        rec_window.title(display_title)
         rec_window.config(bg=theme['bg'])
         rec_window.geometry("800x600")
         
         # Header
-        header = tk.Label(rec_window, text=self.localization.t('market_recommendations'),
+        header = tk.Label(rec_window, text=display_title,
                          bg=theme['bg'], fg=theme['accent'], font=('Segoe UI', 18, 'bold'))
-        header.pack(pady=20)
+        header.pack(pady=(20, 5))
+        
+        # Calculate summary
+        buy_count = sum(1 for r in recommendations if r.get('action') == 'BUY')
+        total_count = len(recommendations)
+        
+        summary_text = f"Found {buy_count} BUY opportunities in {total_count} predictions reviewed."
+        summary_label = tk.Label(rec_window, text=summary_text,
+                               bg=theme['bg'], fg=theme['text_secondary'], font=('Segoe UI', 11))
+        summary_label.pack(pady=(0, 15))
+        
+        # Auto-save BUY opportunities to Potential Trade tab
+        if buy_count > 0:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            self.potential_text.insert(tk.END, f"\n\n{'='*60}\n")
+            self.potential_text.insert(tk.END, f"📊 Scan Results: {timestamp}\n")
+            self.potential_text.insert(tk.END, f"{'='*60}\n")
+            self.potential_text.insert(tk.END, f"{summary_text}\n\n")
+            for rec in recommendations:
+                if rec.get('action') == 'BUY':
+                    symbol = rec['symbol']
+                    name = rec.get('name', symbol)
+                    price = rec['price']
+                    conf = rec.get('confidence', 0)
+                    entry = rec.get('entry_price', price)
+                    target = rec.get('target_price', price * 1.05)
+                    stop = rec.get('stop_loss', price * 0.95)
+                    
+                    # Calculate potential gain/risk
+                    potential_gain = ((target - entry) / entry) * 100 if entry > 0 else 0
+                    potential_loss = ((entry - stop) / entry) * 100 if entry > 0 else 0
+                    risk_reward = potential_gain / potential_loss if potential_loss > 0 else 0
+                    
+                    self.potential_text.insert(tk.END, f"─" * 50 + "\n")
+                    self.potential_text.insert(tk.END, f"🎯 {symbol} - {name}\n")
+                    self.potential_text.insert(tk.END, f"   Action: BUY | Confidence: {conf:.1f}%\n")
+                    self.potential_text.insert(tk.END, f"   Current: ${price:,.2f}\n")
+                    self.potential_text.insert(tk.END, f"   Entry:   ${entry:,.2f} | Target: ${target:,.2f} | Stop: ${stop:,.2f}\n")
+                    self.potential_text.insert(tk.END, f"   Potential: +{potential_gain:.1f}% / -{potential_loss:.1f}% (R:R {risk_reward:.1f}:1)\n\n")
+                    
+                    # Extract key reasoning points (truncate if too long)
+                    reasoning = rec.get('reasoning', 'No detailed reasoning available')
+                    # Get first 3 meaningful lines of reasoning
+                    reasoning_lines = [l.strip() for l in reasoning.split('\n') if l.strip() and not l.strip().startswith('Trading Analysis')]
+                    key_reasons = reasoning_lines[:5]  # First 5 key points
+                    if key_reasons:
+                        self.potential_text.insert(tk.END, f"   📝 Key Reasons:\n")
+                        for reason in key_reasons:
+                            # Clean up and truncate long lines
+                            reason_clean = reason[:80] + "..." if len(reason) > 80 else reason
+                            self.potential_text.insert(tk.END, f"      {reason_clean}\n")
+                    self.potential_text.insert(tk.END, "\n")
+            self.potential_text.see(tk.END)
+            # Switch to Potential Tab to notify user they are saved there? 
+            # No, keep focus on popup, but maybe mentioned it.
+            
+            tk.Label(rec_window, text="(Buy opportunities saved to 'Potential Trade' tab)",
+                    bg=theme['bg'], fg=theme['success'], font=('Segoe UI', 9)).pack(pady=(0, 10))
         
         # Scrollable frame
         canvas = tk.Canvas(rec_window, bg=theme['bg'], highlightthickness=0)
@@ -5682,9 +5805,9 @@ Confidence: {prediction['confidence']:.0f}%
             card = ModernCard(scroll_frame, f"{rec['symbol']} - {rec['name']}", theme=theme, padding=15)
             card.pack(fill=tk.X, padx=20, pady=10)
             
-            # Determine sentiment based on action (inverted)
-            action = rec.get('action', 'SELL') # Default to SELL for scanner
-            sentiment = "BULLISH 🟢" if action == 'SELL' else "BEARISH 🔴" if action == 'BUY' else "NEUTRAL ⚪"
+            # Determine sentiment based on action (Standard Logic)
+            action = rec.get('action', 'BUY') # Default to BUY for scanner (bullish opps)
+            sentiment = "BULLISH 🟢" if action == 'BUY' else "BEARISH 🔴" if action == 'SELL' else "NEUTRAL ⚪"
             
             # Visual confidence bar
             conf = rec.get('confidence', 0)
@@ -5696,7 +5819,7 @@ Confidence: {prediction['confidence']:.0f}%
             price_eur = f"€{self.localization.convert_from_usd(rec['price'], 'EUR'):,.2f}"
             
             info_text = f"🔭 Market Sentiment: {sentiment}\n"
-            info_text += f"📊 Strategy Signal: {action} (Inverted Logic)\n"
+            info_text += f"📊 Strategy Signal: {action}\n"
             info_text += f"🎯 Confidence: [{conf_bar}] {conf:.1f}%\n"
             info_text += f"💰 Current Price: {price_usd} / {price_eur}\n\n"
             
@@ -6034,10 +6157,15 @@ Confidence: {prediction['confidence']:.0f}%
                         logger.info(f"🧠 Buy opportunity detected for {symbol} and fed to Megamind for learning")
             except Exception as e:
                 logger.error(f"Error in buy opportunity analysis: {e}")
+
+
+            # Apply Consensus Mechanism (Unify conflicting signals)
+            self._apply_consensus_check(analysis, symbol)
             
             # Update UI in main thread
             self.root.after(0, self._display_analysis, analysis, history_data, symbol)
-            
+
+
         except Exception as e:
             if not self.analysis_cancelled:
                 logger.error(f"Error in analysis: {e}")
@@ -6048,6 +6176,97 @@ Confidence: {prediction['confidence']:.0f}%
             self.root.after(0, lambda: self.symbol_entry.config(state='normal'))
             self.root.after(0, lambda: self.analyze_btn.config(state='normal'))
     
+    def _apply_consensus_check(self, analysis: Dict, symbol: str):
+        """
+        Unify conflicting signals from different analyzers into a single consensus.
+        Prioritizes Trend Reversals as they are leading indicators.
+        Modifies analysis dict in-place.
+        """
+        try:
+            # 1. Get Core Components
+            recommendation = analysis.get('recommendation', {})
+            rec_action = recommendation.get('action', 'HOLD')
+            rec_conf = recommendation.get('confidence', 50)
+            rec_reasons = recommendation.get('reasons', [])
+            
+            # 2. Get Trend Signals
+            trend_preds = analysis.get('trend_predictions', [])
+            trend_reversal = None
+            for p in trend_preds:
+                if 'Reversal' in p.get('predicted_change', ''):
+                    trend_reversal = p
+                    break
+            
+            # 3. Get Consensus Conflict/Confirmation
+            consensus_msg = ""
+            boost_conf = 0
+            
+            
+            if trend_reversal:
+                trend_type = trend_reversal.get('predicted_change', '')
+                trend_conf = trend_reversal.get('confidence', 0)
+                
+                # Check for BUY conflicts
+                if rec_action == 'BUY':
+                    if 'Bearish' in trend_type and trend_conf > 60:
+                        # CONFLICT: Analyzer says BUY, but Strong Bearish Trend predicted
+                        recommendation['action'] = 'HOLD'
+                        consensus_msg = f"⚠️ CONFLICT: Technicals suggest BUY, but a predicted Bearish Reversal ({trend_conf}% conf) indicates price dip. Wait."
+                        boost_conf = -20
+                    elif 'Bullish' in trend_type:
+                        # CONFIRMATION
+                        consensus_msg = "✅ CONSENSUS: Strong Buy signal. Technicals align with predicted Bullish Reversal."
+                        boost_conf = 15
+                
+                # Check for SELL conflicts
+                elif rec_action == 'SELL':
+                    if 'Bullish' in trend_type and trend_conf > 60:
+                        # CONFLICT: Analyzer says SELL, but Strong Bullish Trend predicted
+                        recommendation['action'] = 'HOLD' # or HOLD to wait for peak?
+                        consensus_msg = f"⚠️ CONFLICT: Technicals suggest SELL, but a predicted Bullish Reversal ({trend_conf}% conf) suggests bounce. Hold."
+                        boost_conf = -20
+                    elif 'Bearish' in trend_type:
+                        # CONFIRMATION
+                        consensus_msg = "✅ CONSENSUS: Strong Sell signal. Technicals align with predicted Bearish Reversal."
+                        boost_conf = 15
+                        
+                # Check for HOLD upgrades (Crucial for active trading)
+                elif rec_action == 'HOLD':
+                    if 'Bullish' in trend_type and trend_conf > 70:
+                        # UPGRADE: Technicals neutral, but AI predicts strong reversal up
+                        recommendation['action'] = 'BUY'
+                        consensus_msg = f"🚀 OPPORTUNITY: Technicals neutral, but high-confidence ({trend_conf}%) Bullish Reversal predicted. Speculative BUY."
+                        boost_conf = 10
+                    elif 'Bearish' in trend_type and trend_conf > 70:
+                        # UPGRADE: Technicals neutral, but AI predicts strong reversal down
+                        recommendation['action'] = 'SELL'
+                        consensus_msg = f"🔻 WARNING: Technicals neutral, but high-confidence ({trend_conf}%) Bearish Reversal predicted. Speculative SELL."
+                        boost_conf = 10
+            
+            # 4. Integrate Buy Opportunity (LLM/Price Action)
+            buy_opp = analysis.get('buy_opportunity')
+            if buy_opp and rec_action != 'BUY':
+                 # If LLM sees a buy opp but technicals don't, trust LLM if confidence is high
+                 if buy_opp.get('confidence', 0) > 75:
+                     recommendation['action'] = 'BUY' # Upgrade to BUY
+                     consensus_msg = f"✅ AI OVERRIDE: High-confidence Buy Opportunity detected by AI pattern analysis, overriding neutral technicals."
+                     boost_conf = 10
+            
+            # 5. Apply Changes
+            if consensus_msg:
+                # Add to TOP of reasons
+                rec_reasons.insert(0, consensus_msg)
+                
+            # Apply confidence adjustments
+            new_conf = min(100, max(0, rec_conf + boost_conf))
+            recommendation['confidence'] = new_conf
+            
+            # Update original dict
+            analysis['recommendation'] = recommendation
+            
+        except Exception as e:
+            logger.error(f"Error in consensus check: {e}")
+
     def _update_status(self, message: str):
         """Update status message with animation"""
         theme = self.theme_manager.get_theme()
@@ -6088,150 +6307,14 @@ Confidence: {prediction['confidence']:.0f}%
                 confidence
             )
         
-        # Convert HOLD to BUY/SELL based on trend reversal predictions and indicators
-        if action == 'HOLD' and symbol:
-            trend_predictions = analysis.get('trend_predictions', [])
-            indicators = analysis.get('indicators', {})
-            
-            # Check for bullish reversal predictions
-            bullish_predictions = [p for p in trend_predictions if p.get('predicted_change') == 'bullish_reversal']
-            bearish_predictions = [p for p in trend_predictions if p.get('predicted_change') == 'bearish_reversal']
-            
-            # Get indicator values
-            rsi = indicators.get('rsi', 50)
-            mfi = indicators.get('mfi', 50)
-            macd_diff = indicators.get('macd_diff', 0)
-            
-            # Check for potential gains (bullish signals)
-            has_potential_gains = (
-                (rsi < 50 or mfi < 50) or  # Not overbought
-                (macd_diff > 0) or  # Positive momentum
-                (len(bullish_predictions) > 0 and any(p.get('confidence', 0) >= 60 for p in bullish_predictions))  # High confidence bullish reversal
-            )
-            
-            # Check for overbought conditions (bearish signals)
-            is_overbought = (
-                (rsi > 70 or mfi > 80) or  # Overbought
-                (macd_diff < -0.5) or  # Negative momentum
-                (len(bearish_predictions) > 0 and any(p.get('confidence', 0) >= 60 for p in bearish_predictions))  # High confidence bearish reversal
-            )
-            
-            # Convert HOLD to SELL if potential gains detected (Bullish signal)
-            if has_potential_gains and not is_overbought:
-                action = 'SELL'
-                # Recalculate entry/target/stop based on current price
-                current_price = recommendation.get('entry_price', 0)
-                if not current_price or current_price <= 0:
-                    # Try to get from current_data
-                    if hasattr(self, 'current_data') and self.current_data and 'price' in self.current_data:
-                        current_price = self.current_data.get('price', 0)
-                
-                if current_price > 0:
-                    # Use trend prediction to set target
-                    if bullish_predictions:
-                        best_pred = max(bullish_predictions, key=lambda p: p.get('confidence', 0))
-                        # Try to get predicted low price from the prediction
-                        predicted_low = best_pred.get('predicted_low_price')
-                        if not predicted_low or predicted_low <= 0:
-                            # Calculate from predicted price drop percentage
-                            confidence_pred = best_pred.get('confidence', 50)
-                            drop_pct = min(10, max(3, confidence_pred / 7))  # 3-10% drop based on confidence
-                            predicted_low = current_price * (1 - drop_pct / 100)
-                        
-                        entry_price = predicted_low  # Enter at predicted low
-                        target_price = current_price * 1.08  # 8% target from entry
-                        stop_loss = entry_price * 0.97  # 3% stop loss
-                    else:
-                        entry_price = current_price
-                        target_price = current_price * 1.05  # 5% target
-                        stop_loss = current_price * 0.95  # 5% stop loss
-                    
-                    recommendation['action'] = action
-                    recommendation['entry_price'] = entry_price
-                    recommendation['target_price'] = target_price
-                    recommendation['stop_loss'] = stop_loss
-                    confidence = max(confidence, 60)  # Boost confidence if trend reversal predicted
-                    recommendation['confidence'] = confidence
-                    
-                    logger.info(f"Converted HOLD to SELL (Bullish) for {symbol} based on bullish reversal predictions")
-            
-            # Convert HOLD to BUY if overbought (Bearish signal)
-            elif is_overbought and not has_potential_gains:
-                action = 'BUY'
-                current_price = recommendation.get('entry_price', 0)
-                if not current_price or current_price <= 0:
-                    if hasattr(self, 'current_data') and self.current_data and 'price' in self.current_data:
-                        current_price = self.current_data.get('price', 0)
-                
-                if current_price > 0:
-                    entry_price = current_price
-                    target_price = current_price * 0.95  # 5% down target
-                    stop_loss = current_price * 1.03  # 3% stop loss
-                    
-                    recommendation['action'] = action
-                    recommendation['entry_price'] = entry_price
-                    recommendation['target_price'] = target_price
-                    recommendation['stop_loss'] = stop_loss
-                    confidence = max(confidence, 60)
-                    recommendation['confidence'] = confidence
-                    
-                    logger.info(f"Converted HOLD to BUY (Bearish) for {symbol} based on overbought conditions")
+        # Legacy logic removed - Consensus Mechanism now handles HOLD/BUY decisions based on trends
+        # See _apply_consensus_check method
+        # if action == 'HOLD' and symbol:
+        #     pass
+
+
         
-        # CRITICAL FIX: Check if SELL recommendation (Bullish) contradicts trend reversal predictions
-        # If trend predictions show price will drop significantly first, convert SELL to HOLD or adjust entry
-        if action == 'SELL' and symbol:
-            trend_predictions = analysis.get('trend_predictions', [])
-            if trend_predictions:
-                bullish_predictions = [p for p in trend_predictions if p.get('predicted_change') == 'bullish_reversal']
-                
-                if bullish_predictions:
-                    # Get current market price (not entry price)
-                    current_market_price = 0
-                    if hasattr(self, 'current_data') and self.current_data and 'price' in self.current_data:
-                        current_market_price = self.current_data.get('price', 0)
-                    elif 'stock_data' in analysis and analysis['stock_data'].get('price'):
-                        current_market_price = analysis['stock_data'].get('price', 0)
-                    
-                    if current_market_price > 0:
-                        # Calculate predicted low from trend predictions
-                        best_pred = max(bullish_predictions, key=lambda p: p.get('confidence', 0))
-                        confidence_pred = best_pred.get('confidence', 50)
-                        
-                        # Calculate predicted drop (same logic as display)
-                        price_adjustment = self.trend_change_predictor.learned_adjustments.get('price_prediction_adjustment', 1.0)
-                        base_drop_pct = min(10, max(3, confidence_pred / 7))  # 3-10% drop before bounce
-                        estimated_drop_pct = base_drop_pct * price_adjustment
-                        predicted_low = current_market_price * (1 - estimated_drop_pct / 100)
-                        
-                        current_entry_price = recommendation.get('entry_price', current_market_price)
-                        
-                        # Check if predicted drop is significant (>5% below current price)
-                        drop_from_current = ((current_market_price - predicted_low) / current_market_price) * 100
-                        
-                        # If entry price is close to predicted low (already accounts for drop), that's fine
-                        # But if entry price is close to current price and predicted drop is significant, we have a problem
-                        entry_price_diff_from_current = abs(current_entry_price - current_market_price) / current_market_price * 100
-                        entry_price_diff_from_predicted = abs(current_entry_price - predicted_low) / current_market_price * 100
-                        
-                        # If entry is at current price but significant drop is predicted, convert to HOLD
-                        if drop_from_current > 5 and entry_price_diff_from_current < 3:
-                            # Entry price is at current price, but drop is predicted - convert to HOLD
-                            logger.warning(f"⚠️ SELL recommendation contradicts trend prediction: price predicted to drop {drop_from_current:.1f}% to ${predicted_low:.2f} before reversal. Converting SELL to HOLD.")
-                            action = 'HOLD'
-                            recommendation['action'] = 'HOLD'
-                            recommendation['confidence'] = max(confidence - 10, 40)  # Reduce confidence
-                            
-                            # Update reasoning to explain why
-                            original_reasoning = analysis.get('reasoning', '')
-                            analysis['reasoning'] = original_reasoning + f"\n\n⚠️ IMPORTANT: Trend reversal predictions indicate price is likely to drop to ${predicted_low:.2f} ({drop_from_current:.1f}% below current ${current_market_price:.2f}) before a bullish reversal. " + \
-                                f"Recommendation changed from SELL to HOLD - wait for entry near ${predicted_low:.2f} for optimal entry point."
-                        
-                        # If entry price is already set to predicted low (or close), that's correct - just verify
-                        elif entry_price_diff_from_predicted < 5 and drop_from_current > 3:
-                            # Entry price is correctly set to predicted low - add note to reasoning
-                            original_reasoning = analysis.get('reasoning', '')
-                            if 'optimal entry' not in original_reasoning.lower():
-                                analysis['reasoning'] = original_reasoning + f"\n\n✓ Entry price (${current_entry_price:.2f}) aligns with predicted low (${predicted_low:.2f}) - optimal entry point before reversal."
+
         
         # Automatically save prediction if it's a BUY or SELL recommendation
         if action in ['BUY', 'SELL'] and symbol:

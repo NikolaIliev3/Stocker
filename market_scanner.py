@@ -72,7 +72,7 @@ class MarketScanner:
                 self.hybrid_predictors = {}
     
     def scan_market(self, strategy: str, max_results: int = 10, 
-                   predictions_tracker=None) -> List[Dict]:
+                   predictions_tracker=None, custom_tickers: List[str] = None) -> List[Dict]:
         """
         Scan market and return recommended stocks
         
@@ -80,17 +80,24 @@ class MarketScanner:
             strategy: 'trading', 'investing', or 'mixed'
             max_results: Maximum number of recommendations to return
             predictions_tracker: Optional PredictionsTracker to skip stocks with active predictions
+                                (IGNORED IF custom_tickers IS PROVIDED)
+            custom_tickers: Optional list of tickers to scan instead of POPULAR_STOCKS
         
         Returns:
             List of recommended stocks with analysis
         """
         recommendations = []
         
-        logger.info(f"Scanning market with {strategy} strategy...")
+        # Use custom tickers if provided, otherwise default list
+        stocks_to_scan = custom_tickers if custom_tickers else self.POPULAR_STOCKS
+        is_custom_scan = custom_tickers is not None
         
-        for symbol in self.POPULAR_STOCKS:
-            # Skip stocks that already have active predictions
-            if predictions_tracker:
+        logger.info(f"Scanning market with {strategy} strategy (Custom Scan: {is_custom_scan}, Stocks: {len(stocks_to_scan)})...")
+        
+        for symbol in stocks_to_scan:
+            # Skip stocks that already have active predictions ONLY if this is a general market scan
+            # If we are scanning specific tickers (e.g. existing predictions), we want to re-analyze them
+            if not is_custom_scan and predictions_tracker:
                 symbol_upper = symbol.upper()
                 has_active = any(
                     p.get('symbol', '').upper() == symbol_upper and 
@@ -155,8 +162,9 @@ class MarketScanner:
                 confidence = recommendation.get('confidence', 0)
                 
                 # Only include recommendations with decent confidence
-                # INVERTED LOGIC: SELL is now bullish/entry signal
-                if action == 'SELL' and confidence >= 50:
+                # STANDARD LOGIC: BUY is the bullish/entry signal
+                # For custom scans (existing predictions), include EVERYTHING (even HOLD)
+                if is_custom_scan or (action == 'BUY' and confidence >= 50):
                     recommendations.append({
                         'symbol': symbol,
                         'name': stock_data.get('name', symbol),
@@ -169,16 +177,22 @@ class MarketScanner:
                         'reasoning': analysis.get('reasoning', '')[:200]  # Truncate
                     })
                 
-                # Limit to prevent too many API calls
-                if len(recommendations) >= max_results:
+                # Limit to prevent too many API calls (unless custom scan)
+                if not is_custom_scan and len(recommendations) >= max_results:
                     break
                     
             except Exception as e:
                 logger.warning(f"Error analyzing {symbol}: {e}")
                 continue
         
-        # Sort by confidence (highest first)
-        recommendations.sort(key=lambda x: x['confidence'], reverse=True)
+        # Sort by Action (BUY first) then Confidence
+        # Action priority: BUY (2), HOLD (1), SELL (0) - assuming standard logic
+        def get_sort_key(rec):
+            action = rec.get('action', 'HOLD')
+            action_score = 2 if action == 'BUY' else 1 if action == 'HOLD' else 0
+            return (action_score, rec.get('confidence', 0))
+            
+        recommendations.sort(key=get_sort_key, reverse=True)
         
         logger.info(f"Found {len(recommendations)} recommendations")
         return recommendations
