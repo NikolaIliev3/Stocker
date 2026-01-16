@@ -255,65 +255,70 @@ class HybridStockPredictor:
         }
     
     def _calculate_dynamic_weights(self, rule_pred: Dict, ml_pred: Optional[Dict]) -> Dict:
-        """Calculate dynamic ensemble weights (Rule and ML only)"""
-        # Determine if ML is available
+        """Calculate dynamic ensemble weights (Rule and ML only)
+        
+        CRITICAL FIX: ML weight is now based on PROVEN backtest accuracy,
+        not just training accuracy. If backtest accuracy is poor (< 55%),
+        ML weight is significantly reduced.
+        """
         has_ml = ml_pred is not None
         
         if not has_ml:
             return {'rule': 1.0, 'ml': 0.0, 'ai': 0.0}
         
-        # Initialize balanced weights
-        rule_weight = 0.5
-        ml_weight = 0.5
+        # Start with rules dominant (proven approach)
+        rule_weight = 0.65
+        ml_weight = 0.35
         
-        # Check if ML model has high training accuracy
-        ml_test_acc = 0
-        try:
-            if self.ml_predictor and self.ml_predictor.metadata:
-                from config import ML_HIGH_ACCURACY_THRESHOLD, ML_VERY_HIGH_ACCURACY_THRESHOLD
-                ml_test_acc = self.ml_predictor.metadata.get('test_accuracy', 0)
-                if ml_test_acc >= ML_HIGH_ACCURACY_THRESHOLD:
-                    if ml_test_acc >= ML_VERY_HIGH_ACCURACY_THRESHOLD:
-                        ml_weight = 0.85
-                        rule_weight = 0.15
-                    else:
-                        ml_weight = 0.75
-                        rule_weight = 0.25
-                    logger.info(f"🎯 ML model has high accuracy ({ml_test_acc*100:.1f}%) - favoring ML (ML: {ml_weight:.2f}, Rule: {rule_weight:.2f})")
-        except Exception as e:
-            logger.debug(f"Could not check ML accuracy metadata: {e}")
+        # Check PROVEN backtest performance first (most important)
+        ml_perf = self._get_recent_performance('ml_based')
+        rule_perf = self._get_recent_performance('weight_based')
         
-        # Adjust based on historical performance if ML isn't dominant
-        if ml_weight < 0.8:
-            rule_perf = self._get_recent_performance('weight_based')
-            ml_perf = self._get_recent_performance('ml_based')
+        proven_ml_accuracy = 50  # Default to random chance
+        if ml_perf and ml_perf.get('total', 0) >= 10:
+            proven_ml_accuracy = ml_perf.get('accuracy', 50)
             
-            if rule_perf and ml_perf:
-                from config import ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD
+            # If ML has proven itself in backtests (> 55%), increase its weight
+            if proven_ml_accuracy > 60:
+                ml_weight = 0.70
+                rule_weight = 0.30
+                logger.debug(f"ML proven in backtest ({proven_ml_accuracy:.1f}%) - increasing weight")
+            elif proven_ml_accuracy > 55:
+                ml_weight = 0.55
+                rule_weight = 0.45
+            elif proven_ml_accuracy < 52:
+                # ML is basically random chance - heavily favor rules
+                ml_weight = 0.20
+                rule_weight = 0.80
+                logger.debug(f"ML poor in backtest ({proven_ml_accuracy:.1f}%) - favoring rules")
+        
+        # If rules have proven better, always favor rules
+        if rule_perf and ml_perf:
+            if rule_perf.get('total', 0) >= 10 and ml_perf.get('total', 0) >= 10:
                 rule_acc = rule_perf.get('accuracy', 50)
                 ml_acc = ml_perf.get('accuracy', 50)
-                
-                if abs(rule_acc - ml_acc) > ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD:
-                    if rule_acc > ml_acc:
-                        rule_weight = min(0.7, rule_weight + 0.1)
-                        ml_weight = max(0.3, ml_weight - 0.1)
-                    else:
-                        rule_weight = max(0.3, rule_weight - 0.1)
-                        ml_weight = min(0.7, ml_weight + 0.1)
-
-        # Adjust based on confidence differences
-        rule_confidence = rule_pred.get('confidence', 50)
-        ml_confidence = ml_pred.get('confidence', 50)
+                if rule_acc > ml_acc + 5:  # Rules are significantly better
+                    rule_weight = max(rule_weight, 0.70)
+                    ml_weight = 1.0 - rule_weight
         
-        from config import ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL
-        confidence_diff = abs(rule_confidence - ml_confidence)
-        if confidence_diff > ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL:
-            if rule_confidence > ml_confidence:
-                rule_weight = min(0.7, rule_weight + 0.05)
-                ml_weight = max(0.3, ml_weight - 0.05)
-            else:
-                rule_weight = max(0.3, rule_weight - 0.05)
-                ml_weight = min(0.7, ml_weight + 0.05)
+        # DISAGREEMENT PENALTY: When ML and rules disagree, favor rules
+        # (since rules have domain knowledge while ML may be overconfident)
+        rule_action = rule_pred.get('action', 'HOLD')
+        ml_action = ml_pred.get('action', 'HOLD')
+        
+        if rule_action != ml_action:
+            # They disagree - reduce ML weight since it hasn't proven reliable
+            if proven_ml_accuracy < 55:
+                ml_weight = min(ml_weight, 0.35)
+                rule_weight = 1.0 - ml_weight
+                logger.debug(f"ML/Rules disagree and ML unproven - favoring rules")
+        
+        # Confidence calibration: reduce ML confidence impact if overconfident
+        ml_confidence = ml_pred.get('confidence', 50)
+        if ml_confidence > 65 and proven_ml_accuracy < 55:
+            # ML is overconfident - it claims high confidence but backtest is poor
+            ml_weight = min(ml_weight, 0.30)
+            rule_weight = 1.0 - ml_weight
         
         return {'rule': rule_weight, 'ml': ml_weight, 'ai': 0.0}
     
@@ -336,15 +341,49 @@ class HybridStockPredictor:
         ml_confidence = ml_pred.get('confidence', 50)
         
         # Weighted confidence
+        # AGGRESSIVE LOGIC UPDATE: Action > Inaction
+        # If Rule Analyzer gives an Aggressive Signal (BUY/SELL) and ML gives HOLD (or low conf),
+        # we trust the specific rule-based logic (Accumulation/Scale Out) over the generic ML indecision.
+        
+        rule_weight = weights.get('rule', 0)
+        ml_weight = weights.get('ml', 0)
+        
+        # Scenario 1: Rule says Action, ML says HOLD (or unsure)
+        if rule_action != 'HOLD' and (ml_action == 'HOLD' or ml_confidence < 60):
+             logger.debug(f"⚖️ Boosting Rule weight for Aggressive Signal (Rule: {rule_action}, ML: {ml_action})")
+             # Force Rule to have majority to pass the signal through
+             rule_weight = max(rule_weight, 0.75) 
+             ml_weight = 1.0 - rule_weight
+             
+            
+         # Scenario 2: Rule says HOLD (Unsure), ML says Action
+        elif rule_action == 'HOLD' and ml_action != 'HOLD':
+             # SAFETY VETO: Prevent ML from blindly buying into extreme overbought conditions
+             rsi = base_analysis.get('indicators', {}).get('rsi', 50)
+             if ml_action == 'BUY' and rsi > 78 and ml_confidence < 85:
+                 logger.info(f"🛡️ SAFETY VETO: Blocking ML BUY because RSI is {rsi:.2f} (Extreme Overbought). Forced HOLD.")
+                 # Force Rule weight to dominate (1.0) to enforce the HOLD
+                 rule_weight = 1.0
+                 ml_weight = 0.0
+             
+             elif ml_confidence > 60:  # Lowered from 70 to allow ML (56-62% acc) to act more often
+                 # If ML is reasonably confident, let it swing the vote
+                 pass 
+             else:
+                 # If ML is weak and Rule is Unsure, stay Safe (HOLD)
+                 logger.debug(f"⚖️ Boosting Rule weight for Safety (Rule: HOLD, ML: Weak {ml_action})")
+                 rule_weight = max(rule_weight, 0.6)
+                 ml_weight = 1.0 - rule_weight
+            
         final_confidence = (
-            rule_confidence * weights.get('rule', 0) + 
-            ml_confidence * weights.get('ml', 0)
+            rule_confidence * rule_weight + 
+            ml_confidence * ml_weight
         )
         
         # Action selection (weighted confidence wins)
         action_counts = {}
-        action_counts[rule_action] = action_counts.get(rule_action, 0) + weights.get('rule', 0)
-        action_counts[ml_action] = action_counts.get(ml_action, 0) + weights.get('ml', 0)
+        action_counts[rule_action] = action_counts.get(rule_action, 0) + rule_weight
+        action_counts[ml_action] = action_counts.get(ml_action, 0) + ml_weight
         
         # Get action with highest weighted count
         final_action = max(action_counts.items(), key=lambda x: x[1])[0]

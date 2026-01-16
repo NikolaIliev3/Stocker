@@ -154,32 +154,50 @@ class PredictionsTracker:
             elif current_price <= stop_loss:
                 was_correct = False
         elif action == "SELL":
-            # SELL prediction (inverted logic: bullish, expecting price to go UP)
-            # Correct if price reached target (went UP) before stop loss (went DOWN)
-            if current_price >= target_price:
+            # SELL prediction (standard logic: bearish, expecting price to go DOWN)
+            # Correct if price reached target (went DOWN) before stop loss (went UP)
+            if current_price <= target_price:
                 was_correct = True
-            elif current_price <= stop_loss:
+            elif current_price >= stop_loss:
                 was_correct = False
         elif action in ["HOLD", "AVOID"]:
             # For HOLD/AVOID, we check if price moved in expected direction
             price_change = ((current_price - entry_price) / entry_price) * 100
             strategy = prediction.get('strategy', 'trading')
             
-            if action == "HOLD":
-                # Strategy-specific thresholds for HOLD (same as backtest evaluation)
-                if strategy == "trading":
-                    was_correct = abs(price_change) < 3
-                elif strategy == "mixed":
-                    was_correct = abs(price_change) < 5
-                else:  # investing
-                    # For investing (1.5 year timeframe), allow up to 20% movement
-                    was_correct = abs(price_change) < 20
-            elif action == "AVOID":
-                # AVOID (legacy) is correct if price went down
-                was_correct = price_change < -5
+            # Check for time-based expiry for HOLD/AVOID since they don't have explicit targets
+            estimated_date_str = prediction.get('estimated_target_date')
+            is_expired = False
+            if estimated_date_str:
+                try:
+                    is_expired = datetime.now() >= datetime.fromisoformat(estimated_date_str)
+                except:
+                    pass
+            
+            if is_expired:
+                if action == "HOLD":
+                    # Strategy-specific thresholds for HOLD (same as backtest evaluation)
+                    if strategy == "trading":
+                        was_correct = abs(price_change) < 3
+                    elif strategy == "mixed":
+                        was_correct = abs(price_change) < 5
+                    else:  # investing
+                        # For investing (1.5 year timeframe), allow up to 20% movement
+                        was_correct = abs(price_change) < 20
+                elif action == "AVOID":
+                    # AVOID (legacy) is correct if price went down
+                    was_correct = price_change < -5
+                else:
+                    was_correct = False
             else:
-                was_correct = False
+                # Not expired yet, keep active
+                return None
         
+        # KEY CHANGE: If was_correct is still None (neither Target nor Stop hit), 
+        # do NOT verify. Keep it active until it hits a level.
+        if was_correct is None:
+            return None
+            
         # Calculate price change
         price_change = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
         
@@ -253,8 +271,8 @@ class PredictionsTracker:
         
         Args:
             data_fetcher: Data fetcher instance
-            check_all: If True, verify all active predictions. If False, only verify
-                      predictions that have reached their estimated target date.
+            check_all: Legacy parameter, no longer restricts verification. 
+                      Now consistently checks ALL active predictions for Price Targets/Stops.
         """
         verified_count = 0
         correct_count = 0
@@ -263,50 +281,28 @@ class PredictionsTracker:
         
         for prediction in self.predictions:
             if prediction['status'] == 'active':
-                # Check if target date has been reached (or check_all is True)
-                should_verify = check_all
+                # ALWAYS check price conditions for active predictions.
+                # We want to know if Target or Stop was hit immediately.
+                # We no longer wait for the 'date' to expire to check for success.
+                # We also don't auto-fail if date expires but levels aren't hit (handled in verify_prediction).
                 
-                if not should_verify:
-                    # Check if estimated target date has been reached
-                    estimated_date_str = prediction.get('estimated_target_date')
-                    if estimated_date_str:
-                        try:
-                            estimated_date = datetime.fromisoformat(estimated_date_str)
-                            should_verify = now >= estimated_date
-                        except:
-                            # If date parsing fails, verify anyway (backward compatibility)
-                            should_verify = True
-                    else:
-                        # No estimated date - verify if prediction is old enough
-                        # Default to verifying if older than strategy-appropriate timeframe
-                        pred_date = datetime.fromisoformat(prediction['timestamp'])
-                        days_old = (now - pred_date).days
-                        strategy = prediction.get('strategy', 'trading')
-                        
-                        if strategy == "trading" and days_old >= 10:
-                            should_verify = True
-                        elif strategy == "mixed" and days_old >= 21:
-                            should_verify = True
-                        elif strategy == "investing" and days_old >= 365:
-                            should_verify = True
-                
-                if should_verify:
-                    try:
-                        # Fetch current price
-                        stock_data = data_fetcher.fetch_stock_data(prediction['symbol'])
-                        current_price = stock_data.get('price', 0)
-                        
-                        if current_price > 0:
-                            result = self.verify_prediction(prediction['id'], current_price)
-                            if result:
-                                verified_count += 1
-                                if result['was_correct']:
-                                    correct_count += 1
-                                # Add to newly verified list
-                                newly_verified.append(result)
-                    except Exception as e:
-                        logger.warning(f"Could not verify prediction {prediction['id']} for {prediction['symbol']}: {e}")
-                        continue
+                try:
+                    # Fetch current price
+                    stock_data = data_fetcher.fetch_stock_data(prediction['symbol'])
+                    current_price = stock_data.get('price', 0)
+                    
+                    if current_price > 0:
+                        result = self.verify_prediction(prediction['id'], current_price)
+                        if result:
+                            # If verify_prediction returns a result, it means it was verified (Target/Stop hit)
+                            verified_count += 1
+                            if result['was_correct']:
+                                correct_count += 1
+                            # Add to newly verified list
+                            newly_verified.append(result)
+                except Exception as e:
+                    logger.warning(f"Could not verify prediction {prediction['id']} for {prediction['symbol']}: {e}")
+                    continue
         
         return {
             "verified": verified_count,
@@ -456,4 +452,12 @@ class PredictionsTracker:
             "avg_days_to_target": avg_days_to_target,
             "recent_verified_count": len(recent_preds)
         }
+
+    def get_all_tracked_symbols(self) -> List[str]:
+        """Get list of unique symbols from all predictions"""
+        symbols = set()
+        for p in self.predictions:
+            if 'symbol' in p:
+                symbols.add(p['symbol'])
+        return list(symbols)
 

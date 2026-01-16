@@ -513,78 +513,92 @@ class InvestingAnalyzer:
             score -= 1
             reasons.append("High risk factors present")
         
-        # Determine recommendation
-        # INVERTED: User reported BUY/SELL are backwards
-        # High score (good fundamentals) = stock likely to go UP = SELL to take profits
-        # Low score (poor fundamentals) = stock likely to go DOWN = BUY at discount
-        if score >= 3:
-            action = "SELL"  # Changed from BUY - good fundamentals mean stock rising, sell to take profits
-            confidence = min(90, 60 + (score * 5))
-        elif score <= -3:
-            action = "BUY"  # Changed from AVOID - poor fundamentals mean stock falling, buy at discount
-            confidence = min(90, 60 + (abs(score) * 5))
-        else:
-            action = "HOLD"
-            confidence = 50
+        # Determine recommendation (Aggressive Value Investing)
+        # STANDARD LOGIC RESTORED:
+        # Good Fundamentals + Undervalued = BUY (Accumulate)
+        # Good Fundamentals + Overvalued = SELL (Scale Out) or HOLD
+        # Bad Fundamentals = SELL (Avoid/Liquidate)
         
+        # Determine strict signal states
+        is_undervalued = valuation.get('is_undervalued', False)
+        is_overvalued = valuation.get('is_overvalued', False)
+        health_excellent = health_score >= 80
+        health_poor = health_score < 50
+        
+        # Default
+        action = "HOLD"
+        confidence = 50
+        
+        if score >= 2: # Good Fundamentals
+            if is_undervalued:
+                 # The Holy Grail: Good Company + Cheap Price
+                 action = "BUY"
+                 confidence = 90
+                 reasons.append("💎 VALUE INVESTING: High Quality Company at Discount Price")
+            elif is_overvalued:
+                 # Good Company but Expensive
+                 action = "SELL"
+                 confidence = 70
+                 reasons.append("⚠️ Good company but SIGNIFICANTLY OVERVALUED - Consider taking profits")
+            else:
+                 # Good Company, Fair Price -> BUY/HOLD
+                 action = "BUY" # Aggressive: Keep adding to winners
+                 confidence = 75
+                 reasons.append("📈 High Quality Business - Accumulate/Hold for long term")
+                 
+        elif score <= -2: # Bad Fundamentals
+             action = "SELL"
+             confidence = 80
+             reasons.append("📉 Deteriorating Fundamentals - High Risk Investment")
+             if is_undervalued:
+                 reasons.append("⚠️ Stock is 'cheap' for a reason (Value Trap?)")
+                 
+        else: # Mixed / Average Fundamentals
+             if is_undervalued:
+                 action = "BUY"
+                 confidence = 65
+                 reasons.append("💡 Speculative Value Play (Average Fundamentals but Cheap)")
+             elif is_overvalued:
+                 action = "SELL"
+                 confidence = 65
+                 reasons.append("⚠️ Overvalued with average fundamentals - Risk to downside")
+             else:
+                 # Truly middle of the road
+                 action = "HOLD"
+                 confidence = 50
+                 reasons.append("↔️ Average fundamentals and fair valuation - Wait for better setup")
+
         current_price = stock_data.get('price', 0)
         
-        # Long-term targets (for INVESTING: 1-3 years timeframe)
+        # Long-term targets (1-3 years)
         entry_price = current_price
         
+        # Multipliers
+        target_mult = 1.2 # Default 20% upside per year? 
+        stop_mult = 0.85
+        
         if action == "BUY":
-            # BUY action (inverted: poor fundamentals, stock likely to go down, so buy at discount)
-            # Target: stock goes UP after buying (recovery from low)
-            # Base target: 10-25% recovery potential
-            growth_rate = growth.get('revenue_growth', 0) or growth.get('earnings_growth', 0) or 5
-            pe_ratio = valuation.get('pe_ratio', 0)
-            
-            # Adjust target based on recovery potential
-            if growth_rate > 15:
-                # High growth potential: 20-25% annual target
-                annual_target_percent = 20 + min(5, (growth_rate - 15) / 2)
-            elif growth_rate > 10:
-                # Moderate growth: 15-20% annual target
-                annual_target_percent = 15 + min(5, (growth_rate - 10) / 2)
-            elif growth_rate > 5:
-                # Slow growth: 10-15% annual target
-                annual_target_percent = 10 + min(5, (growth_rate - 5) / 2)
+            # Target = Intrinsic Value (or estimate)
+            # If undervalued, target is "Fair Value" which is higher
+            if is_undervalued:
+                target_price = current_price * 1.50 # Expect 50% mean reversion + growth
             else:
-                # Low/no growth: 8-12% annual target (market average)
-                annual_target_percent = 8 + min(4, growth_rate / 2)
+                target_price = current_price * 1.25 # Expect 25% growth
             
-            # Adjust for valuation
-            if pe_ratio > 0:
-                if pe_ratio > 30:
-                    # Overvalued - reduce target
-                    annual_target_percent *= 0.8
-                elif pe_ratio < 15:
-                    # Undervalued - increase target slightly
-                    annual_target_percent *= 1.1
+            # Stop Loss (Wide for investing)
+            stop_loss = current_price * 0.80 # 20% trailing stop idea
             
-            # For 1-3 year investing, use 1.5 year average (conservative)
-            target_percent = annual_target_percent * 1.5
-            target_price = current_price * (1 + target_percent / 100)
+            # Entry: If we can get it cheaper?
+            # Implied: User wants to enter NOW unless it's a "Wait for dip"
             
-            # Long-term stop loss: 20-25% down (allows for market volatility)
-            financial_health_score = financial_health.get('overall_score', 50)
-            if financial_health_score < 40:
-                # Poor financial health: tighter stop loss (20%)
-                stop_loss = current_price * 0.80
-            else:
-                # Good financial health: wider stop loss (25%) for long-term
-                stop_loss = current_price * 0.75
-                
         elif action == "SELL":
-            # SELL action (inverted: good fundamentals, stock likely to go up, so sell to take profits)
-            # NOTE: System uses INVERTED logic - SELL = bullish (expecting price to go UP)
-            # Target: price increase of 10-15% over 1-2 years (sell at profit)
-            target_price = current_price * 1.12  # 12% target for long-term bullish
-            stop_loss = current_price * 0.85  # 15% downside risk (price goes down instead)
+            # Exit Strategy
+            target_price = current_price * 1.10 # Maybe eke out 10% more?
+            stop_loss = current_price * 0.90 # Protect gains?
             
-        else:  # HOLD
-            target_price = current_price
-            stop_loss = current_price
+        else: # HOLD
+            target_price = current_price * 1.10
+            stop_loss = current_price * 0.90
         
         return {
             "action": action,

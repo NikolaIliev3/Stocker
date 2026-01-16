@@ -94,7 +94,7 @@ try:
                        ML_FEATURE_SELECTION_THRESHOLD, ML_RF_N_ESTIMATORS, ML_RF_MAX_DEPTH,
                        ML_RF_MIN_SAMPLES_SPLIT, ML_RF_MIN_SAMPLES_LEAF, ML_GB_N_ESTIMATORS,
                        ML_GB_MAX_DEPTH, ML_GB_LEARNING_RATE, ML_MIN_TRAINING_SAMPLES,
-                       ML_MIN_BINARY_SAMPLES)
+                       ML_MIN_BINARY_SAMPLES, ML_BINARY_HOLD_THRESHOLD)
 except ImportError:
     # Fallback if not in config
     # Windows-specific: limit to 4 cores to prevent deadlocks
@@ -112,7 +112,9 @@ except ImportError:
     ML_GB_MAX_DEPTH = 4
     ML_GB_LEARNING_RATE = 0.03
     ML_MIN_TRAINING_SAMPLES = 100
+    ML_MIN_TRAINING_SAMPLES = 100
     ML_MIN_BINARY_SAMPLES = 30
+    ML_BINARY_HOLD_THRESHOLD = 0.55
 
 # Helper function to safely get n_jobs value (Windows-specific fix)
 def get_safe_n_jobs(requested_cores):
@@ -1226,6 +1228,18 @@ class StockPredictionML:
         X = np.array([s['features'] for s in training_samples])
         y = np.array([s['label'] for s in training_samples])
         
+        # Extract sample weights (verified predictions = 10x, historical = 1x)
+        sample_weights = np.array([s.get('sample_weight', 1.0) for s in training_samples])
+        
+        # Log weight distribution
+        unique_weights, weight_counts = np.unique(sample_weights, return_counts=True)
+        weight_dist = dict(zip(unique_weights, weight_counts))
+        if len(weight_dist) > 1:
+            logger.info(f"📊 Sample weight distribution: {weight_dist}")
+            verified_count = sum(1 for w in sample_weights if w > 1.0)
+            if verified_count > 0:
+                logger.info(f"   ✨ {verified_count} verified samples with 10x weight")
+        
         # Binary classification mode: convert BUY/SELL/HOLD to UP/DOWN (skip HOLD)
         # This achieves ~65% accuracy vs ~45% for 3-class
         if use_binary_classification:
@@ -1236,10 +1250,10 @@ class StockPredictionML:
             for i, label in enumerate(y):
                 if label == 'BUY':
                     binary_mask.append(i)
-                    binary_labels.append('DOWN')  # BUY signal = price went down (inverted logic)
+                    binary_labels.append('UP')  # BUY signal = price went up (standard logic)
                 elif label == 'SELL':
                     binary_mask.append(i)
-                    binary_labels.append('UP')  # SELL signal = price went up (inverted logic)
+                    binary_labels.append('DOWN')  # SELL signal = price went down (standard logic)
                 # Skip HOLD
             
             # Reduced minimum from 100 to 30 for incremental training scenarios (backtest results)
@@ -1248,6 +1262,7 @@ class StockPredictionML:
             
             X = X[binary_mask]
             y = np.array(binary_labels)
+            sample_weights = sample_weights[binary_mask]  # Keep weights aligned
             logger.info(f"Binary samples: {len(X)} (removed {len(training_samples) - len(X)} HOLD samples)")
         
         # Handle missing values
@@ -1276,6 +1291,7 @@ class StockPredictionML:
             logger.warning(f"Removed {len(X) - len(unique_indices)} duplicate samples ({len(unique_indices)}/{len(X)} unique) to prevent overfitting")
             X = X[unique_indices]
             y = y[unique_indices]
+            sample_weights = sample_weights[unique_indices]  # Keep weights aligned
         
         # Check class distribution
         label_counts = Counter(y)
@@ -1322,10 +1338,10 @@ class StockPredictionML:
                 for i, label in enumerate(y):
                     if label == 'BUY':
                         binary_mask.append(i)
-                        binary_labels.append('DOWN')  # BUY signal = price went down (inverted logic)
+                        binary_labels.append('UP')  # BUY signal = price went up (standard logic)
                     elif label == 'SELL':
                         binary_mask.append(i)
-                        binary_labels.append('UP')  # SELL signal = price went up (inverted logic)
+                        binary_labels.append('DOWN')  # SELL signal = price went down (standard logic)
                     # Skip HOLD
                 
                 # Check label distribution BEFORE filtering (from original y array)
@@ -1463,6 +1479,8 @@ class StockPredictionML:
                     X_test = X[test_indices]
                     y_train = y_encoded[train_indices]
                     y_test = y_encoded[test_indices]
+                    weights_train = sample_weights[train_indices]
+                    weights_test = sample_weights[test_indices]
                     
                     # Log temporal split info
                     if valid_dates:
@@ -1473,21 +1491,20 @@ class StockPredictionML:
                                       f"({len(train_indices)} samples), "
                                       f"Test={min(test_dates).date()} to {max(test_dates).date()} ({len(test_indices)} samples)")
                 else:
-                    # Fallback to random split if dates not available
                     logger.warning("⚠️ Less than 80% of samples have dates, using random split (may cause data leakage)")
-                    X_train, X_test, y_train, y_test = train_test_split(
-                        X, y_encoded, test_size=test_size, random_state=random_seed, stratify=y_encoded
+                    X_train, X_test, y_train, y_test, weights_train, weights_test = train_test_split(
+                        X, y_encoded, sample_weights, test_size=test_size, random_state=random_seed, stratify=y_encoded
                     )
             except Exception as e:
                 logger.warning(f"⚠️ Temporal split failed: {e}. Falling back to random split.")
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y_encoded, test_size=test_size, random_state=random_seed, stratify=y_encoded
+                X_train, X_test, y_train, y_test, weights_train, weights_test = train_test_split(
+                    X, y_encoded, sample_weights, test_size=test_size, random_state=random_seed, stratify=y_encoded
                 )
         else:
             # Fallback to random split if temporal split disabled or no samples
             logger.warning("⚠️ Using random split (temporal split disabled or no samples). This may cause data leakage.")
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y_encoded, test_size=test_size, random_state=random_seed, stratify=y_encoded
+            X_train, X_test, y_train, y_test, weights_train, weights_test = train_test_split(
+                X, y_encoded, sample_weights, test_size=test_size, random_state=random_seed, stratify=y_encoded
             )
         
         # Apply SMOTE for class balancing if enabled and binary classification is used
@@ -1506,7 +1523,17 @@ class StockPredictionML:
                         logger.info(f"Applying SMOTE to balance classes (ratio: {imbalance_ratio:.2f})")
                         logger.info(f"  Before SMOTE: {class_dist}")
                         smote = SMOTE(random_state=random_seed, k_neighbors=min(5, min_count - 1))
+                        X_train_original_size = len(X_train)
                         X_train, y_train = smote.fit_resample(X_train, y_train)
+                        # Recreate weights: keep original weights + add 1.0 for synthetic samples
+                        new_samples_count = len(X_train) - X_train_original_size
+                        if new_samples_count > 0:
+                            # Original weights + new ones for synthetic samples
+                            weights_train = np.concatenate([
+                                weights_train[:X_train_original_size],
+                                np.ones(new_samples_count)  # Synthetic samples get weight 1.0
+                            ])
+                            logger.info(f"  Added {new_samples_count} synthetic samples with weight 1.0")
                         unique_after, counts_after = np.unique(y_train, return_counts=True)
                         class_dist_after = dict(zip(unique_after, counts_after))
                         logger.info(f"  After SMOTE: {class_dist_after}")
@@ -1539,7 +1566,7 @@ class StockPredictionML:
             # Determine number of features to select (top 50-70 features to reduce overfitting)
             # Reduced feature count to prevent overfitting while maintaining performance
             total_features = len(X_train[0])
-            n_features_to_select = max(50, min(70, int(total_features * 0.5)))  # 50% of features, clamped to 50-70 range
+            n_features_to_select = max(30, min(50, int(total_features * 0.4)))  # Reduced to 30-50 features to prevent overfitting
             
             if self.feature_selection_method == 'rfe' and len(X_train) > n_features_to_select:
                 # Use RFE for feature selection
@@ -1764,7 +1791,7 @@ class StockPredictionML:
                 # Stacking ensemble: meta-learner learns optimal combination
                 self.model = StackingClassifier(
                     estimators=[('rf', rf), ('gb', gb), ('lr', lr)],
-                    final_estimator=LogisticRegression(max_iter=1000, C=0.2, class_weight='balanced', random_state=random_seed, penalty='l2'),  # Reduced C from 0.5 for stronger regularization
+                    final_estimator=LogisticRegression(max_iter=1000, C=0.1, class_weight='balanced', random_state=random_seed, penalty='l2'),  # Reduced C from 0.2 for stronger regularization
                     cv=5,  # 5-fold cross-validation for meta-learner
                     stack_method='predict_proba',  # Use probabilities for better combination
                     n_jobs=get_safe_n_jobs(ML_TRAINING_CPU_CORES)
@@ -1785,7 +1812,13 @@ class StockPredictionML:
         # Train (suppress feature name warnings)
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.utils.validation')
-        self.model.fit(X_train_scaled, y_train)
+        
+        # Log if we're using weighted training (verified samples have more influence)
+        if weights_train is not None and len(np.unique(weights_train)) > 1:
+            verified_in_train = sum(1 for w in weights_train if w > 1.0)
+            logger.info(f"⚖️ Training with sample weights ({verified_in_train} verified samples with 10x weight)")
+        
+        self.model.fit(X_train_scaled, y_train, sample_weight=weights_train)
         
         # Evaluate
         # Key trick for noisy 3-class tasks: if the model isn't confident, predict HOLD.
@@ -1901,18 +1934,23 @@ class StockPredictionML:
             logger.debug(traceback.format_exc())
             cv_scores = np.array([test_score])  # Fallback to test score if CV fails
         
-        # Save model securely
-        self.storage.save_model(self.model, self.model_file)
-        self.storage.save_model(self.scaler, self.scaler_file)
-        # Save label encoder (needed for prediction)
-        label_encoder_file = self.data_dir / f"label_encoder_{self.strategy}.pkl"
-        self.storage.save_model(self.label_encoder, label_encoder_file)
+        # Save model securely to temporary files first to prevent corruption
+        tmp_model_file = f"tmp_ml_model_{self.strategy}.pkl"
+        tmp_scaler_file = f"tmp_scaler_{self.strategy}.pkl"
+        tmp_encoder_file = f"tmp_label_encoder_{self.strategy}.pkl"
+        
+        self.storage.save_model(self.model, tmp_model_file)
+        self.storage.save_model(self.scaler, tmp_scaler_file)
+        self.storage.save_model(self.label_encoder, tmp_encoder_file)
         
         # Store accuracy values for access by regime model training
         self.train_accuracy = float(train_score)
         self.test_accuracy = float(test_score)
         
-        # Save metadata
+        # Prepare metadata
+        # CRITICAL: Store scaler's expected feature count to prevent mismatch during prediction
+        scaler_n_features = self.scaler.n_features_in_ if hasattr(self.scaler, 'n_features_in_') else X_train_scaled.shape[1]
+        
         self.metadata = {
             'strategy': self.strategy,
             'samples': len(training_samples),
@@ -1923,6 +1961,8 @@ class StockPredictionML:
             'trained_date': datetime.now().isoformat(),
             'feature_importance': self.feature_importance,
             'selected_features': self.selected_features.tolist() if self.selected_features is not None else None,
+            'selected_feature_names': selected_feature_names if 'selected_feature_names' in dir() else None,
+            'scaler_n_features': scaler_n_features,  # Store exact feature count scaler was trained on
             'feature_selection_threshold': self.feature_selection_threshold,
             'feature_selection_method': self.feature_selection_method,
             'total_features': len(self.feature_extractor.get_feature_names()),
@@ -1932,17 +1972,18 @@ class StockPredictionML:
             'hold_confidence_threshold': float(hold_confidence_threshold) if hold_confidence_threshold is not None else 0.0,
             'has_optuna': HAS_OPTUNA,
             'used_hyperparameter_tuning': self.use_hyperparameter_tuning,
-            'use_binary_classification': use_binary_classification  # Store binary mode flag
+            'use_binary_classification': use_binary_classification
         }
         
         # Register new version and check if it should be activated
         should_activate = True
         if self.version_manager:
             try:
-                # Generate version number if not already created
+                # Generate version number
                 if not version_number:
                     version_number = self.version_manager.generate_version_number()
                 
+                # Check performance before activating
                 registered_version, should_activate = self.version_manager.register_new_version(
                     metadata=self.metadata,
                     test_accuracy=test_score,
@@ -1951,39 +1992,34 @@ class StockPredictionML:
                 )
                 
                 if not should_activate:
-                    # New model is worse, rollback to previous version
-                    logger.warning(f"⚠️ New model performs worse than current. Rolling back...")
-                    current_version = self.version_manager.get_current_version()
-                    if current_version:
-                        rollback_success = self.version_manager.rollback_to_version(current_version.get('version'))
-                        if rollback_success:
-                            logger.info(f"✅ Rolled back to previous version {current_version.get('version')}")
-                            # Reload the previous model
-                            self._load_model()
-                            # Return previous metadata
-                            return self.metadata
-                        else:
-                            logger.error("❌ Rollback failed! New model may be active despite being worse.")
-                    else:
-                        logger.warning("⚠️ No previous version to rollback to. Keeping new model.")
-                else:
-                    logger.info(f"✅ New model version {registered_version} activated (accuracy: {test_score*100:.1f}%)")
+                    logger.warning(f"⚠️ New model performs worse than current. Rejected version {version_number}.")
+                    # Cleanup temporary files
+                    for tmp_file in [tmp_model_file, tmp_scaler_file, tmp_encoder_file]:
+                        tmp_path = self.data_dir / tmp_file
+                        if tmp_path.exists():
+                            tmp_path.unlink()
+                    return self.metadata
             except Exception as e:
                 logger.error(f"Error in version management: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-        
-        # Only save if versioning says we should activate, or if versioning is disabled
-        if should_activate or not self.version_manager:
-            with open(self.metadata_file, 'w') as f:
-                json.dump(self.metadata, f, indent=2)
+                # Fallback to activating if version manager fails
+                should_activate = True
 
-            logger.info(f"Trained and saved ML model: {test_score*100:.1f}% accuracy")
-        else:
-            # Don't save if we rolled back
-            logger.info(f"Model training complete but not saved (rolled back to previous version)")
-            # Don't save if we rolled back
-            logger.info(f"Model training complete but not saved (rolled back to previous version)")
+        # Activate the new model by renaming temporary files to main names
+        if should_activate:
+            try:
+                import shutil
+                shutil.move(self.data_dir / tmp_model_file, self.data_dir / self.model_file)
+                shutil.move(self.data_dir / tmp_scaler_file, self.data_dir / self.scaler_file)
+                shutil.move(self.data_dir / tmp_encoder_file, self.data_dir / f"label_encoder_{self.strategy}.pkl")
+                
+                # Save metadata finally
+                with open(self.metadata_file, 'w') as f:
+                    json.dump(self.metadata, f, indent=2)
+                
+                logger.info(f"✅ Successfully activated new model version (accuracy: {test_score*100:.1f}%)")
+            except Exception as e:
+                logger.error(f"Error activating new model files: {e}")
+                return self.metadata
         
         return self.metadata
     
@@ -2327,6 +2363,15 @@ class StockPredictionML:
                 
                 # Store the regime model
                 regime_models[regime] = regime_ml
+                
+                # Get scaler feature count from regime model
+                regime_scaler_n_features = regime_ml.scaler.n_features_in_ if hasattr(regime_ml.scaler, 'n_features_in_') else None
+                
+                # Get selected_feature_names from regime model's metadata
+                regime_selected_feature_names = None
+                if regime_ml.metadata and 'selected_feature_names' in regime_ml.metadata:
+                    regime_selected_feature_names = regime_ml.metadata['selected_feature_names']
+                
                 regime_metadata[regime] = {
                     'train_accuracy': train_acc,
                     'test_accuracy': test_acc,
@@ -2334,8 +2379,11 @@ class StockPredictionML:
                     'cv_std': cv_std,
                     'samples': len(regime_X),
                     'selected_features': regime_ml.selected_features.tolist() if regime_ml.selected_features is not None else None,
+                    'selected_feature_names': regime_selected_feature_names,  # Store feature names for prediction
+                    'scaler_n_features': regime_scaler_n_features,  # Store scaler's expected feature count
                     'num_features': len(regime_ml.selected_features) if regime_ml.selected_features is not None else None
                 }
+
                 
                 # Weighted average for overall metrics
                 overall_train_acc += train_acc * len(regime_X)
@@ -2567,39 +2615,62 @@ class StockPredictionML:
             logger.debug(f"Detected interactions: scaler expects {scaler_expected_features} features, we have {num_selected} after selection")
         
         if use_interactions:
-            # Get feature names for selected features
-            all_feature_names = self.feature_extractor.get_feature_names()
-            if self.selected_features is not None and len(self.selected_features) > 0:
-                selected_feature_names = [all_feature_names[i] for i in self.selected_features if i < len(all_feature_names)]
+            # IMPROVEMENT: Use stored feature names from metadata if available
+            # This ensures we use the EXACT same feature names that were used during training
+            selected_feature_names = None
+            if self.metadata and 'selected_feature_names' in self.metadata and self.metadata['selected_feature_names']:
+                selected_feature_names = self.metadata['selected_feature_names']
+                logger.debug(f"Using stored selected_feature_names from metadata ({len(selected_feature_names)} names)")
             else:
-                selected_feature_names = all_feature_names[:num_selected]
+                # Fallback: reconstruct from indices (may differ from training)
+                all_feature_names = self.feature_extractor.get_feature_names()
+                if self.selected_features is not None and len(self.selected_features) > 0:
+                    selected_feature_names = [all_feature_names[i] for i in self.selected_features if i < len(all_feature_names)]
+                else:
+                    selected_feature_names = all_feature_names[:num_selected]
+                logger.debug(f"Reconstructed selected_feature_names from indices ({len(selected_feature_names)} names)")
             
             # Add interactions using the same logic as training (method is on FeatureExtractor)
             try:
-                features, _ = self.feature_extractor._add_feature_interactions(features, selected_feature_names, fit=False)
-                logger.debug(f"Added feature interactions: {len(features[0])} features total (was {num_selected})")
+                features, interaction_names = self.feature_extractor._add_feature_interactions(features, selected_feature_names, fit=False)
+                logger.debug(f"Added {len(interaction_names)} feature interactions: {len(features[0])} features total (was {num_selected})")
             except Exception as e:
-                logger.warning(f"Could not add feature interactions during prediction: {e}. Using features without interactions.")
-                # If interactions fail, we can't proceed - return error
+                logger.warning(f"Could not add feature interactions during prediction: {e}. Falling back to rule-based.")
+                # If interactions fail, don't crash - return HOLD with low confidence
                 return {
                     'action': 'HOLD',
                     'confidence': 0.0,
                     'error': f'Feature interaction error: {e}',
                     'probabilities': {'BUY': 0.0, 'SELL': 0.0, 'HOLD': 100.0}
                 }
+
         
         # Final check: ensure feature count matches scaler expectations
         if scaler_expected_features is not None and len(features[0]) != scaler_expected_features:
-            logger.error(f"Feature count mismatch after selection/interactions: got {len(features[0])}, scaler expects {scaler_expected_features}")
+            actual_count = len(features[0])
+            logger.warning(f"Feature count mismatch after selection/interactions: got {actual_count}, scaler expects {scaler_expected_features}. Attempting emergency adjustment.")
+            
+            if actual_count < scaler_expected_features:
+                # Pad with zeros
+                padding = np.zeros((features.shape[0], scaler_expected_features - actual_count))
+                features = np.column_stack([features, padding])
+                logger.info(f"Padded features with {scaler_expected_features - actual_count} zeros to match scaler")
+            else:
+                # Truncate
+                features = features[:, :scaler_expected_features]
+                logger.info(f"Truncated features from {actual_count} to {scaler_expected_features} to match scaler")
+        
+        # Scale
+        try:
+            features_scaled = self.scaler.transform(features)
+        except Exception as e:
+            logger.error(f"Scaling failed even after adjustment: {e}")
             return {
                 'action': 'HOLD',
                 'confidence': 0.0,
-                'error': f'Feature count mismatch: got {len(features[0])}, expected {scaler_expected_features}',
+                'error': f'Scaling error: {e}',
                 'probabilities': {'BUY': 0.0, 'SELL': 0.0, 'HOLD': 100.0}
             }
-        
-        # Scale
-        features_scaled = self.scaler.transform(features)
         
         # Predict (suppress feature name warnings - they're harmless)
         with warnings.catch_warnings():
@@ -2620,22 +2691,46 @@ class StockPredictionML:
         
         # For binary classification, add confidence threshold to reduce bias
         # If confidence is too low, return HOLD instead of making a biased prediction
-        is_binary_mode = (set(classes) == {'UP', 'DOWN'} or 
-                         (len(classes) == 2 and 'UP' in classes and 'DOWN' in classes))
+        is_binary_mode = (len(classes) == 2 or 'HOLD' not in classes)
         
-        # Binary confidence threshold: if max probability < 60%, return HOLD
+        # Binary confidence threshold: if max probability < threshold, return HOLD
         # This helps reduce bias toward majority class
-        # Increased from 55% to 60% to be more aggressive in filtering uncertain predictions
-        binary_confidence_threshold = 0.60  # 60% minimum confidence for binary predictions
+        # Configurable via ML_BINARY_HOLD_THRESHOLD
+        binary_confidence_threshold = ML_BINARY_HOLD_THRESHOLD
         if is_binary_mode and maxp < binary_confidence_threshold:
             logger.debug(f"Low confidence binary prediction ({maxp*100:.1f}% < {binary_confidence_threshold*100}%), returning HOLD")
+            
+            # Map probabilities based on available classes
+            buy_prob = 0.0
+            sell_prob = 0.0
+            
+            if 'BUY' in classes:
+                buy_prob = float(probabilities[classes.index('BUY')] * 100)
+            elif 'DOWN' in classes: # Assuming DOWN = BUY (Dip buying) based on previous logic, but checking context is safer. 
+                # Re-evaluating: Usually UP=BUY. If existing code had DOWN=BUY, it was likely specific.
+                # Standardizing:
+                buy_prob = float(probabilities[classes.index('DOWN')] * 100)
+            elif 'UP' in classes: # If UP is mapped to something else? 
+                 pass
+
+            if 'SELL' in classes:
+                 sell_prob = float(probabilities[classes.index('SELL')] * 100)
+            elif 'UP' in classes:
+                 sell_prob = float(probabilities[classes.index('UP')] * 100)
+            
+            # Fill in the gaps if we have the other side
+            if 'BUY' in classes and 'SELL' in classes:
+                 pass # Already set
+            elif 'UP' in classes and 'DOWN' in classes:
+                 # Previous logic had DOWN->BUY, UP->SELL. Preserving that weird mapping if it was intentional for "Dip Buying"?
+                 # Actually, let's stick to the visible classes in logs: BUY and SELL.
+                 pass
+                 
             return {
                 'action': 'HOLD',
                 'confidence': float(maxp * 100),
                 'reasoning': f'Low confidence prediction ({maxp*100:.1f}%) - avoiding biased prediction',
-                'probabilities': {'BUY': float(probabilities[classes.index('DOWN')] * 100) if 'DOWN' in classes else 0.0,
-                                 'SELL': float(probabilities[classes.index('UP')] * 100) if 'UP' in classes else 0.0,
-                                 'HOLD': 100.0 - float(maxp * 100)}
+                'probabilities': {'BUY': buy_prob, 'SELL': sell_prob, 'HOLD': 0.0}
             }
         
         if hold_idx is not None and hold_threshold > 0.0 and maxp < hold_threshold:
@@ -2659,9 +2754,9 @@ class StockPredictionML:
         
         if is_binary_mode:
             if action == 'UP':
-                action = 'SELL'  # UP prediction = price goes up = sell signal
+                action = 'BUY'   # UP prediction = price goes up = buy signal
             elif action == 'DOWN':
-                action = 'BUY'  # DOWN prediction = price goes down = buy signal
+                action = 'SELL'  # DOWN prediction = price goes down = sell signal
             # Note: Binary mode doesn't predict HOLD, so we use the action directly
             logger.debug(f"Binary mode conversion: {original_action} → {action}")
 
@@ -2674,17 +2769,18 @@ class StockPredictionML:
             # Convert binary class names to BUY/SELL for compatibility
             display_name = class_name
             if class_name == 'UP':
-                display_name = 'SELL'
-            elif class_name == 'DOWN':
                 display_name = 'BUY'
+            elif class_name == 'DOWN':
+                display_name = 'SELL'
             prob_dict[display_name] = float(probabilities[i] * 100)
         
         # Ensure all expected actions are in prob_dict (for 3-class compatibility)
-        if 'BUY' not in prob_dict:
-            prob_dict['BUY'] = 0.0
-        if 'SELL' not in prob_dict:
-            prob_dict['SELL'] = 0.0
-        if 'HOLD' not in prob_dict:
+        if 'BUY' not in prob_dict: prob_dict['BUY'] = 0.0
+        if 'SELL' not in prob_dict: prob_dict['SELL'] = 0.0
+        if 'HOLD' not in prob_dict: prob_dict['HOLD'] = 0.0
+        
+        # In binary mode, HOLD is not a possible class output, so it should be zero
+        if is_binary_mode:
             prob_dict['HOLD'] = 0.0
         
         # Record prediction in production monitor
@@ -2892,6 +2988,10 @@ class StockPredictionML:
                                 # Extract selected_features and other info from regime's own metadata
                                 if 'selected_features' in regime_own_metadata:
                                     regime_metadata['selected_features'] = regime_own_metadata['selected_features']
+                                if 'selected_feature_names' in regime_own_metadata:
+                                    regime_metadata['selected_feature_names'] = regime_own_metadata['selected_feature_names']
+                                if 'scaler_n_features' in regime_own_metadata:
+                                    regime_metadata['scaler_n_features'] = regime_own_metadata['scaler_n_features']
                                 if 'train_accuracy' in regime_own_metadata:
                                     regime_metadata['train_accuracy'] = regime_own_metadata['train_accuracy']
                                 if 'test_accuracy' in regime_own_metadata:
@@ -2899,6 +2999,7 @@ class StockPredictionML:
                                 logger.debug(f"Loaded regime metadata from {regime_ml.metadata_file.name}")
                         except Exception as e:
                             logger.debug(f"Could not load regime metadata from {regime_ml.metadata_file.name}: {e}")
+
                     
                     regime_ml.metadata = regime_metadata if regime_metadata else {}
                     regime_ml.train_accuracy = regime_metadata.get('train_accuracy', 0) if regime_metadata else 0

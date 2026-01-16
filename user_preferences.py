@@ -64,7 +64,8 @@ class UserPreferences:
             'show_momentum_change_notifications': True,  # Show momentum/trend change notifications
             'show_backtest_complete_notifications': True,  # Show backtest completion notifications
             'show_training_complete_notifications': True,  # Show ML training completion notifications
-            'show_auto_training_notifications': True  # Show auto-training completion notifications
+            'show_auto_training_notifications': True,  # Show auto-training completion notifications
+            'monitored_stocks': []  # List of stocks to monitor
         }
     
     def save(self):
@@ -83,6 +84,14 @@ class UserPreferences:
         """Set a preference value"""
         self.preferences[key] = value
         self.save()
+        
+    def get_monitored_stocks(self) -> list:
+        """Get list of monitored stocks"""
+        return self.preferences.get('monitored_stocks', [])
+        
+    def set_monitored_stocks(self, stocks: list):
+        """Set list of monitored stocks"""
+        self.set('monitored_stocks', stocks)
     
     def get_budget(self, current_currency: str = None) -> float:
         """Get saved budget, converted to current currency if needed"""

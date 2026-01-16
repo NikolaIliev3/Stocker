@@ -122,6 +122,66 @@ class TrendChangeTracker:
         self.save()
         return prediction
     
+    def check_for_verification(self, data_fetcher) -> List[Dict]:
+        """Check active trend predictions for verification"""
+        verified_items = []
+        active_preds = self.get_active_predictions()
+        
+        for pred in active_preds:
+            try:
+                symbol = pred.get('symbol')
+                if not symbol:
+                    continue
+                    
+                # Get current data
+                current_data = data_fetcher.fetch_stock_data(symbol)
+                current_price = current_data.get('price', 0)
+                
+                if current_price <= 0:
+                    continue
+                    
+                # Check 1: Has estimated date passed?
+                estimated_date_str = pred.get('estimated_date', '')
+                try:
+                    estimated_date = datetime.fromisoformat(estimated_date_str)
+                    has_time_passed = datetime.now() > estimated_date
+                except:
+                    has_time_passed = False
+                    
+                # Check 2: Has significant movement happened in predicted direction?
+                # We need historical context or price at prediction time, but trend change only records "current trend"
+                # So we largely rely on time-based verification OR major reversals
+                
+                should_verify = has_time_passed
+                
+                if should_verify:
+                    # Determine what happened
+                    predicted_change = pred.get('predicted_change', '')
+                    
+                    # Logic to determine if prediction was correct
+                    # This is simplified - ideally we'd look at price history since prediction
+                    
+                    # For now, we will verify based on what the trend LOOKS like now compared to prediction
+                    # However, determining "trend" instantly is hard. 
+                    # We will use price movement as a proxy if we can't do full analysis
+                    
+                    # If we don't have entry price, we can't know for sure.
+                    # BUT, we can mark it as "expired - waiting for manual verification" 
+                    # OR we can try to deduce it.
+                    
+                    # Since we can't easily auto-verify purely on price without start price,
+                    # we will mostly rely on MANUAL verification for now, unless we update the tracker
+                    # to store start price.
+                    
+                    # Let's check if we CAN auto-verify. 
+                    # If we can't auto-verify safely, we leave it active for manual verification.
+                    pass 
+
+            except Exception as e:
+                logger.error(f"Error checking verification for prediction {pred.get('id')}: {e}")
+                
+        return verified_items
+
     def delete_prediction(self, prediction_id: int) -> bool:
         """Delete a trend change prediction"""
         prediction = self.get_prediction_by_id(prediction_id)

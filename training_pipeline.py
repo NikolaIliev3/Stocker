@@ -242,29 +242,28 @@ class TrainingDataGenerator:
                 future_price = float(hist.iloc[future_idx]['Close'])
                 price_change_pct = ((future_price - current_price) / current_price) * 100
                 
-                # Label based on strategy (INVERTED LOGIC)
-                # With inverted logic:
-                # - Price going DOWN → BUY (bearish signals, buy at discount)
-                # - Price going UP → SELL (bullish signals, sell at profit)
+                # Label based on strategy (Trend Following)
+                # - Price going UP → BUY (Signal to Enter/Long)
+                # - Price going DOWN → SELL (Signal to Exit/Short)
                 if strategy == "trading":
-                    if price_change_pct <= -3:
-                        label = "BUY"  # Price went down, bearish → BUY
-                    elif price_change_pct >= 3:
-                        label = "SELL"  # Price went up, bullish → SELL
+                    if price_change_pct >= 3:
+                        label = "BUY"
+                    elif price_change_pct <= -3:
+                        label = "SELL"
                     else:
                         label = "HOLD"
                 elif strategy == "investing":
-                    if price_change_pct <= -10:
-                        label = "BUY"  # Price went down significantly, bearish → BUY
-                    elif price_change_pct >= 10:
-                        label = "SELL"  # Price went up significantly, bullish → SELL (was AVOID, now SELL)
+                    if price_change_pct >= 10:
+                        label = "BUY"
+                    elif price_change_pct <= -10:
+                        label = "SELL"
                     else:
                         label = "HOLD"
                 else:  # mixed
-                    if price_change_pct <= -5:
-                        label = "BUY"  # Price went down, bearish → BUY
-                    elif price_change_pct >= 5:
-                        label = "SELL"  # Price went up, bullish → SELL (was AVOID, now SELL)
+                    if price_change_pct >= 5:
+                        label = "BUY"
+                    elif price_change_pct <= -5:
+                        label = "SELL"
                     else:
                         label = "HOLD"
                 
@@ -369,7 +368,8 @@ class TrainingDataGenerator:
                     'label': label,
                     'price_change_pct': price_change_pct,
                     'date': current_date.strftime('%Y-%m-%d'),
-                    'symbol': symbol
+                    'symbol': symbol,
+                    'sample_weight': 1.0  # Historical samples = baseline weight
                 })
                 success_count += 1
                 
@@ -562,26 +562,28 @@ class MLTrainingPipeline:
                 price_change_pct = ((actual_price - entry_price) / entry_price) * 100
                 
                 # Determine correct label based on actual outcome and strategy
-                # NOTE: Uses INVERTED logic - BUY = price went down, SELL = price went up
+                # STANDARD LOGIC (fixed from inverted):
+                # Price went UP → model should have said BUY (bullish)
+                # Price went DOWN → model should have said SELL (bearish)
                 if strategy == "trading":
-                    if price_change_pct <= -3:
-                        label = "BUY"  # Price went down, bearish → BUY
-                    elif price_change_pct >= 3:
-                        label = "SELL"  # Price went up, bullish → SELL
+                    if price_change_pct >= 3:
+                        label = "BUY"  # Price went UP → Correct action was BUY
+                    elif price_change_pct <= -3:
+                        label = "SELL"  # Price went DOWN → Correct action was SELL
                     else:
                         label = "HOLD"
                 elif strategy == "investing":
-                    if price_change_pct <= -10:
-                        label = "BUY"  # Price went down significantly, bearish → BUY
-                    elif price_change_pct >= 10:
-                        label = "SELL"  # Price went up significantly, bullish → SELL
+                    if price_change_pct >= 10:
+                        label = "BUY"  # Price went UP significantly → Correct action was BUY
+                    elif price_change_pct <= -10:
+                        label = "SELL"  # Price went DOWN significantly → Correct action was SELL
                     else:
                         label = "HOLD"
                 else:  # mixed
-                    if price_change_pct <= -5:
-                        label = "BUY"  # Price went down, bearish → BUY
-                    elif price_change_pct >= 5:
-                        label = "SELL"  # Price went up, bullish → SELL
+                    if price_change_pct >= 5:
+                        label = "BUY"  # Price went UP → Correct action was BUY
+                    elif price_change_pct <= -5:
+                        label = "SELL"  # Price went DOWN → Correct action was SELL
                     else:
                         label = "HOLD"
                 
@@ -692,7 +694,8 @@ class MLTrainingPipeline:
                         'price_change_pct': price_change_pct,
                         'date': pred_date.strftime('%Y-%m-%d'),
                         'symbol': symbol,
-                        'was_correct': pred.get('was_correct', False)
+                        'was_correct': pred.get('was_correct', False),
+                        'sample_weight': 10.0  # Verified samples = 10x more important!
                     })
                     
                 except Exception as e:

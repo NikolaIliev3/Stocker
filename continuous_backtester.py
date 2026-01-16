@@ -393,11 +393,12 @@ class ContinuousBacktester:
         interval_ms = self.test_interval_hours * 3600000
         self.app.root.after(interval_ms, self._schedule_next_test)
     
-    def run_test_now(self, selected_strategies: List[str] = None):
+    def run_test_now(self, selected_strategies: List[str] = None, num_tests: int = None):
         """Manually trigger a backtest
         
         Args:
             selected_strategies: List of strategies to test. If None, tests all strategies.
+            num_tests: Number of test points per strategy. If None, uses default (100).
         """
         if self.is_testing:
             logger.info("Backtest already in progress")
@@ -407,16 +408,17 @@ class ContinuousBacktester:
         if selected_strategies is None:
             selected_strategies = ['trading', 'mixed', 'investing']
         
-        thread = threading.Thread(target=self._run_backtest, args=(selected_strategies,))
+        thread = threading.Thread(target=self._run_backtest, args=(selected_strategies, num_tests))
         thread.daemon = True
         thread.start()
         return True
     
-    def _run_backtest(self, selected_strategies: List[str] = None):
+    def _run_backtest(self, selected_strategies: List[str] = None, num_tests: int = None):
         """Run backtest on random historical points
         
         Args:
             selected_strategies: List of strategies to test. If None, tests all strategies.
+            num_tests: Number of test points per strategy. If None, uses default.
         """
         if self.is_testing:
             return
@@ -430,13 +432,16 @@ class ContinuousBacktester:
         if selected_strategies is None:
             selected_strategies = ['trading', 'mixed', 'investing']
         
+        # Use provided num_tests or fall back to default
+        tests_to_run = num_tests if num_tests is not None else self.tests_per_run
+        
         # Track dates tested in this run (reset for each new run)
         self.current_run_tested_dates = set()
         self.current_run_start_time = datetime.now()
         
         try:
             logger.info("🧪 Starting continuous backtest...")
-            logger.info(f"   • Will test {self.tests_per_run} points per strategy")
+            logger.info(f"   • Will test {tests_to_run} points per strategy")
             logger.info(f"   • Selected strategies: {', '.join(selected_strategies)}")
             
             # Track total tests across all strategies
@@ -468,12 +473,12 @@ class ContinuousBacktester:
                 logger.info(f"Testing {strategy} strategy (lookforward: {lookforward} days, need dates at least {lookforward + 30} days ago)")
                 
                 # Try 5x more attempts to find valid points (increased from 3x for better success rate)
-                max_attempts = self.tests_per_run * 5
+                max_attempts = tests_to_run * 5
                 for attempt in range(max_attempts):
                     if not self.is_running:
                         break
                     
-                    if tests_run >= self.tests_per_run:
+                    if tests_run >= tests_to_run:
                         break  # Got enough valid tests
                     
                     # Pick random symbol
@@ -813,21 +818,22 @@ class ContinuousBacktester:
                             f"price_change={actual_change_pct:.2f}%")
             
             # Determine if prediction was correct
-            # NOTE: Algorithm uses INVERTED logic:
-            # - BUY = bearish signals (expecting price to go DOWN, then buy at discount)
-            # - SELL = bullish signals (expecting price to go UP, then sell to take profits)
+            # STANDARD LOGIC (Fixed):
+            # - BUY = Bullish (expecting price to go UP)
+            # - SELL = Bearish (expecting price to go DOWN)
             was_correct = None
             if predicted_action == 'BUY':
-                # BUY (bearish signals) is correct if price went DOWN (so you can buy at discount)
-                was_correct = actual_change_pct < 0
-                # Detailed logging for BUY predictions
-                logger.debug(f"BUY prediction evaluation: price_change={actual_change_pct:.2f}%, "
-                           f"correct={was_correct}, ml_action={ml_pred.get('action', 'N/A')}, "
-                           f"rule_action={rule_pred.get('action', 'N/A')}")
-            elif predicted_action == 'SELL':
-                # SELL (bullish signals) is correct if price went UP (so you can sell at profit)
+                # BUY is correct if price went UP
                 was_correct = actual_change_pct > 0
-                # Detailed logging for SELL predictions (first 20 to diagnose the 78% failure rate)
+                # Detailed logging for BUY predictions (first 20)
+                if test_number < 20:
+                    logger.debug(f"BUY prediction evaluation: price_change={actual_change_pct:.2f}%, "
+                               f"correct={was_correct}, ml_action={ml_pred.get('action', 'N/A')}, "
+                               f"rule_action={rule_pred.get('action', 'N/A')}")
+            elif predicted_action == 'SELL':
+                # SELL is correct if price went DOWN (avoided loss)
+                was_correct = actual_change_pct < 0
+                # Detailed logging for SELL predictions
                 if test_number < 20:
                     logger.info(f"SELL prediction evaluation: price_change={actual_change_pct:.2f}%, "
                               f"correct={was_correct}, ml_action={ml_pred.get('action', 'N/A')}, "
@@ -1057,24 +1063,23 @@ class ContinuousBacktester:
                 avg_failed_confidence = np.mean(confidence_failures) if confidence_failures else 50
                 
                 if avg_failed_confidence > 70:
-                    logger.info(
-                        f"🔧 High-confidence failures detected ({strategy}): "
+                    # Log at debug level - hybrid_predictor now handles weight adjustment automatically
+                    logger.debug(
+                        f"High-confidence failures detected ({strategy}): "
                         f"Avg confidence {avg_failed_confidence:.1f}% - "
-                        f"Model may be overconfident, adjusting weights"
+                        f"Hybrid predictor will auto-adjust weights"
                     )
-                    # This indicates the model is overconfident
-                    # We could adjust weights to be more conservative
                 
-                # Log action failure patterns
+                # Log action failure patterns at debug level (informational only)
                 if action_failures:
                     most_failed = max(action_failures.items(), key=lambda x: x[1])
                     failure_rate = most_failed[1] / len(failures) * 100
                     if failure_rate > 60:
-                        logger.info(
-                            f"🔧 Action pattern detected ({strategy}): "
+                        # Changed to debug level - this is normal during ML learning phase
+                        logger.debug(
+                            f"Action pattern ({strategy}): "
                             f"{most_failed[0]} predictions failing {failure_rate:.0f}% of time "
-                            f"({most_failed[1]}/{len(failures)} failures). "
-                            f"This may indicate the model needs adjustment for this action type."
+                            f"- hybrid predictor auto-adjusting"
                         )
             
             # Note: Full weight adjustment requires indicator data which we don't store
@@ -1169,29 +1174,28 @@ class ContinuousBacktester:
                     # Calculate price change
                     price_change_pct = ((future_price - test_price) / test_price) * 100
                     
-                    # Determine label based on actual outcome (INVERTED LOGIC)
-                    # With inverted logic:
-                    # - Price going DOWN → BUY (bearish signals, buy at discount)
-                    # - Price going UP → SELL (bullish signals, sell at profit)
+                    # Corrected Logic: Trend Following
+                    # Future Price Higher → BUY (Signal to Enter/Long)
+                    # Future Price Lower → SELL (Signal to Exit/Short)
                     if strategy == "trading":
-                        if price_change_pct <= -3:
-                            label = "BUY"  # Price went down, bearish → BUY
-                        elif price_change_pct >= 3:
-                            label = "SELL"  # Price went up, bullish → SELL
+                        if price_change_pct >= 3:
+                            label = "BUY"
+                        elif price_change_pct <= -3:
+                            label = "SELL"
                         else:
                             label = "HOLD"
                     elif strategy == "investing":
-                        if price_change_pct <= -10:
-                            label = "BUY"  # Price went down significantly, bearish → BUY
-                        elif price_change_pct >= 10:
-                            label = "SELL"  # Price went up significantly, bullish → SELL (was AVOID)
+                        if price_change_pct >= 10:
+                            label = "BUY"
+                        elif price_change_pct <= -10:
+                            label = "SELL"
                         else:
                             label = "HOLD"
                     else:  # mixed
-                        if price_change_pct <= -5:
-                            label = "BUY"  # Price went down, bearish → BUY
-                        elif price_change_pct >= 5:
-                            label = "SELL"  # Price went up, bullish → SELL (was AVOID)
+                        if price_change_pct >= 5:
+                            label = "BUY"
+                        elif price_change_pct <= -5:
+                            label = "SELL"
                         else:
                             label = "HOLD"
                     

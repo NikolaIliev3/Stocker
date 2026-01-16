@@ -89,18 +89,19 @@ HYPERPARAMETER_TUNING_PARALLEL_TRIALS = None  # None = auto (uses all cores), or
 
 # ML Model Configuration
 ML_FEATURE_SELECTION_THRESHOLD = 0.005  # Threshold for feature selection importance
-ML_RF_N_ESTIMATORS = 80  # Random Forest number of estimators
-ML_RF_MAX_DEPTH = 4  # Random Forest max depth (anti-overfitting)
-ML_RF_MIN_SAMPLES_SPLIT = 30  # Random Forest min samples split
-ML_RF_MIN_SAMPLES_LEAF = 15  # Random Forest min samples leaf
-ML_GB_N_ESTIMATORS = 150  # Gradient Boosting number of estimators
-ML_GB_MAX_DEPTH = 4  # Gradient Boosting max depth
-ML_GB_LEARNING_RATE = 0.03  # Gradient Boosting learning rate
-ML_HIGH_ACCURACY_THRESHOLD = 0.60  # Threshold for considering ML model "high accuracy" (60%)
-ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.62  # Threshold for "very high accuracy" (62%)
-ML_MIN_TRAINING_SAMPLES = 100  # Minimum samples required for training
-ML_MIN_BINARY_SAMPLES = 30  # Minimum samples for binary classification
-ML_PERFORMANCE_HISTORY_LIMIT = 1000  # Maximum entries in performance history
+ML_RF_N_ESTIMATORS = 60  # Reduced from 80 to prevent overfitting
+ML_RF_MAX_DEPTH = 5  # Increased from 3 to allow some granularity
+ML_RF_MIN_SAMPLES_SPLIT = 20  # Reduced from 40 for small datasets
+ML_RF_MIN_SAMPLES_LEAF = 10  # Reduced from 30 to allow model to find sub-patterns
+ML_GB_N_ESTIMATORS = 80  # Reduced from 100
+ML_GB_MAX_DEPTH = 3  
+ML_GB_LEARNING_RATE = 0.03  
+ML_HIGH_ACCURACY_THRESHOLD = 0.60  
+ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.62  
+ML_MIN_TRAINING_SAMPLES = 80  # Reduced from 100 to allow earlier learning
+ML_MIN_BINARY_SAMPLES = 30  
+ML_PERFORMANCE_HISTORY_LIMIT = 1000  
+ML_BINARY_HOLD_THRESHOLD = 0.60  
 ML_RECENT_PERFORMANCE_WINDOW = 50  # Window size for recent performance calculation
 ML_ENSEMBLE_WEIGHT_UPDATE_THRESHOLD = 5  # Minimum accuracy difference to update ensemble weights
 ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD = 10  # Accuracy difference threshold for weight adjustment
