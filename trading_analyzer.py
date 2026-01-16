@@ -235,26 +235,58 @@ class TradingAnalyzer:
     def _analyze_price_action(self, df: pd.DataFrame) -> dict:
         """Analyze price action and trends"""
         current_price = df['close'].iloc[-1]
-        recent_prices = df['close'].tail(20)
         
-        # Trend detection
-        higher_highs = 0
-        higher_lows = 0
-        lower_highs = 0
-        lower_lows = 0
+        # Use shorter window for trading (more responsive)
+        short_prices = df['close'].tail(5)  # Last week
+        medium_prices = df['close'].tail(10)  # Last 2 weeks
+        recent_prices = df['close'].tail(20)  # Last month
         
-        for i in range(1, len(recent_prices)):
-            if recent_prices.iloc[i] > recent_prices.iloc[i-1]:
-                higher_highs += 1
-            else:
-                lower_highs += 1
-            
-            if recent_prices.iloc[i] > recent_prices.iloc[i-1]:
-                higher_lows += 1
-            else:
-                lower_lows += 1
+        # Calculate EMAs for trend
+        ema_5 = df['close'].ewm(span=5).mean().iloc[-1]
+        ema_10 = df['close'].ewm(span=10).mean().iloc[-1]
+        ema_20 = df['close'].ewm(span=20).mean().iloc[-1]
         
-        trend = "uptrend" if higher_highs > lower_highs else "downtrend" if lower_highs > higher_highs else "sideways"
+        # Short-term momentum (for trading)
+        short_change = ((short_prices.iloc[-1] / short_prices.iloc[0]) - 1) * 100  # 5-day change
+        medium_change = ((medium_prices.iloc[-1] / medium_prices.iloc[0]) - 1) * 100  # 10-day change
+        
+        # Determine trend based on multiple factors
+        bullish_signals = 0
+        bearish_signals = 0
+        
+        # EMA alignment
+        if ema_5 > ema_10 > ema_20:
+            bullish_signals += 2  # Strong bullish
+        elif ema_5 > ema_10:
+            bullish_signals += 1
+        elif ema_5 < ema_10 < ema_20:
+            bearish_signals += 2  # Strong bearish
+        elif ema_5 < ema_10:
+            bearish_signals += 1
+        
+        # Short-term momentum (most important for trading)
+        if short_change > 2:
+            bullish_signals += 2
+        elif short_change > 0:
+            bullish_signals += 1
+        elif short_change < -2:
+            bearish_signals += 2
+        elif short_change < 0:
+            bearish_signals += 1
+        
+        # Price vs EMAs
+        if current_price > ema_5:
+            bullish_signals += 1
+        else:
+            bearish_signals += 1
+        
+        # Determine trend
+        if bullish_signals > bearish_signals + 1:
+            trend = "uptrend"
+        elif bearish_signals > bullish_signals + 1:
+            trend = "downtrend"
+        else:
+            trend = "sideways"
         
         # Price position relative to recent range
         recent_high = recent_prices.max()
@@ -267,8 +299,13 @@ class TradingAnalyzer:
             "recent_high": float(recent_high),
             "recent_low": float(recent_low),
             "price_position_percent": float(price_position),
-            "higher_highs": higher_highs,
-            "lower_lows": lower_lows
+            "short_change_pct": float(short_change),
+            "medium_change_pct": float(medium_change),
+            "ema_5": float(ema_5),
+            "ema_10": float(ema_10),
+            "ema_20": float(ema_20),
+            "bullish_signals": bullish_signals,
+            "bearish_signals": bearish_signals
         }
     
     def _analyze_volume(self, df: pd.DataFrame) -> dict:
@@ -823,8 +860,6 @@ class TradingAnalyzer:
         
         # Determine recommendation (with stricter overbought handling)
         # If multiple overbought indicators, cap confidence even if score suggests BUY
-        # Determine recommendation (with stricter overbought handling)
-        # If multiple overbought indicators, cap confidence even if score suggests BUY
         overbought_penalty = 0
         if rsi > self.rsi_overbought and mfi > 80:
             overbought_penalty = 20  # Reduce confidence significantly
@@ -872,34 +907,60 @@ class TradingAnalyzer:
                 confidence = 75
                 reasons.append("📉 Price falling but indicators showing strength (Bullish Divergence)")
             else:
-                # Standard Accumulation
-                confidence = 65 
-                reasons.append("📉 Accumulating in downtrend (Dollar Cost Averaging)")
-                reasons.append("⚠️ WARNING: Price is falling. Possible lower lows ahead.")
+                # Standard Accumulation / "Buy the Dip"
+                # Formerly HOLD, now enabled as requested by user
+                action = "BUY"
+                confidence = 65
+                reasons.append("📉 Aggressive Accumulation - Buying the Dip")
+                
+                # Boost confidence if near support
+                if distance_to_support < 8:
+                     confidence += 5
+                     reasons.append(f"✅ Near support zone ({distance_to_support:.1f}%)")
+                
+                # Check for severe weakness to potentially revert to HOLD
+                if score < -3:
+                     action = "HOLD"
+                     confidence = 50
+                     reasons.append("⚠️ Bearish momentum too strong for entry yet")
                 
         elif trend == "uptrend":
              # STRATEGIC VIEW: Price is high/rising.
-             # User Intent: Wants to RIDE trend or SELL peak.
+             # User Intent: Ride trend (BUY) or Sell peak.
              
-             if is_overbought or is_reversing_bearish or score < 0:
-                 # Trend potentially ending -> SELL
-                 action = "SELL"
-                 if is_overbought and is_reversing_bearish:
-                     confidence = 95
-                     reasons.append("🛑 Trend reversal detected at Overbought levels - SELL HIGHEST")
-                 elif is_overbought:
-                     confidence = 85
-                     reasons.append("⚠️ Overbought conditions - Consider scaling out (Selling Strength)")
+             # Check for potential SELL conditions first
+             should_sell = (is_overbought and is_reversing_bearish) or score < -1
+             
+             if should_sell:
+                 # Rocket Protection: Don't sell/short if trend is truly strong
+                 if 'strong' in trend_strength and not is_reversing_bearish:
+                     action = "HOLD"
+                     confidence = 65
+                     reasons.append("🚀 Strong Momentum - Ignoring SELL signal (Don't short the rocket)")
                  else:
-                     confidence = 75
-                     reasons.append("⚠️ Weakness detected in uptrend - Protect profits")
+                     # Valid Sell Signal
+                     action = "SELL"
+                     if is_overbought and is_reversing_bearish:
+                         confidence = 90
+                         reasons.append("🛑 Trend reversal detected at Overbought levels - SELL HIGHEST")
+                     else:
+                         confidence = 70
+                         reasons.append("⚠️ Weakness detected in uptrend (Reversal indicated)")
+                         
+             elif is_overbought:
+                 # Overbought but NO reversal yet -> HOLD (Wait for dip)
+                 action = "HOLD"
+                 confidence = 60
+                 reasons.append("📈 Strong Uptrend but Overbought - Watch for pullback (Don't chase)")
+                 
              else:
-                 # Stable/Strong Uptrend -> BUY (Momentum) or HOLD (Let Run)
-                 # User Request: "instead of just saying hold it can say BUY"
+                 # Stable/Strong Uptrend + Not Overbought -> BUY (Join the move)
                  action = "BUY"
-                 confidence = 80
-                 reasons.append("🚀 Strong uptrend momentum - Trend Following Entry")
-                 reasons.append("📈 Price expected to continue rising")
+                 confidence = 85
+                 if 'strong' in trend_strength:
+                     reasons.append("🚀 Strong Uptrend Momentum - Joining the rocket")
+                 else:
+                     reasons.append("📈 Uptrend continues - Trend Following Entry")
         
         # --- HOLD OVERRIDE (For Unsure/Mixed Signals) ---
         # If signals are truly conflicting, force HOLD
@@ -965,60 +1026,79 @@ class TradingAnalyzer:
             target_mult = multipliers.get('target_mult', 1.0)
             stop_mult = multipliers.get('stop_loss_mult', 1.0)
         
+        # --- ENTRY, TARGET, STOP LOSS LOGIC (REVERSAL STRATEGY) ---
+        
         if action == "BUY":
-            # BUY LOGIC: Assume User wants Lowest Entry
-            resistance = support_resistance.get('resistance', None)
+            # REVERSAL BUY STRATEGY: Buying the dip / oversold bounce
+            
             support = support_resistance.get('support', None)
+            resistance = support_resistance.get('resistance', None)
+            recent_low = price_action.get('recent_low', current_price * 0.95)
             
-            # 1. Entry Strategy
+            # 1. STOP LOSS: Strict protection (Recent Swing Low)
             if support and support < current_price:
-                 # Entry ideal = Near Support
-                 # If we are accumulating in downtrend, try to bid lower
-                 if trend == "downtrend":
-                     entry_price = (current_price + support) / 2
-                     reasons.append(f"💡 Try to enter lower @ ${entry_price:.2f} (Avg down)")
-                 else:
-                     entry_price = current_price # Momentum buy = Market order usually
+                # If support is unreasonably far (>15% drop), use a tighter stop
+                if (current_price - support) / current_price < 0.15: 
+                    stop_loss = support * 0.98 # 2% below support buffer
+                else:
+                    # Support too far, use recent low or volatility based stop
+                    stop_loss = max(recent_low * 0.98, current_price * 0.95)
+            else:
+                 stop_loss = current_price * 0.96 # Fallback tight stop
             
-            # 2. Target Strategy (Highest Exit)
-            if resistance and resistance > current_price:
-                # Target = Resistance
-                target_price = resistance
-            else:
-                 # No resistance = Run with Score
-                 target_price = current_price * (1 + (0.05 * target_mult)) # Min 5% target
-                 
-            # 3. Stop Loss
-            if support and support < current_price:
-                 stop_loss = support * 0.95
-            else:
+            # Sanity check for stop loss
+            if stop_loss >= current_price:
                  stop_loss = current_price * 0.95
-                 
-        elif action == "SELL":
-            # SELL LOGIC: Assume User wants Highest Exit
-            resistance = support_resistance.get('resistance', None)
-            support = support_resistance.get('support', None)
-            
-            # 1. Entry (Current Price is exit price technically, but for tracking...)
-            entry_price = current_price
-            
-            # 2. Target Price (Where price might go if we held - technically 'Support' because shorting? 
-            # OR if this is a sell signal for a long position, Target is 'exit price' which is current)
-            # User said: "give me the highest possible price before reversal"
-            
+
+            # 2. TARGET PRICE: Resistance (Potential Reversal Top)
             if resistance and resistance > current_price:
-                 # It might go higher?
-                 reasons.append(f"💡 Price might touch ${resistance:.2f} before reversing.")
-                 target_price = resistance # This is the "Highest Possible Price" prediction
+                target_price = resistance
+                # If resistance is too close (<5% upside), aim higher (breakout)
+                if (target_price - current_price) / current_price < 0.05:
+                     target_price = current_price * 1.10
             else:
-                 target_price = current_price # Sell now, it's peak
+                 # No clear resistance, assume mean reversion momentum
+                 risk = current_price - stop_loss
+                 target_price = current_price + (risk * 3) # 3:1 Reward
                  
-            # 3. Stop Loss (If we are wrong and it keeps skyrocketing? Or if we short?)
-            # Valid for shorting context:
-            if resistance:
-                 stop_loss = resistance * 1.05
+            # 3. ENTRY: Immediate
+            entry_price = current_price
+
+            # Enforce Minimum R:R Ratio of 2.0
+            potential_reward = target_price - current_price
+            potential_risk = current_price - stop_loss
+            
+            if potential_risk > 0:
+                rr_ratio = potential_reward / potential_risk
+                if rr_ratio < 2.0:
+                    # Adjust target to reflect the minimum viable reversal trade (Greedy Target)
+                    target_price = current_price + (potential_risk * 2.5)
+                    reasons.append("🎯 Target adjusted for >2.0 R:R Ratio")
+
+        elif action == "SELL":
+            # SELL / SHORT STRATEGY
+            
+            support = support_resistance.get('support', None)
+            resistance = support_resistance.get('resistance', None)
+            recent_high = price_action.get('recent_high', current_price * 1.05)
+            
+            # 1. STOP LOSS (Invalidation)
+            if resistance and resistance > current_price:
+                 if (resistance - current_price) / current_price < 0.15:
+                     stop_loss = resistance * 1.02
+                 else:
+                     stop_loss = min(recent_high * 1.02, current_price * 1.05)
             else:
                  stop_loss = current_price * 1.05
+                 
+            # 2. TARGET PRICE (Downside / Support)
+            if support and support < current_price:
+                target_price = support
+            else:
+                risk = stop_loss - current_price
+                target_price = current_price - (risk * 3)
+            
+            entry_price = current_price
         
         else: # HOLD
              entry_price = current_price
@@ -1210,4 +1290,3 @@ class TradingAnalyzer:
             reasoning += f"• Stop Loss: ${recommendation.get('stop_loss', 0):.2f}\n"
         
         return reasoning
-

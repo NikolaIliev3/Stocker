@@ -242,29 +242,28 @@ class TrainingDataGenerator:
                 future_price = float(hist.iloc[future_idx]['Close'])
                 price_change_pct = ((future_price - current_price) / current_price) * 100
                 
-                # Label based on strategy (INVERTED LOGIC)
-                # With inverted logic:
-                # - Price going DOWN → BUY (bearish signals, buy at discount)
-                # - Price going UP → SELL (bullish signals, sell at profit)
+                # Label based on strategy (Trend Following)
+                # - Price going UP → BUY (Signal to Enter/Long)
+                # - Price going DOWN → SELL (Signal to Exit/Short)
                 if strategy == "trading":
-                    if price_change_pct <= -3:
-                        label = "BUY"  # Price went down, bearish → BUY
-                    elif price_change_pct >= 3:
-                        label = "SELL"  # Price went up, bullish → SELL
+                    if price_change_pct >= 3:
+                        label = "BUY"
+                    elif price_change_pct <= -3:
+                        label = "SELL"
                     else:
                         label = "HOLD"
                 elif strategy == "investing":
-                    if price_change_pct <= -10:
-                        label = "BUY"  # Price went down significantly, bearish → BUY
-                    elif price_change_pct >= 10:
-                        label = "SELL"  # Price went up significantly, bullish → SELL (was AVOID, now SELL)
+                    if price_change_pct >= 10:
+                        label = "BUY"
+                    elif price_change_pct <= -10:
+                        label = "SELL"
                     else:
                         label = "HOLD"
                 else:  # mixed
-                    if price_change_pct <= -5:
-                        label = "BUY"  # Price went down, bearish → BUY
-                    elif price_change_pct >= 5:
-                        label = "SELL"  # Price went up, bullish → SELL (was AVOID, now SELL)
+                    if price_change_pct >= 5:
+                        label = "BUY"
+                    elif price_change_pct <= -5:
+                        label = "SELL"
                     else:
                         label = "HOLD"
                 

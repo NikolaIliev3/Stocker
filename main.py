@@ -50,6 +50,8 @@ from config import SEEKER_AI_ENABLED
 from scrollable_notebook import TwoRowNotebook
 from llm_ai_predictor import LLMAIPredictor
 from price_move_predictor import PriceMovePredictor
+from holdings_tracker import HoldingsTracker
+from potentials_tracker import PotentialsTracker
 
 # Import new modules
 try:
@@ -210,6 +212,8 @@ class StockerApp:
         from trend_change_tracker import TrendChangeTracker
         self.trend_change_tracker = TrendChangeTracker(APP_DATA_DIR)  # Track trend change predictions for learning
         self.llm_ai_predictor = LLMAIPredictor(APP_DATA_DIR)  # AI Predictor for buy opportunities and reasoning
+        self.holdings_tracker = HoldingsTracker(APP_DATA_DIR, app=self)  # Track user's stock holdings
+        self.potentials_tracker = PotentialsTracker(APP_DATA_DIR)  # Track potential investment opportunities
         
         # Initialize momentum changes history from persistent storage
         self.momentum_changes_history = self.momentum_monitor.history
@@ -246,6 +250,11 @@ class StockerApp:
         self.current_analysis = None
         self.current_theme = self.saved_theme
         self.loading_screen = None
+        
+        # Initialize monitored stocks (Used by UI for favorites)
+        self.monitored_stocks = self.preferences.get_monitored_stocks()
+        if self.monitored_stocks is None:
+            self.monitored_stocks = []
         
         # Create UI
         self._create_ui()
@@ -1965,6 +1974,19 @@ class StockerApp:
         )
         self.sidebar_scan_btn.pack(fill=tk.X)
         
+        # Market Dip Scanner Button (New Feature)
+        self.sidebar_dip_frame = tk.Frame(self.strategy_card.content_frame, bg=theme['card_bg'])
+        self.sidebar_dip_frame.pack(fill=tk.X, pady=(8, 0))
+        
+        self.sidebar_dip_btn = ModernButton(
+            self.sidebar_dip_frame, 
+            "📉 Find Market Dips", 
+            command=self._scan_for_dips,
+            theme=theme
+        )
+        self.sidebar_dip_btn.pack(fill=tk.X)
+
+        
         # Budget Card
         self.budget_card = ModernCard(sidebar, self.localization.t('investment_budget'), theme=theme, padding=20)
         self.budget_card.pack(fill=tk.X, pady=(0, 15))
@@ -2424,6 +2446,11 @@ class StockerApp:
         self.notebook.add(self.alerts_frame, text="🔔 Alerts")
         self._create_alerts_tab()
         
+        # My Holdings tab
+        self.holdings_frame = tk.Frame(self.notebook, bg=theme['frame_bg'])
+        self.notebook.add(self.holdings_frame, text="💼 My Holdings")
+        self._create_holdings_tab()
+        
         # Bind mousewheel to potential text for smooth scrolling
         def on_potential_scroll(event):
             delta = event.delta if hasattr(event, 'delta') else (event.num == 4 and -1) or 1
@@ -2556,6 +2583,11 @@ class StockerApp:
         self.momentum_changes_frame = tk.Frame(self.notebook, bg=theme['frame_bg'])
         self.notebook.add(self.momentum_changes_frame, text="🔄 Momentum Changes")
         self._create_momentum_changes_tab()
+        
+        # Potentials tab
+        self.potentials_frame = tk.Frame(self.notebook, bg=theme['frame_bg'])
+        self.notebook.add(self.potentials_frame, text="🎯 Potentials")
+        self._create_potentials_tab()
         
         self._create_gun_tab()
         
@@ -3025,6 +3057,28 @@ class StockerApp:
         def verify_in_background():
             try:
                 self.root.after(0, self._update_status, self.localization.t('verifying_predictions'))
+                
+                # 1. Verify Trend Changes
+                trend_verified = self.trend_change_tracker.check_for_verification(self.data_fetcher)
+                if trend_verified:
+                    logger.info(f"Verified {len(trend_verified)} trend predictions")
+                    for pred in trend_verified:
+                        if hasattr(self, 'learning_tracker'):
+                            self.learning_tracker.record_verified_trend_change(
+                                pred['symbol'],
+                                pred['predicted_change'],
+                                pred.get('actual_change', 'unknown'),
+                                pred.get('was_correct', False)
+                            )
+                    self.root.after(0, self._update_trend_change_display)
+                
+                # 2. Verify Momentum History
+                momentum_verified = self.momentum_monitor.verify_history(self.data_fetcher)
+                if momentum_verified:
+                    logger.info(f"Verified {len(momentum_verified)} momentum history items")
+                    self.root.after(0, self._update_momentum_changes_display)
+                
+                # 3. Verify Regular Predictions
                 # check_all=True to verify all active predictions regardless of target date
                 result = self.predictions_tracker.verify_all_active_predictions(self.data_fetcher, check_all=True)
                 if result['verified'] > 0:
@@ -3303,7 +3357,8 @@ class StockerApp:
                     symbol=symbol,
                     action='MONITOR',  # Indicated it came from background monitoring
                     changes=momentum_changes,
-                    strategy='monitored'
+                    strategy='monitored',
+                    current_price=current_price
                 )
                 self.root.after(0, self._update_momentum_changes_display)
                 
@@ -4582,6 +4637,350 @@ class StockerApp:
         
         # Initial display
         self._refresh_alerts()
+
+    def _create_holdings_tab(self):
+        """Create the My Holdings tab"""
+        theme = self.theme_manager.get_theme()
+        
+        # Header
+        header_frame = tk.Frame(self.holdings_frame, bg=theme['bg'])
+        header_frame.pack(fill=tk.X, pady=(0, 15), padx=15)
+        
+        title_label = tk.Label(header_frame, text="💼 My Portfolio Holdings", 
+                              font=('Segoe UI', 14, 'bold'), bg=theme['bg'], fg=theme['fg'])
+        title_label.pack(side=tk.LEFT)
+        
+        # Action Buttons
+        refresh_btn = ModernButton(header_frame, text="🔄 Refresh Prices", 
+                                   command=self._refresh_holdings, theme=theme)
+        refresh_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        
+        add_btn = ModernButton(header_frame, text="➕ Add Holding", 
+                               command=self._show_add_holding_dialog, theme=theme)
+        add_btn.pack(side=tk.RIGHT)
+        
+        # Container with scroll
+        container = tk.Frame(self.holdings_frame, bg=theme['bg'])
+        container.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        
+        # Configure columns
+        columns = ('symbol', 'buy_price', 'current_price', 'quantity', 'cost_basis', 'value', 'pl', 'recommendation', 'actions')
+        self.holdings_tree = ttk.Treeview(container, columns=columns, show='headings', selectmode='browse')
+        
+        # Setup headers
+        self.holdings_tree.heading('symbol', text='Symbol')
+        self.holdings_tree.heading('buy_price', text='Buy Price')
+        self.holdings_tree.heading('current_price', text='Current Price')
+        self.holdings_tree.heading('quantity', text='Quantity')
+        self.holdings_tree.heading('cost_basis', text='Cost Basis')
+        self.holdings_tree.heading('value', text='Market Value')
+        self.holdings_tree.heading('pl', text='P/L')
+        self.holdings_tree.heading('recommendation', text='Status')
+        self.holdings_tree.heading('actions', text='Actions')
+        
+        # Setup columns
+        self.holdings_tree.column('symbol', width=80, anchor='center')
+        self.holdings_tree.column('buy_price', width=100, anchor='center')
+        self.holdings_tree.column('current_price', width=100, anchor='center')
+        self.holdings_tree.column('quantity', width=80, anchor='center')
+        self.holdings_tree.column('cost_basis', width=100, anchor='center')
+        self.holdings_tree.column('value', width=100, anchor='center')
+        self.holdings_tree.column('pl', width=120, anchor='center')
+        self.holdings_tree.column('recommendation', width=150, anchor='center')
+        self.holdings_tree.column('actions', width=100, anchor='center')
+        
+        # Add scrollbar
+        scrollbar = ModernScrollbar(container, command=self.holdings_tree.yview, theme=theme)
+        self.holdings_tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.holdings_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Style treeview
+        style = ttk.Style()
+        style.configure("Treeview", 
+                       background=theme['entry_bg'],
+                       foreground=theme['fg'],
+                       fieldbackground=theme['entry_bg'],
+                       font=('Segoe UI', 10),
+                       rowheight=35)
+        style.configure("Treeview.Heading",
+                       background=theme['secondary_bg'],
+                       foreground=theme['fg'],
+                       font=('Segoe UI', 10, 'bold'))
+        style.map("Treeview", background=[('selected', theme['accent'])])
+        
+        # Bind double click to show details
+        self.holdings_tree.bind("<Double-1>", self._on_holding_double_click)
+        self.holdings_tree.bind("<Delete>", self._delete_selected_holding)
+        
+        # Summary footer
+        footer_frame = tk.Frame(self.holdings_frame, bg=theme['bg'])
+        footer_frame.pack(fill=tk.X, padx=15, pady=(0, 15))
+        
+        self.holdings_summary = tk.Label(
+            footer_frame,
+            text="Total Value: $0.00 | Total P/L: $0.00 (0.00%)",
+            font=('Segoe UI', 11, 'bold'),
+            bg=theme['bg'],
+            fg=theme['fg']
+        )
+        self.holdings_summary.pack(side=tk.LEFT)
+        
+        # Initialize
+        self._refresh_holdings()
+        
+        # Schedule auto-refresh every 5 minutes (if not already scheduled)
+        if not hasattr(self, '_holdings_refresh_scheduled'):
+             self.root.after(300000, self._auto_refresh_holdings)
+             self._holdings_refresh_scheduled = True
+
+    def _show_add_holding_dialog(self):
+        """Show dialog to add a new holding"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add New Holding")
+        dialog.geometry("400x450")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        theme = self.theme_manager.get_theme()
+        dialog.config(bg=theme['bg'])
+        
+        header = tk.Label(dialog, text="Add Portfolio Holding", font=('Segoe UI', 14, 'bold'),
+                         bg=theme['bg'], fg=theme['accent'])
+        header.pack(pady=20)
+        
+        form_frame = tk.Frame(dialog, bg=theme['bg'])
+        form_frame.pack(fill=tk.BOTH, expand=True, padx=40)
+        
+        # Symbol
+        tk.Label(form_frame, text="Stock Symbol:", bg=theme['bg'], fg=theme['fg']).pack(anchor=tk.W, pady=(10, 5))
+        symbol_entry = tk.Entry(form_frame, width=30)
+        symbol_entry.pack(fill=tk.X)
+        symbol_entry.focus_set()
+        
+        # Price
+        tk.Label(form_frame, text="Purchase Price ($):", bg=theme['bg'], fg=theme['fg']).pack(anchor=tk.W, pady=(15, 5))
+        price_entry = tk.Entry(form_frame, width=30)
+        price_entry.pack(fill=tk.X)
+        
+        # Quantity
+        tk.Label(form_frame, text="Quantity:", bg=theme['bg'], fg=theme['fg']).pack(anchor=tk.W, pady=(15, 5))
+        qty_entry = tk.Entry(form_frame, width=30)
+        qty_entry.pack(fill=tk.X)
+        
+        # Date
+        tk.Label(form_frame, text="Purchase Date (YYYY-MM-DD):", bg=theme['bg'], fg=theme['fg']).pack(anchor=tk.W, pady=(15, 5))
+        date_entry = tk.Entry(form_frame, width=30)
+        date_entry.insert(0, datetime.now().strftime('%Y-%m-%d'))
+        date_entry.pack(fill=tk.X)
+        
+        def save():
+            symbol = symbol_entry.get().strip().upper()
+            price_str = price_entry.get().strip()
+            qty_str = qty_entry.get().strip()
+            date_str = date_entry.get().strip()
+            
+            if not symbol or not price_str or not qty_str:
+                messagebox.showerror("Error", "Please fill in all fields")
+                return
+            
+            try:
+                price = float(price_str)
+                qty = float(qty_str)
+            except ValueError:
+                messagebox.showerror("Error", "Price and Quantity must be numbers")
+                return
+            
+            self.holdings_tracker.add_holding(symbol, price, qty, date_str)
+            self._refresh_holdings()
+            dialog.destroy()
+            messagebox.showinfo("Success", f"Added {symbol} to portfolio")
+        
+        btn_frame = tk.Frame(dialog, bg=theme['bg'])
+        btn_frame.pack(pady=30)
+        
+        ModernButton(btn_frame, "Cancel", command=dialog.destroy, theme=theme).pack(side=tk.LEFT, padx=10)
+        ModernButton(btn_frame, "Save Holding", command=save, theme=theme).pack(side=tk.LEFT, padx=10)
+
+    def _refresh_holdings(self):
+        """Refresh holdings data and UI"""
+        if not hasattr(self, 'holdings_tracker'):
+            return
+            
+        # Clear tree
+        for item in self.holdings_tree.get_children():
+            self.holdings_tree.delete(item)
+        
+        # Get analyzed holdings
+        # Run in background to avoid freezing UI
+        def analyze_background():
+            results = self.holdings_tracker.analyze_all_holdings()
+            self.root.after(0, lambda: self._update_holdings_ui(results))
+        
+        threading.Thread(target=analyze_background, daemon=True).start()
+
+    def _update_holdings_ui(self, results):
+        """Update holdings UI with analysis results"""
+        total_value = 0
+        total_cost = 0
+        
+        for r in results:
+            h = r['holding']
+            total_value += r['total_value']
+            total_cost += r['total_cost']
+            
+            # Format values
+            pl_color = '#4caf50' if r['profit_loss'] >= 0 else '#f44336'
+            pl_text = f"${r['profit_loss']:,.2f} ({r['profit_loss_pct']:+.1f}%)"
+            
+            status = r['recommendation']
+            status_icon = "🟢" if status == 'HOLD' else "🔴" if 'SELL' in status else "🟡"
+            
+            # Tags for row coloring
+            tag = 'sell' if 'SELL' in status else 'hold'
+            
+            self.holdings_tree.insert('', 'end', values=(
+                h.symbol,
+                f"${h.buy_price:,.2f}",
+                f"${r['current_price']:,.2f}",
+                f"{h.quantity}",
+                f"${r['total_cost']:,.2f}",
+                f"${r['total_value']:,.2f}",
+                pl_text,
+                f"{status_icon} {status}",
+                "🗑️ Delete" if 'SELL' in status else "Analyze"
+            ), tags=(tag, str(h.id)))
+        
+        # Update summary
+        total_pl = total_value - total_cost
+        total_pl_pct = (total_pl / total_cost * 100) if total_cost > 0 else 0
+        pl_color = '#4caf50' if total_pl >= 0 else '#f44336'
+        
+        self.holdings_summary.config(
+            text=f"Total Value: ${total_value:,.2f} | Total P/L: ${total_pl:,.2f} ({total_pl_pct:+.2f}%)",
+            fg=pl_color
+        )
+        
+        # Configure tag colors
+        theme = self.theme_manager.get_theme()
+        sell_bg = '#ffebee' if theme['name'] == 'light' else '#3e2723'
+        self.holdings_tree.tag_configure('sell', background=sell_bg)
+        
+    def _on_holding_double_click(self, event):
+        """Handle double click on holding"""
+        try:
+            item = self.holdings_tree.selection()[0]
+            tags = self.holdings_tree.item(item, "tags")
+            holding_id = int(tags[1]) if len(tags) > 1 else 0
+            if holding_id:
+                self._show_holding_details(holding_id)
+        except IndexError:
+            pass
+
+    def _show_holding_details(self, holding_id):
+        """Show detailed analysis for a holding"""
+        holding = self.holdings_tracker.get_holding(holding_id)
+        if not holding:
+            return
+            
+        # Show loading indicator first
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Analysis: {holding.symbol}")
+        dialog.geometry("500x600")
+        theme = self.theme_manager.get_theme()
+        dialog.config(bg=theme['bg'])
+        
+        def load_analysis():
+            analysis = self.holdings_tracker.analyze_holding(holding)
+            self.root.after(0, lambda: update_dialog(analysis))
+            
+        def update_dialog(analysis):
+            # Clear dialog
+            for widget in dialog.winfo_children():
+                widget.destroy()
+                
+            # Header
+            header = tk.Frame(dialog, bg=theme['bg'])
+            header.pack(fill=tk.X, pady=20, padx=20)
+            
+            tk.Label(header, text=holding.symbol, font=('Segoe UI', 24, 'bold'),
+                    bg=theme['bg'], fg=theme['accent']).pack(side=tk.LEFT)
+            
+            status_color = '#f44336' if 'SELL' in analysis['recommendation'] else '#4caf50'
+            tk.Label(header, text=analysis['recommendation'], font=('Segoe UI', 14, 'bold'),
+                    bg=status_color, fg='white', padx=10, pady=5).pack(side=tk.RIGHT)
+            
+            # Content
+            content = scrolledtext.ScrolledText(dialog, height=20, font=('Segoe UI', 10))
+            content.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+            
+            text = f"""POSITION DETAILS
+----------------
+Buy Price:    ${holding.buy_price:.2f}
+Quantity:     {holding.quantity}
+Cost Basis:   ${analysis['total_cost']:.2f}
+Current Price: ${analysis['current_price']:.2f}
+Market Value: ${analysis['total_value']:.2f}
+Profit/Loss:  ${analysis['profit_loss']:+.2f} ({analysis['profit_loss_pct']:+.1f}%)
+
+ANALYSIS
+----------------
+Confidence: {analysis.get('confidence', 0)}%
+
+SELL SIGNALS:
+"""
+            if analysis['sell_signals']:
+                for signal in analysis['sell_signals']:
+                    text += f"• {signal}\n"
+            else:
+                text += "• None detected (Safe to Hold)\n"
+                
+            if analysis['reasoning']:
+                text += "\nNOTES:\n"
+                for note in analysis['reasoning']:
+                    text += f"• {note}\n"
+                    
+            content.insert('1.0', text)
+            content.config(state='disabled')
+            
+            # Buttons
+            btn_frame = tk.Frame(dialog, bg=theme['bg'])
+            btn_frame.pack(pady=20)
+            
+            def sell_holding():
+                if messagebox.askyesno("Confirm Sell", f"Are you sure you want to remove {holding.symbol} from portfolio?"):
+                    self.holdings_tracker.remove_holding(holding.id)
+                    self._refresh_holdings()
+                    dialog.destroy()
+            
+            ModernButton(btn_frame, "Close", command=dialog.destroy, theme=theme).pack(side=tk.LEFT, padx=10)
+            ModernButton(btn_frame, "Mark as Sold", command=sell_holding, theme=theme).pack(side=tk.LEFT, padx=10)
+
+        # Show loading text
+        tk.Label(dialog, text="Analyzing...", font=('Segoe UI', 12), bg=theme['bg'], fg=theme['fg']).pack(pady=50)
+        
+        threading.Thread(target=load_analysis, daemon=True).start()
+
+    def _delete_selected_holding(self, event):
+        """Delete selected holding via keyboard"""
+        try:
+            item = self.holdings_tree.selection()[0]
+            tags = self.holdings_tree.item(item, "tags")
+            holding_id = int(tags[1]) if len(tags) > 1 else 0
+            
+            if holding_id and messagebox.askyesno("Confirm Delete", "Remove this holding?"):
+                self.holdings_tracker.remove_holding(holding_id)
+                self._refresh_holdings()
+        except IndexError:
+            pass
+
+    def _auto_refresh_holdings(self):
+        """Periodically refresh holdings"""
+        if hasattr(self, 'holdings_frame') and self.holdings_frame.winfo_viewable():
+            self._refresh_holdings()
+        # Schedule next check
+        self.root.after(300000, self._auto_refresh_holdings)
     
     def _create_trend_change_tab(self):
         """Create the trend change predictions tab"""
@@ -4618,12 +5017,14 @@ class StockerApp:
         list_inner = tk.Frame(list_card, bg=theme['card_bg'])
         list_inner.pack(fill=tk.BOTH, expand=True)
         
-        columns = ('ID', 'Symbol', 'Current Trend', 'Predicted Change', 'Estimated Days', 'Estimated Date', 'Confidence', 'Status', 'Delete')
+        columns = ('Fav', 'ID', 'Symbol', 'Current Trend', 'Predicted Change', 'Estimated Days', 'Estimated Date', 'Confidence', 'Status', 'Delete')
         self.trend_change_tree = ttk.Treeview(list_inner, columns=columns, show='headings', height=12)
         
         for col in columns:
             self.trend_change_tree.heading(col, text=col, anchor=tk.CENTER)
-            if col == 'ID':
+            if col == 'Fav':
+                self.trend_change_tree.column(col, width=30, anchor=tk.CENTER)
+            elif col == 'ID':
                 # Hide ID column
                 self.trend_change_tree.column(col, width=0, stretch=False)
             elif col == 'Status':
@@ -4738,10 +5139,16 @@ class StockerApp:
                 elif was_correct is False:
                     status = "Incorrect ❌"
             
+            symbol = pred['symbol']
+            # Favorite status
+            is_fav = symbol in self.monitored_stocks
+            fav_char = "★" if is_fav else "☆"
+
             pred_id = pred.get('id', '')
             values = (
+                fav_char,
                 str(pred_id),  # ID column (hidden)
-                pred['symbol'],
+                symbol,
                 curr_trend_display,
                 change_display,
                 f"{pred.get('estimated_days', 0)}d",
@@ -4759,6 +5166,76 @@ class StockerApp:
                 item_tags.append('bullish_tag')
             elif 'Bearish' in change_display or 'Downtrend' in change_display:
                 item_tags.append('bearish_tag')
+            
+            # Add Fav tag
+            if is_fav:
+                item_tags.append('fav_active')
+            else:
+                item_tags.append('fav_inactive')
+                
+            self.trend_change_tree.item(item, tags=tuple(item_tags))
+            
+    def _on_momentum_changes_tree_click(self, event):
+        """Handle clicks on momentum changes tree (specifically Favorite column)"""
+        region = self.momentum_changes_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+            
+        column = self.momentum_changes_tree.identify_column(event.x)
+        item_id = self.momentum_changes_tree.identify_row(event.y)
+        
+        if not item_id:
+            return
+            
+        # Check if Fav column (index 0 which is #1)
+        if column == '#1':
+            values = self.momentum_changes_tree.item(item_id, 'values')
+            if values and len(values) > 2:
+                symbol = values[2] # Symbol is now at index 2
+                self._toggle_trend_monitoring(symbol, quiet=True)
+                
+                # Refresh UI
+                self._update_momentum_changes_display()
+                if hasattr(self, '_update_trend_change_display'):
+                    self._update_trend_change_display()
+
+    def _on_trend_change_tree_click(self, event):
+        """Handle clicks on trend change tree (specifically Fav and Delete columns)"""
+        region = self.trend_change_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+            
+        column = self.trend_change_tree.identify_column(event.x)
+        item_id = self.trend_change_tree.identify_row(event.y)
+        
+        if not item_id:
+            return
+            
+        # Fav column (index 0 -> #1)
+        if column == '#1':
+            values = self.trend_change_tree.item(item_id, 'values')
+            if values and len(values) > 2:
+                symbol = values[2] # Symbol is at index 2 (Fav, ID, Symbol)
+                self._toggle_trend_monitoring(symbol, quiet=True)
+                
+                # Refresh UI
+                self._update_trend_change_display()
+                self._update_momentum_changes_display()
+            return
+
+        # Delete column (index 9 -> #10)
+        if column == '#10': 
+            values = self.trend_change_tree.item(item_id, 'values')
+            if values and len(values) > 1:
+                # ID is at index 1 (Fav, ID, ...)
+                try:
+                    prediction_id = int(values[1])
+                    if self.trend_change_tracker.delete_prediction(prediction_id):
+                        self.trend_change_tree.delete(item_id)
+                        # Remove from local list if exists
+                        self.trend_change_predictions = [p for p in self.trend_change_predictions if p.get('id') != prediction_id]
+                except ValueError:
+                    pass
             
             # Tag based on confidence
             if pred['confidence'] >= 75:
@@ -4822,22 +5299,28 @@ class StockerApp:
         list_inner = tk.Frame(list_card, bg=theme['card_bg'])
         list_inner.pack(fill=tk.BOTH, expand=True)
         
-        columns = ('Time', 'Symbol', 'Type', 'From', 'To', 'Changes', 'Confidence', 'Strategy')
+        columns = ('Fav', 'Time', 'Symbol', 'Type', 'From', 'To', 'Changes', 'Confidence', 'Strategy', 'Status')
         self.momentum_changes_tree = ttk.Treeview(list_inner, columns=columns, show='headings', height=15)
         
         for col in columns:
             self.momentum_changes_tree.heading(col, text=col, anchor=tk.CENTER)
-            if col == 'Time':
+            if col == 'Fav':
+                self.momentum_changes_tree.column(col, width=30, anchor=tk.CENTER)
+            elif col == 'Time':
                 self.momentum_changes_tree.column(col, width=150, anchor=tk.CENTER)
             elif col == 'Symbol':
                 self.momentum_changes_tree.column(col, width=80, anchor=tk.CENTER)
             elif col == 'Changes':
                 self.momentum_changes_tree.column(col, width=300, anchor=tk.W)
-            else:
+            elif col == 'Status':
                 self.momentum_changes_tree.column(col, width=100, anchor=tk.CENTER)
+            else:
+                self.momentum_changes_tree.column(col, width=90, anchor=tk.CENTER)
         
         # Bind double-click to analyze stock
         self.momentum_changes_tree.bind('<Double-1>', self._on_momentum_changes_tree_double_click)
+        # Bind click for favorite toggle
+        self.momentum_changes_tree.bind('<Button-1>', self._on_momentum_changes_tree_click)
         
         tree_scrollbar = ModernScrollbar(list_inner, command=self.momentum_changes_tree.yview, theme=theme)
         self.momentum_changes_tree.configure(yscrollcommand=tree_scrollbar.set)
@@ -4889,7 +5372,24 @@ class StockerApp:
             detected_changes = changes.get('changes', [])
             changes_str = ", ".join(detected_changes) if detected_changes else "No specific changes"
             
+            # Status
+            status = change_info.get('status', 'pending').title()
+            verified = change_info.get('verified', False)
+            
+            if verified:
+                if status.lower() == 'correct':
+                    status = "Correct ✅"
+                elif status.lower() == 'incorrect':
+                    status = "Incorrect ❌"
+                elif status.lower() == 'neutral':
+                    status = "Neutral ➖"
+            
+            # Favorite status
+            is_fav = symbol in self.monitored_stocks
+            fav_char = "★" if is_fav else "☆"
+
             values = (
+                fav_char,
                 timestamp,
                 symbol,
                 change_type,
@@ -4897,7 +5397,8 @@ class StockerApp:
                 new_action,
                 changes_str,
                 f"{recommendation.get('confidence', 50)}%",
-                change_info.get('strategy', 'mixed').title()
+                change_info.get('strategy', 'mixed').title(),
+                status
             )
             
             item = self.momentum_changes_tree.insert('', tk.END, values=values)
@@ -4909,19 +5410,116 @@ class StockerApp:
                 self.momentum_changes_tree.item(item, tags=('sell_action',))
             else:
                 self.momentum_changes_tree.item(item, tags=('hold_action',))
+                
+            # Apply Fav tag for color
+            if is_fav:
+                self.momentum_changes_tree.item(item, tags=self.momentum_changes_tree.item(item, 'tags') + ('fav_active',))
+            else:
+                self.momentum_changes_tree.item(item, tags=self.momentum_changes_tree.item(item, 'tags') + ('fav_inactive',))
         
         # Configure tags
         self.momentum_changes_tree.tag_configure('buy_action', foreground=theme['success'])
         self.momentum_changes_tree.tag_configure('sell_action', foreground=theme['warning'])
         self.momentum_changes_tree.tag_configure('hold_action', foreground=theme['text_secondary'])
+        self.momentum_changes_tree.tag_configure('fav_active', foreground='#FFD700')  # Gold
+        self.momentum_changes_tree.tag_configure('fav_inactive', foreground=theme['text_secondary'])
+
+    def _on_momentum_changes_tree_click(self, event):
+        """Handle clicks on momentum changes tree (specifically Favorite column)"""
+        try:
+            region = self.momentum_changes_tree.identify("region", event.x, event.y)
+            logger.info(f"DEBUG: Mom Tree Click Region: {region} at {event.x},{event.y}")
+            if region != "cell":
+                return
+                
+            column = self.momentum_changes_tree.identify_column(event.x)
+            item_id = self.momentum_changes_tree.identify_row(event.y)
+            logger.info(f"DEBUG: Mom Tree Click Column: {column}, Item: {item_id}")
+            
+            if not item_id:
+                return
+                
+            # Check if Fav column (index 0 which is #1)
+            # Treeview columns are #1, #2, #3... so index 0 is indeed #1
+            if column == '#1':
+                values = self.momentum_changes_tree.item(item_id, 'values')
+                logger.info(f"DEBUG: Mom Tree Values: {values}")
+                if values and len(values) > 2:
+                    symbol = values[2] # Symbol is now at index 2
+                    logger.info(f"DEBUG: Toggling {symbol} from Mom Tree")
+                    self._toggle_trend_monitoring(symbol, quiet=True)
+                    
+                    # Refresh UI
+                    self._update_momentum_changes_display()
+                    if hasattr(self, '_update_trend_change_display'):
+                        self._update_trend_change_display()
+        except Exception as e:
+            logger.error(f"Error in momentum click handler: {e}")
+
+    def _on_trend_change_tree_click(self, event):
+        """Handle clicks on trend change tree (specifically Fav and Delete columns)"""
+        try:
+            region = self.trend_change_tree.identify("region", event.x, event.y)
+            logger.info(f"DEBUG: Trend Tree Click Region: {region} at {event.x},{event.y}")
+            if region != "cell":
+                return
+                
+            column = self.trend_change_tree.identify_column(event.x)
+            item_id = self.trend_change_tree.identify_row(event.y)
+            logger.info(f"DEBUG: Trend Tree Click Column: {column}, Item: {item_id}")
+            
+            if not item_id:
+                return
+                
+            # Fav column (index 0 -> #1)
+            if column == '#1':
+                values = self.trend_change_tree.item(item_id, 'values')
+                logger.info(f"DEBUG: Trend Tree Values: {values}")
+                if values and len(values) > 2:
+                    symbol = values[2] # Symbol is at index 2 (Fav, ID, Symbol)
+                    logger.info(f"DEBUG: Toggling {symbol} from Trend Tree")
+                    self._toggle_trend_monitoring(symbol, quiet=True)
+                    
+                    # Refresh UI
+                    self._update_trend_change_display()
+                    self._update_momentum_changes_display()
+                return
+
+            # Delete column (index 9 -> #10)
+            if column == '#10': 
+                values = self.trend_change_tree.item(item_id, 'values')
+                if values and len(values) > 1:
+                    # ID is at index 1 (Fav, ID, ...)
+                    try:
+                        prediction_id = int(values[1])
+                        if self.trend_change_tracker.delete_prediction(prediction_id):
+                            self.trend_change_tree.delete(item_id)
+                            # Remove from local list if exists
+                            self.trend_change_predictions = [p for p in self.trend_change_predictions if p.get('id') != prediction_id]
+                    except ValueError:
+                        pass
+        except Exception as e:
+            logger.error(f"Error in trend click handler: {e}")
+            if values and len(values) > 1:
+                # ID is at index 1 (Fav, ID, ...)
+                try:
+                    prediction_id = int(values[1])
+                    if self.trend_change_tracker.delete_prediction(prediction_id):
+                        self.trend_change_tree.delete(item_id)
+                        # Remove from local list if exists
+                        self.trend_change_predictions = [p for p in self.trend_change_predictions if p.get('id') != prediction_id]
+                except ValueError:
+                    pass
+
 
     def _on_momentum_changes_tree_double_click(self, event):
         """Handle double-click to analyze stock from momentum changes"""
         item = self.momentum_changes_tree.identify_row(event.y)
         if item:
             values = self.momentum_changes_tree.item(item, 'values')
-            if values and len(values) > 1:
-                symbol = values[1]
+            # Columns: Fav(0), Time(1), Symbol(2), Type(3), ...
+            if values and len(values) > 2:
+                symbol = values[2]  # Symbol is at index 2 (after Fav and Time)
                 # Switch to analysis tab and analyze
                 self.symbol_entry.delete(0, tk.END)
                 self.symbol_entry.insert(0, symbol)
@@ -4938,6 +5536,365 @@ class StockerApp:
             self.momentum_monitor.clear_history()
             self.momentum_changes_history = self.momentum_monitor.history
             self._update_momentum_changes_display()
+    
+    def _create_potentials_tab(self):
+        """Create the Potentials tab for tracking upcoming investment opportunities"""
+        theme = self.theme_manager.get_theme()
+        
+        # Header
+        header_frame = tk.Frame(self.potentials_frame, bg=theme['bg'])
+        header_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        title_label = tk.Label(header_frame, text="🎯 Potential Investments", 
+                              font=('Segoe UI', 14, 'bold'), bg=theme['bg'], fg=theme['fg'])
+        title_label.pack(side=tk.LEFT)
+        
+        # Scan scope dropdown
+        self.potentials_scope_var = tk.StringVar(value="predictions")
+        scope_frame = tk.Frame(header_frame, bg=theme['bg'])
+        scope_frame.pack(side=tk.RIGHT, padx=(0, 10))
+        
+        scope_label = tk.Label(scope_frame, text="Scope:", font=('Segoe UI', 9), 
+                              bg=theme['bg'], fg=theme['text_secondary'])
+        scope_label.pack(side=tk.LEFT, padx=(0, 5))
+        
+        scope_combo = ttk.Combobox(scope_frame, textvariable=self.potentials_scope_var,
+                                   values=["predictions", "market"], state="readonly", width=12)
+        scope_combo.pack(side=tk.LEFT)
+        
+        scan_btn = ModernButton(header_frame, text="🔍 Scan for Potentials", 
+                               command=self._scan_for_potentials, theme=theme)
+        scan_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        
+        refresh_btn = ModernButton(header_frame, text="🔄 Refresh", 
+                                  command=self._update_potentials_display, theme=theme)
+        refresh_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        
+        # Info label
+        info_label = tk.Label(self.potentials_frame, 
+                             text="Stocks predicted to hit a target price soon. Verified automatically when target reached or date passed.",
+                             font=('Segoe UI', 9), bg=theme['bg'], fg=theme['text_secondary'],
+                             justify=tk.LEFT)
+        info_label.pack(fill=tk.X, pady=(0, 15))
+        
+        # Treeview
+        list_card = ModernCard(self.potentials_frame, "", theme=theme, padding=15)
+        list_card.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+        
+        list_inner = tk.Frame(list_card, bg=theme['card_bg'])
+        list_inner.pack(fill=tk.BOTH, expand=True)
+        
+        columns = ('Fav', 'Symbol', 'Current', 'Target', 'Target Date', 'Confidence', 'Reasoning', 'Status')
+        self.potentials_tree = ttk.Treeview(list_inner, columns=columns, show='headings', height=15)
+        
+        for col in columns:
+            self.potentials_tree.heading(col, text=col, anchor=tk.CENTER)
+            if col == 'Fav':
+                self.potentials_tree.column(col, width=30, anchor=tk.CENTER)
+            elif col == 'Symbol':
+                self.potentials_tree.column(col, width=80, anchor=tk.CENTER)
+            elif col == 'Current' or col == 'Target':
+                self.potentials_tree.column(col, width=80, anchor=tk.CENTER)
+            elif col == 'Target Date':
+                self.potentials_tree.column(col, width=100, anchor=tk.CENTER)
+            elif col == 'Confidence':
+                self.potentials_tree.column(col, width=80, anchor=tk.CENTER)
+            elif col == 'Reasoning':
+                self.potentials_tree.column(col, width=250, anchor=tk.W)
+            else:
+                self.potentials_tree.column(col, width=100, anchor=tk.CENTER)
+        
+        # Bindings
+        self.potentials_tree.bind('<Double-1>', self._on_potentials_tree_double_click)
+        self.potentials_tree.bind('<Button-1>', self._on_potentials_tree_click)
+        
+        tree_scrollbar = ModernScrollbar(list_inner, command=self.potentials_tree.yview, theme=theme)
+        self.potentials_tree.configure(yscrollcommand=tree_scrollbar.set)
+        
+        self.potentials_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+        
+        # Stats card
+        stats_card = ModernCard(self.potentials_frame, "📊 Statistics", theme=theme, padding=10)
+        stats_card.pack(fill=tk.X, pady=(0, 15))
+        
+        self.potentials_stats_label = tk.Label(stats_card, text="No data yet", 
+                                               font=('Segoe UI', 9), bg=theme['card_bg'], fg=theme['fg'])
+        self.potentials_stats_label.pack()
+        
+        # Initial display
+        self._update_potentials_display()
+    
+    def _update_potentials_display(self):
+        """Update the potentials tree with current data"""
+        if not hasattr(self, 'potentials_tree'):
+            return
+        
+        theme = self.theme_manager.get_theme()
+        
+        # Clear tree
+        for item in self.potentials_tree.get_children():
+            self.potentials_tree.delete(item)
+        
+        # Get potentials (active first)
+        all_potentials = self.potentials_tracker.potentials
+        active = [p for p in all_potentials if p.get('status') == 'active']
+        verified = [p for p in all_potentials if p.get('status') == 'verified']
+        
+        for p in active + verified:
+            symbol = p.get('symbol', '')
+            is_fav = symbol in self.monitored_stocks
+            fav_char = "★" if is_fav else "☆"
+            
+            status = p.get('status', 'active').title()
+            if p.get('verified'):
+                status = "Correct ✅" if p.get('was_correct') else "Incorrect ❌"
+            
+            # Format date
+            target_date = p.get('target_date', '')
+            try:
+                dt = datetime.fromisoformat(target_date)
+                target_date_str = dt.strftime("%Y-%m-%d")
+            except:
+                target_date_str = target_date
+            
+            values = (
+                fav_char,
+                symbol,
+                f"${p.get('current_price', 0):.2f}",
+                f"${p.get('target_price', 0):.2f}",
+                target_date_str,
+                f"{p.get('confidence', 0):.0f}%",
+                p.get('reasoning', '')[:50] + "..." if len(p.get('reasoning', '')) > 50 else p.get('reasoning', ''),
+                status
+            )
+            
+            item = self.potentials_tree.insert('', tk.END, values=values)
+            
+            # Tags
+            tags = []
+            if p.get('was_correct') is True:
+                tags.append('correct')
+            elif p.get('was_correct') is False:
+                tags.append('incorrect')
+            if is_fav:
+                tags.append('fav_active')
+            self.potentials_tree.item(item, tags=tuple(tags))
+        
+        # Configure tags
+        self.potentials_tree.tag_configure('correct', foreground=theme['success'])
+        self.potentials_tree.tag_configure('incorrect', foreground=theme['error'])
+        self.potentials_tree.tag_configure('fav_active', foreground='#FFD700')
+        
+        # Update stats
+        stats = self.potentials_tracker.get_statistics()
+        stats_text = f"Total: {stats['total']} | Active: {stats['active']} | Verified: {stats['verified']} | Accuracy: {stats['accuracy']:.1f}%"
+        if hasattr(self, 'potentials_stats_label'):
+            self.potentials_stats_label.config(text=stats_text)
+    
+    def _scan_for_potentials(self):
+        """Scan stocks for potential investment opportunities"""
+        scope = self.potentials_scope_var.get() if hasattr(self, 'potentials_scope_var') else 'predictions'
+        
+        # Determine stock list
+        if scope == 'predictions':
+            # Get symbols from existing predictions
+            symbols = list(set([p.get('symbol') for p in self.predictions_tracker.predictions if p.get('symbol')]))
+            if not symbols:
+                messagebox.showinfo("No Data", "No predictions found. Add some predictions first or scan the market.")
+                return
+        else:
+            # S&P 500 sample (top 50 for speed)
+            symbols = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'JPM', 'V', 'WMT',
+                      'JNJ', 'UNH', 'PG', 'HD', 'MA', 'BAC', 'XOM', 'DIS', 'PFE', 'CSCO',
+                      'INTC', 'VZ', 'T', 'CMCSA', 'KO', 'PEP', 'ABT', 'MRK', 'ORCL', 'CRM',
+                      'NFLX', 'AMD', 'COST', 'TXN', 'QCOM', 'LOW', 'UNP', 'MS', 'GS', 'BLK',
+                      'SCHW', 'AXP', 'C', 'IBM', 'GE', 'RTX', 'BA', 'CAT', 'MMM', 'HON']
+        
+        total = len(symbols)
+        potentials_found = []
+        
+        # Update status
+        self.root.after(0, lambda: self._update_status(f"Scanning {total} stocks for potentials..."))
+        
+        def scan_in_background():
+            nonlocal potentials_found
+            for i, symbol in enumerate(symbols):
+                try:
+                    # Update status bar
+                    self.root.after(0, lambda s=symbol, idx=i: self._update_status(
+                        f"Scanning {s}... ({idx+1}/{total})"))
+                    
+                    # Fetch full analysis data (not just basic stock data)
+                    data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=True)
+                    if not data or data.get('price', 0) <= 0:
+                        continue
+                    
+                    current_price = data.get('price', 0)
+                    
+                    # Get the required data structures for predict_trend_changes
+                    # history_data needs to be a dict with 'data' key containing the list
+                    history_list = data.get('history', [])
+                    if isinstance(history_list, list):
+                        history_data = {'data': history_list}
+                    else:
+                        history_data = history_list if isinstance(history_list, dict) else {'data': []}
+                    
+                    indicators = data.get('indicators', {})
+                    price_action = data.get('price_action', {'trend': 'sideways'})
+                    
+                    # Use trend change predictor for dip predictions
+                    predictions = self.trend_change_predictor.predict_trend_changes(
+                        symbol, history_data, indicators, price_action
+                    )
+                    
+                    found_for_symbol = False
+                    
+                    # Look for bullish reversal or dip opportunities (FUTURE)
+                    for pred in predictions:
+                        predicted_change = pred.get('predicted_change', '').lower()
+                        if 'bullish' in predicted_change:
+                            confidence = pred.get('confidence', 0)
+                            if confidence >= 50:  # Minimum threshold
+                                target_price = pred.get('target_low_price', current_price * 0.95)
+                                target_date = pred.get('estimated_date', '')
+                                reasoning = pred.get('reasoning', 'Bullish reversal expected')
+                                
+                                # Add to tracker
+                                self.potentials_tracker.add_potential(
+                                    symbol=symbol,
+                                    current_price=current_price,
+                                    target_price=target_price,
+                                    target_date=target_date,
+                                    confidence=confidence,
+                                    reasoning=f"📅 FUTURE: {reasoning}",
+                                    indicators=pred.get('key_indicators', {})
+                                )
+                                potentials_found.append(symbol)
+                                found_for_symbol = True
+                                break  # One per symbol
+                    
+                    # Also check for CURRENT buy opportunities
+                    if not found_for_symbol:
+                        rsi = indicators.get('rsi', 50)
+                        mfi = indicators.get('mfi', 50)
+                        macd_diff = indicators.get('macd_diff', 0)
+                        trend = price_action.get('trend', 'sideways')
+                        
+                        logger.info(f"DEBUG {symbol}: RSI={rsi:.1f}, MFI={mfi:.1f}, trend={trend}")
+                        
+                        # Current buy signals (relaxed thresholds)
+                        buy_signals = []
+                        confidence = 50
+                        
+                        # RSI signals
+                        if rsi < 30:
+                            buy_signals.append(f"RSI oversold ({rsi:.1f})")
+                            confidence += 20
+                        elif rsi < 45:
+                            buy_signals.append(f"RSI low ({rsi:.1f})")
+                            confidence += 8
+                        
+                        # MFI signals
+                        if mfi < 30:
+                            buy_signals.append(f"MFI low ({mfi:.1f})")
+                            confidence += 10
+                        
+                        # Golden cross
+                        if indicators.get('golden_cross', False):
+                            buy_signals.append("Golden cross")
+                            confidence += 20
+                        
+                        # MACD bullish
+                        if macd_diff > 0:
+                            buy_signals.append("MACD bullish")
+                            confidence += 5
+                        
+                        # Support level
+                        if price_action.get('at_support', False):
+                            buy_signals.append("At support")
+                            confidence += 10
+                        
+                        # Dip in uptrend
+                        if trend == 'uptrend':
+                            buy_signals.append("Uptrend")
+                            confidence += 10
+                            if rsi < 50:
+                                buy_signals.append("Pullback opportunity")
+                                confidence += 5
+                        
+                        # Downtrend reversal potential
+                        if trend == 'downtrend' and rsi < 35:
+                            buy_signals.append("Reversal potential")
+                            confidence += 10
+                        
+                        logger.info(f"DEBUG {symbol}: signals={buy_signals}, confidence={confidence}")
+                        
+                        # Lower threshold to 50 to catch more
+                        if buy_signals and confidence >= 50:
+                            from datetime import timedelta
+                            target_date = (datetime.now() + timedelta(days=7)).isoformat()
+                            
+                            self.potentials_tracker.add_potential(
+                                symbol=symbol,
+                                current_price=current_price,
+                                target_price=current_price,
+                                target_date=target_date,
+                                confidence=min(confidence, 90),
+                                reasoning=f"🔥 NOW: {', '.join(buy_signals[:3])}",  # Top 3 reasons
+                                indicators=indicators
+                            )
+                            potentials_found.append(symbol)
+                            logger.info(f"DEBUG {symbol}: ADDED as potential!")
+                                
+                except Exception as e:
+                    logger.error(f"Error scanning {symbol}: {e}")
+            
+            # Done
+            self.root.after(0, lambda: self._update_status("Scan complete"))
+            self.root.after(0, self._update_potentials_display)
+            self.root.after(0, lambda: messagebox.showinfo("Scan Complete", 
+                f"Found {len(potentials_found)} potential opportunities!"))
+        
+        thread = threading.Thread(target=scan_in_background)
+        thread.daemon = True
+        thread.start()
+    
+    def _on_potentials_tree_click(self, event):
+        """Handle clicks on potentials tree (Fav column)"""
+        try:
+            region = self.potentials_tree.identify("region", event.x, event.y)
+            if region != "cell":
+                return
+            
+            column = self.potentials_tree.identify_column(event.x)
+            item_id = self.potentials_tree.identify_row(event.y)
+            
+            if not item_id:
+                return
+            
+            # Fav column (#1)
+            if column == '#1':
+                values = self.potentials_tree.item(item_id, 'values')
+                if values and len(values) > 1:
+                    symbol = values[1]
+                    self._toggle_trend_monitoring(symbol, quiet=True)
+                    self._update_potentials_display()
+        except Exception as e:
+            logger.error(f"Error in potentials click handler: {e}")
+    
+    def _on_potentials_tree_double_click(self, event):
+        """Handle double-click to analyze stock from potentials"""
+        item = self.potentials_tree.identify_row(event.y)
+        if item:
+            values = self.potentials_tree.item(item, 'values')
+            if values and len(values) > 1:
+                symbol = values[1]
+                self.symbol_entry.delete(0, tk.END)
+                self.symbol_entry.insert(0, symbol)
+                self.notebook.select(0)
+                self._analyze_stock()
+
     
     def _on_trend_change_tree_click(self, event):
         """Handle click on trend change tree, specifically for delete column"""
@@ -5503,6 +6460,186 @@ Confidence: {prediction['confidence']:.0f}%
         thread.daemon = True
         thread.start()
     
+    def _scan_for_dips(self):
+        """Scan market for oversold dip buying opportunities"""
+        # Show loading screen
+        theme = self.theme_manager.get_theme()
+        if self.loading_screen:
+            self.loading_screen.theme = theme
+        else:
+            self.loading_screen = LoadingScreen(self.root, theme)
+        
+        # ~120 stocks, ~2-3s each = ~4-6 minutes
+        est_time = 300
+        
+        self.loading_screen.show(
+            "📉 Scanning Market for Dips", 
+            processes=["Initializing dip scanner..."],
+            cancel_callback=self._cancel_dip_scan,
+            estimated_time=est_time
+        )
+        
+        # Disable button during scan
+        if hasattr(self, 'sidebar_dip_btn'):
+            self.sidebar_dip_btn.config(state='disabled')
+        
+        # Reset cancel flag
+        self.dip_scan_cancelled = False
+        
+        # Run scan in thread
+        thread = threading.Thread(target=self._perform_dip_scan)
+        thread.daemon = True
+        thread.start()
+    
+    def _cancel_dip_scan(self):
+        """Cancel the dip scan"""
+        self.dip_scan_cancelled = True
+        logger.info("Dip scan cancelled by user")
+    
+    def _perform_dip_scan(self):
+        """Perform dip scan in background thread"""
+        try:
+            def progress_callback(current, total, symbol):
+                if self.dip_scan_cancelled:
+                    return
+                pct = int((current / total) * 100)
+                self.root.after(0, lambda: self.loading_screen.update_processes([
+                    f"Scanning {symbol}... ({current}/{total})",
+                    f"Progress: {pct}%"
+                ]) if self.loading_screen else None)
+            
+            dips = self.market_scanner.scan_for_dips(
+                max_results=30,
+                rsi_threshold=35.0,
+                mfi_threshold=25.0,
+                progress_callback=progress_callback
+            )
+            
+            if self.dip_scan_cancelled:
+                return
+            
+            # Show results on main thread
+            self.root.after(0, lambda: self._display_dip_results(dips))
+            
+        except Exception as e:
+            logger.error(f"Dip scan error: {e}")
+            self.root.after(0, lambda: messagebox.showerror("Scan Error", f"Error scanning for dips: {e}"))
+        finally:
+            # Hide loading and re-enable button
+            self.root.after(0, self._finish_dip_scan)
+    
+    def _finish_dip_scan(self):
+        """Clean up after dip scan"""
+        if self.loading_screen:
+            self.loading_screen.hide()
+        if hasattr(self, 'sidebar_dip_btn'):
+            self.sidebar_dip_btn.config(state='normal')
+    
+    def _display_dip_results(self, dips: list):
+        """Display dip scan results in a popup window"""
+        theme = self.theme_manager.get_theme()
+        
+        # Create results window
+        dip_window = tk.Toplevel(self.root)
+        dip_window.title("📉 Market Dip Opportunities")
+        dip_window.config(bg=theme['bg'])
+        dip_window.geometry("900x700")
+        
+        # Header
+        header = tk.Label(dip_window, text="📉 Market Dip Opportunities",
+                         bg=theme['bg'], fg=theme['accent'], font=('Segoe UI', 18, 'bold'))
+        header.pack(pady=(20, 5))
+        
+        # Summary
+        summary_text = f"Found {len(dips)} oversold stocks (RSI < 35 or MFI < 25)"
+        summary_label = tk.Label(dip_window, text=summary_text,
+                               bg=theme['bg'], fg=theme['text_secondary'], font=('Segoe UI', 11))
+        summary_label.pack(pady=(0, 15))
+        
+        if not dips:
+            no_dips_label = tk.Label(dip_window, 
+                                    text="🎉 No oversold stocks found right now.\nThe market is not in a dip condition.",
+                                    bg=theme['bg'], fg=theme['text_secondary'], 
+                                    font=('Segoe UI', 12), justify=tk.CENTER)
+            no_dips_label.pack(pady=50)
+            return
+        
+        # Save to Potential Trade tab
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        self.potential_text.insert(tk.END, f"\n\n{'='*60}\n")
+        self.potential_text.insert(tk.END, f"📉 Market Dip Scan: {timestamp}\n")
+        self.potential_text.insert(tk.END, f"{'='*60}\n")
+        self.potential_text.insert(tk.END, f"{summary_text}\n\n")
+        
+        # Scrollable frame
+        canvas = tk.Canvas(dip_window, bg=theme['bg'], highlightthickness=0)
+        scrollbar = ModernScrollbar(dip_window, command=canvas.yview, theme=theme)
+        scroll_frame = tk.Frame(canvas, bg=theme['bg'])
+        
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.create_window((0, 0), window=scroll_frame, anchor=tk.NW)
+        
+        # Mousewheel scrolling
+        def on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind("<MouseWheel>", on_mousewheel)
+        
+        # Display each dip opportunity
+        for dip in dips:
+            card = ModernCard(scroll_frame, f"💎 {dip['symbol']} - {dip['name']}", theme=theme, padding=15)
+            card.pack(fill=tk.X, padx=20, pady=10)
+            
+            rsi = dip.get('rsi', 50)
+            mfi = dip.get('mfi', 50)
+            dip_score = dip.get('dip_score', 0)
+            potential = dip.get('potential_gain', 0)
+            
+            # RSI/MFI bars
+            rsi_bar_len = 15
+            rsi_filled = int((rsi / 100) * rsi_bar_len)
+            rsi_bar = "█" * rsi_filled + "░" * (rsi_bar_len - rsi_filled)
+            
+            mfi_filled = int((mfi / 100) * rsi_bar_len)
+            mfi_bar = "█" * mfi_filled + "░" * (rsi_bar_len - mfi_filled)
+            
+            info_text = f"📊 Dip Score: {dip_score:.1f}/100 (Higher = Deeper Dip)\n\n"
+            info_text += f"🔴 RSI: [{rsi_bar}] {rsi:.1f} {'⚠️ OVERSOLD' if rsi < 30 else ''}\n"
+            info_text += f"🔴 MFI: [{mfi_bar}] {mfi:.1f} {'⚠️ OVERSOLD' if mfi < 20 else ''}\n"
+            info_text += f"📈 Trend: {dip.get('trend', 'Unknown')}\n\n"
+            info_text += f"💰 Current Price: ${dip['price']:,.2f}\n"
+            info_text += f"🎯 Target (EMA20): ${dip.get('target_price', 0):,.2f}\n"
+            info_text += f"🛑 Stop Loss: ${dip.get('stop_loss', 0):,.2f}\n"
+            info_text += f"📈 Potential Gain: +{potential:.1f}%\n\n"
+            info_text += f"📝 {dip.get('reasoning', '')}"
+            
+            info_label = tk.Label(card.content_frame, text=info_text, bg=theme['card_bg'],
+                                fg=theme['fg'], font=('Segoe UI', 10), justify=tk.LEFT)
+            info_label.pack(anchor=tk.W)
+            
+            # Analyze button
+            analyze_btn = ModernButton(card.content_frame, f"Analyze {dip['symbol']}",
+                                      command=lambda s=dip['symbol']: self._analyze_symbol_from_rec(s, dip_window),
+                                      theme=theme)
+            analyze_btn.pack(fill=tk.X, pady=(10, 0))
+            
+            # Save to Potential Trade tab
+            self.potential_text.insert(tk.END, f"─" * 50 + "\n")
+            self.potential_text.insert(tk.END, f"💎 {dip['symbol']} - {dip['name']}\n")
+            self.potential_text.insert(tk.END, f"   RSI: {rsi:.1f} | MFI: {mfi:.1f} | Dip Score: {dip_score:.1f}\n")
+            self.potential_text.insert(tk.END, f"   Price: ${dip['price']:,.2f} | Target: ${dip.get('target_price', 0):,.2f} (+{potential:.1f}%)\n")
+            self.potential_text.insert(tk.END, f"   {dip.get('reasoning', '')}\n\n")
+        
+        self.potential_text.see(tk.END)
+        
+        def configure_scroll(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        scroll_frame.bind('<Configure>', configure_scroll)
+        
+        dip_window.update_idletasks()
+        scrollbar._update_slider()
+    
     def _cancel_market_scan(self):
         """Cancel the market scan"""
         self.market_scan_cancelled = True
@@ -5556,11 +6693,22 @@ Confidence: {prediction['confidence']:.0f}%
             processes = [scan_msg]
             self.root.after(0, lambda: self.loading_screen.update_processes(processes) if self.loading_screen else None)
             
+            def scan_progress_callback(current, total, symbol, found_count):
+                if self.market_scan_cancelled:
+                    return
+                pct = int((current / total) * 100)
+                # Update the last process line
+                self.root.after(0, lambda: self.loading_screen.update_processes([
+                    f"Scanning {symbol}... ({current}/{total}) - {pct}%",
+                    f"Found {found_count} potential plays"
+                ]) if self.loading_screen else None)
+                
             recommendations = self.market_scanner.scan_market(
                 strategy, 
                 max_results=100 if custom_tickers else 10,  # Allow many results for tracked stocks
                 predictions_tracker=self.predictions_tracker,
-                custom_tickers=custom_tickers
+                custom_tickers=custom_tickers,
+                progress_callback=scan_progress_callback
             )
             
             if self.market_scan_cancelled:
@@ -5762,7 +6910,20 @@ Confidence: {prediction['confidence']:.0f}%
             tk.Label(rec_window, text="(Buy opportunities saved to 'Potential Trade' tab)",
                     bg=theme['bg'], fg=theme['success'], font=('Segoe UI', 9)).pack(pady=(0, 10))
         
-        # Scrollable frame
+        # Sorting Controls
+        sort_frame = tk.Frame(rec_window, bg=theme['bg'])
+        sort_frame.pack(fill=tk.X, padx=20, pady=(0, 10))
+        
+        tk.Label(sort_frame, text="Sort by:", bg=theme['bg'], fg=theme['fg'], 
+                font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=(0, 10))
+        
+        sort_var = tk.StringVar(value="Default (Confidence)")
+        sort_combo = ttk.Combobox(sort_frame, textvariable=sort_var, 
+                                 values=["Default (Confidence)", "Signal (Buy/Sell)", "Trend (Bullish/Bearish)", "Potential Gain"],
+                                 state="readonly", width=25)
+        sort_combo.pack(side=tk.LEFT)
+        
+        # Scrollable frame setup
         canvas = tk.Canvas(rec_window, bg=theme['bg'], highlightthickness=0)
         scrollbar = ModernScrollbar(rec_window, command=canvas.yview, theme=theme)
         scroll_frame = tk.Frame(canvas, bg=theme['bg'])
@@ -5770,7 +6931,7 @@ Confidence: {prediction['confidence']:.0f}%
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.create_window((0, 0), window=scroll_frame, anchor=tk.NW)
+        canvas_window = canvas.create_window((0, 0), window=scroll_frame, anchor=tk.NW)
         
         # Mousewheel scrolling handler
         def on_mousewheel(event):
@@ -5780,12 +6941,7 @@ Confidence: {prediction['confidence']:.0f}%
                 canvas.yview_scroll(scroll_amount, "units")
             return "break"
         
-        # Bind mousewheel to canvas and all child widgets
-        canvas.bind("<MouseWheel>", on_mousewheel)
-        canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-3, "units") or "break")
-        canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(3, "units") or "break")
-        
-        # Also bind to scroll_frame and all its children
+        # Function to bind scroll to all children
         def bind_scroll_to_children(parent):
             parent.bind("<MouseWheel>", on_mousewheel)
             parent.bind("<Button-4>", lambda e: canvas.yview_scroll(-3, "units") or "break")
@@ -5797,64 +6953,141 @@ Confidence: {prediction['confidence']:.0f}%
                     child.bind("<Button-5>", lambda e: canvas.yview_scroll(3, "units") or "break")
                     if isinstance(child, tk.Frame):
                         bind_scroll_to_children(child)
-        
-        bind_scroll_to_children(scroll_frame)
-        
-        # Display each recommendation
-        for i, rec in enumerate(recommendations):
-            card = ModernCard(scroll_frame, f"{rec['symbol']} - {rec['name']}", theme=theme, padding=15)
-            card.pack(fill=tk.X, padx=20, pady=10)
+
+        # Main render function
+        def render_recommendations(recs_to_show):
+            # Clear existing
+            for widget in scroll_frame.winfo_children():
+                widget.destroy()
+                
+            # Display each recommendation
+            for i, rec in enumerate(recs_to_show):
+                card = ModernCard(scroll_frame, f"{rec['symbol']} - {rec['name']}", theme=theme, padding=15)
+                card.pack(fill=tk.X, padx=20, pady=10)
+                
+                # Determine actual market trend from reasoning
+                action = rec.get('action', 'BUY')
+                reasoning = rec.get('reasoning', '').lower()
+                
+                if 'uptrend' in reasoning or 'bullish' in reasoning or 'momentum' in reasoning:
+                    actual_trend = "BULLISH 📈"
+                    trend_val = 2
+                elif 'downtrend' in reasoning or 'bearish' in reasoning or 'falling' in reasoning:
+                    actual_trend = "BEARISH 📉"
+                    trend_val = 0
+                else:
+                    actual_trend = "NEUTRAL ↔️"
+                    trend_val = 1
+                
+                # Store trend value for sorting if needed later (though we sort list before calling this)
+                rec['_trend_val'] = trend_val
+                
+                # Create action context
+                if action == 'BUY':
+                    action_context = "BUY (Accumulate)" if 'downtrend' in reasoning else "BUY (Momentum)"
+                elif action == 'SELL':
+                    action_context = "SELL (Take Profits)" if 'uptrend' in reasoning or 'overbought' in reasoning else "SELL (Exit)"
+                else:
+                    action_context = "HOLD (Wait)"
+                
+                # Visual confidence bar
+                conf = rec.get('confidence', 0)
+                bar_len = 15
+                filled = int((conf / 100) * bar_len)
+                conf_bar = "█" * filled + "░" * (bar_len - filled)
+                
+                price_usd = f"${rec['price']:,.2f}"
+                price_eur = f"€{self.localization.convert_from_usd(rec['price'], 'EUR'):,.2f}"
+                
+                info_text = f"🔭 Market Trend: {actual_trend}\n"
+                info_text += f"📊 Strategy Signal: {action_context}\n"
+                info_text += f"🎯 Confidence: [{conf_bar}] {conf:.1f}%\n"
+                info_text += f"💰 Current Price: {price_usd} / {price_eur}\n\n"
+                
+                entry_usd = f"${rec['entry_price']:,.2f}"
+                entry_eur = f"€{self.localization.convert_from_usd(rec['entry_price'], 'EUR'):,.2f}"
+                info_text += f"🟢 Entry Target: {entry_usd} / {entry_eur}\n"
+                
+                target_usd = f"${rec['target_price']:,.2f}"
+                target_eur = f"€{self.localization.convert_from_usd(rec['target_price'], 'EUR'):,.2f}"
+                info_text += f"🏁 Target Exit:  {target_usd} / {target_eur}\n"
+                
+                stop_usd = f"${rec['stop_loss']:,.2f}"
+                stop_eur = f"€{self.localization.convert_from_usd(rec['stop_loss'], 'EUR'):,.2f}"
+                info_text += f"🛑 Stop Loss:    {stop_usd} / {stop_eur}\n\n"
+                info_text += f"📝 Reasoning: {rec['reasoning']}"
+                
+                info_label = tk.Label(card.content_frame, text=info_text, bg=theme['card_bg'],
+                                    fg=theme['fg'], font=('Segoe UI', 10), justify=tk.LEFT)
+                info_label.pack(anchor=tk.W)
+                
+                # Button to analyze this stock
+                analyze_btn = ModernButton(card.content_frame, f"Analyze {rec['symbol']}",
+                                          command=lambda s=rec['symbol']: self._analyze_symbol_from_rec(s, rec_window),
+                                          theme=theme)
+                analyze_btn.pack(fill=tk.X, pady=(10, 0))
+                
+                # Bind mousewheel to card components
+                card.bind("<MouseWheel>", on_mousewheel)
+                card.content_frame.bind("<MouseWheel>", on_mousewheel)
+                info_label.bind("<MouseWheel>", on_mousewheel)
+                analyze_btn.bind("<MouseWheel>", on_mousewheel)
             
-            # Determine sentiment based on action (Standard Logic)
-            action = rec.get('action', 'BUY') # Default to BUY for scanner (bullish opps)
-            sentiment = "BULLISH 🟢" if action == 'BUY' else "BEARISH 🔴" if action == 'SELL' else "NEUTRAL ⚪"
+            # Re-bind main scroll container
+            bind_scroll_to_children(scroll_frame)
             
-            # Visual confidence bar
-            conf = rec.get('confidence', 0)
-            bar_len = 15
-            filled = int((conf / 100) * bar_len)
-            conf_bar = "█" * filled + "░" * (bar_len - filled)
-            
-            price_usd = f"${rec['price']:,.2f}"
-            price_eur = f"€{self.localization.convert_from_usd(rec['price'], 'EUR'):,.2f}"
-            
-            info_text = f"🔭 Market Sentiment: {sentiment}\n"
-            info_text += f"📊 Strategy Signal: {action}\n"
-            info_text += f"🎯 Confidence: [{conf_bar}] {conf:.1f}%\n"
-            info_text += f"💰 Current Price: {price_usd} / {price_eur}\n\n"
-            
-            entry_usd = f"${rec['entry_price']:,.2f}"
-            entry_eur = f"€{self.localization.convert_from_usd(rec['entry_price'], 'EUR'):,.2f}"
-            info_text += f"🟢 Entry Target: {entry_usd} / {entry_eur}\n"
-            
-            target_usd = f"${rec['target_price']:,.2f}"
-            target_eur = f"€{self.localization.convert_from_usd(rec['target_price'], 'EUR'):,.2f}"
-            info_text += f"🏁 Target Exit:  {target_usd} / {target_eur}\n"
-            
-            stop_usd = f"${rec['stop_loss']:,.2f}"
-            stop_eur = f"€{self.localization.convert_from_usd(rec['stop_loss'], 'EUR'):,.2f}"
-            info_text += f"🛑 Stop Loss:    {stop_usd} / {stop_eur}\n\n"
-            info_text += f"📝 Reasoning: {rec['reasoning']}"
-            
-            info_label = tk.Label(card.content_frame, text=info_text, bg=theme['card_bg'],
-                                fg=theme['fg'], font=('Segoe UI', 10), justify=tk.LEFT)
-            info_label.pack(anchor=tk.W)
-            
-            # Button to analyze this stock
-            analyze_btn = ModernButton(card.content_frame, f"Analyze {rec['symbol']}",
-                                      command=lambda s=rec['symbol']: self._analyze_symbol_from_rec(s, rec_window),
-                                      theme=theme)
-            analyze_btn.pack(fill=tk.X, pady=(10, 0))
-            
-            # Bind mousewheel to card and its children
-            card.bind("<MouseWheel>", on_mousewheel)
-            card.content_frame.bind("<MouseWheel>", on_mousewheel)
-            info_label.bind("<MouseWheel>", on_mousewheel)
-            analyze_btn.bind("<MouseWheel>", on_mousewheel)
-        
-        def configure_scroll(event=None):
+            # Update scroll region
+            scroll_frame.update_idletasks()
             canvas.configure(scrollregion=canvas.bbox("all"))
+        
+        # Sort Handler
+        def on_sort_change(event=None):
+            sort_mode = sort_var.get()
+            sorted_recs = list(recommendations)
+            
+            if "Signal" in sort_mode:
+                # BUY -> SELL -> HOLD
+                action_priority = {'BUY': 2, 'SELL': 1, 'HOLD': 0}
+                sorted_recs.sort(key=lambda x: (action_priority.get(x.get('action', 'HOLD'), 0), x.get('confidence', 0)), reverse=True)
+            elif "Trend" in sort_mode:
+                # Sort by trend (need to pre-calc or calc on fly)
+                # To be efficient, we'll let the render loop parse trends, but for sorting we need to do it here
+                def get_trend_score(r):
+                    txt = r.get('reasoning', '').lower()
+                    if 'uptrend' in txt or 'bullish' in txt: return 2
+                    if 'downtrend' in txt or 'bearish' in txt: return 0
+                    return 1
+                sorted_recs.sort(key=lambda x: get_trend_score(x), reverse=True)
+            elif "Potential" in sort_mode:
+                # Potential Gain (Target - Entry) / Entry
+                def get_potential(r):
+                    entry = r.get('entry_price', 1)
+                    target = r.get('target_price', entry)
+                    return ((target - entry) / entry) if entry else 0
+                sorted_recs.sort(key=lambda x: get_potential(x), reverse=True)
+            else:
+                # Default: Confidence
+                sorted_recs.sort(key=lambda x: x.get('confidence', 0), reverse=True)
+                
+            render_recommendations(sorted_recs)
+        
+        sort_combo.bind("<<ComboboxSelected>>", on_sort_change)
+
+        # Configure resize handling for canvas window
+        def configure_scroll(event=None):
+            canvas.itemconfig(canvas_window, width=canvas.winfo_width())
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            
+        canvas.bind('<Configure>', configure_scroll)
         scroll_frame.bind('<Configure>', configure_scroll)
+        
+        # Bind mousewheel to canvas
+        canvas.bind("<MouseWheel>", on_mousewheel)
+        canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-3, "units") or "break")
+        canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(3, "units") or "break")
+        
+        # Initial Render
+        render_recommendations(recommendations)
         
         # Force initial scrollbar update
         rec_window.update_idletasks()
@@ -6481,14 +7714,29 @@ Confidence: {prediction['confidence']:.0f}%
                 current_price_display = recommendation.get('entry_price', 0)
                 logger.debug(f"Using fallback price from recommendation: {current_price_display}")
         
-        # Determine sentiment and visual indicators
-        analysis_reasoning = analysis.get('reasoning', '')
-        sentiment = "BULLISH 🟢" if action == 'SELL' else "BEARISH 🔴" if action == 'BUY' else "NEUTRAL ⚪"
-        if action == 'HOLD':
-            # Check if it's a "Wait for Entry" HOLD
-            if 'trend reversal predictions indicate price is likely to drop' in analysis_reasoning.lower() or \
-               'price predicted to drop' in analysis_reasoning.lower():
-                sentiment = "BULLISH (WAITING) 🟡"
+        # Determine actual market trend from price_action (NOT from text matching)
+        price_action = analysis.get('price_action', {})
+        trend_from_analysis = price_action.get('trend', 'sideways').lower()
+        analysis_reasoning = analysis.get('reasoning', '').lower()  # Still needed for action context
+        
+        # Use the actual computed trend from technical analysis
+        if trend_from_analysis == 'uptrend':
+            actual_trend = "BULLISH 📈"
+        elif trend_from_analysis == 'downtrend':
+            actual_trend = "BEARISH 📉"
+        else:
+            actual_trend = "NEUTRAL ↔️"
+        
+        # Create action context for aggressive strategy
+        if action == 'BUY':
+            action_context = "BUY (Accumulate)" if trend_from_analysis == 'downtrend' else "BUY (Momentum)"
+        elif action == 'SELL':
+            action_context = "SELL (Take Profits)" if trend_from_analysis == 'uptrend' or 'overbought' in analysis_reasoning else "SELL (Exit)"
+        else:
+            action_context = "HOLD (Wait)"
+            # Check if it's a strategic wait for entry
+            if trend_from_analysis == 'downtrend' or 'trend reversal' in analysis_reasoning:
+                action_context = "HOLD (Wait for Better Entry)"
         
         # Visual confidence bar
         bar_len = 20
@@ -6496,13 +7744,13 @@ Confidence: {prediction['confidence']:.0f}%
         conf_bar = "█" * filled + "░" * (bar_len - filled)
         
         header = f"{'='*60}\n"
-        header += f"🔭 MARKET SENTIMENT: {sentiment}\n"
-        header += f"📊 STRATEGY SIGNAL: {action} (Inverted Logic)\n"
+        header += f"🔭 MARKET TREND: {actual_trend}\n"
+        header += f"📊 STRATEGY SIGNAL: {action_context}\n"
         header += f"🎯 CONFIDENCE: [{conf_bar}] {confidence}%\n"
         
-        # Add warning if HOLD was recommended due to predicted price drop
-        if "WAITING" in sentiment:
-            header += f"   ⚠️ STRATEGY: Wait for lower price entry before bullish reversal\n"
+        # Add context for wait scenarios
+        if "Wait" in action_context:
+            header += f"   ⚠️ STRATEGY: Waiting for optimal entry point\n"
         
         header += f"{'='*60}\n\n"
         
@@ -8488,6 +9736,69 @@ By using this application, you acknowledge that you understand and accept these 
         )
         load_config_btn.pack(side=tk.LEFT, padx=5)
         
+        # Factory Reset Button
+        def do_factory_reset():
+            if messagebox.askyesno(
+                "⚠️ Factory Reset ML System?", 
+                "This will completely wipe all ML models, learning data, and statistics.\n\n"
+                "Your accuracy will reset to 0% and the system will relearn from scratch.\n\n"
+                "Are you sure you want to do this?",
+                icon='warning'
+            ):
+                try:
+                    # 1. Clear in-memory data structures to prevent save-on-exit
+                    logger.info("Clearing in-memory data structures...")
+                    if hasattr(self, 'hybrid_predictors'):
+                        for strategy, predictor in self.hybrid_predictors.items():
+                            predictor.performance_history = {'weight_based': [], 'ml_based': [], 'hybrid': []}
+                            predictor.ensemble_weights = {'rule': 1.0, 'ml': 0.0, 'ai': 0.0}
+                    
+                    if hasattr(self, 'learning_tracker'):
+                        self.learning_tracker.data = {}
+                        
+                    if hasattr(self, 'predictions_tracker'):
+                        self.predictions_tracker.verified_predictions = []
+                        self.predictions_tracker.predictions = []
+                        
+                    if hasattr(self, 'model_benchmarker'):
+                        self.model_benchmarker.benchmark_data = []
+
+                    # 2. Run reset scripts
+                    import force_clear_stats
+                    force_clear_stats.clear_performance_stats()
+                    
+                    import complete_reset
+                    # Redirect stdout to capture output
+                    import io
+                    import sys
+                    from contextlib import redirect_stdout
+                    
+                    f = io.StringIO()
+                    with redirect_stdout(f):
+                        complete_reset.main()
+                    
+                    messagebox.showinfo(
+                        "Reset Complete", 
+                        "System reset successfully!\n\n"
+                        "The application will now close immediately.\n"
+                        "Please restart it to begin fresh training."
+                    )
+                    
+                    # 3. Force exit immediately to skip any cleanup/save handlers
+                    import os
+                    os._exit(0)
+                    
+                except Exception as e:
+                    messagebox.showerror("Reset Failed", f"Error during reset: {e}")
+
+        reset_btn = ModernButton(
+            config_btn_frame,
+            "⚠️ Factory Reset",
+            command=do_factory_reset,
+            theme=theme
+        )
+        reset_btn.pack(side=tk.RIGHT, padx=20)
+        
         # Buttons
         btn_frame = tk.Frame(dialog, bg=theme['bg'])
         btn_frame.pack(pady=10)
@@ -9218,19 +10529,23 @@ By using this application, you acknowledge that you understand and accept these 
             return
 
         # Show strategy selection dialog
-        selected_strategies = self._show_backtest_strategy_selection()
-        if not selected_strategies:
+        result = self._show_backtest_strategy_selection()
+        if not result:
             return  # User cancelled
+
+        selected_strategies = result['strategies']
+        num_tests = result['num_tests']
 
         # Run in background
         def run():
-            success = self.backtester.run_test_now(selected_strategies=selected_strategies)
+            success = self.backtester.run_test_now(selected_strategies=selected_strategies, num_tests=num_tests)
             if success:
                 strategies_str = ", ".join([s.capitalize() for s in selected_strategies])
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Backtest Started",
                     f"🧪 Backtest started!\n\n"
-                    f"Testing strategies: {strategies_str}\n\n"
+                    f"Testing strategies: {strategies_str}\n"
+                    f"Tests per strategy: {num_tests}\n\n"
                     "The algorithm will test itself on random historical points.\n"
                     "Results will be available in 'View Backtest Results'."
                 ))
@@ -9247,7 +10562,7 @@ By using this application, you acknowledge that you understand and accept these 
         """Show dialog to select strategies for backtesting"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Select Strategies for Backtesting")
-        dialog.geometry("400x250")
+        dialog.geometry("400x320")
         dialog.transient(self.root)
         dialog.grab_set()  # Make dialog modal
         dialog.protocol("WM_DELETE_WINDOW", lambda: dialog.destroy())
@@ -9298,21 +10613,64 @@ By using this application, you acknowledge that you understand and accept these 
             )
             checkbox.pack(anchor=tk.W, pady=5)
         
+        # Number of tests input
+        tests_frame = tk.Frame(dialog, bg=theme['bg'])
+        tests_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        tk.Label(
+            tests_frame,
+            text="Number of Tests (per strategy):",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 10)
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        
+        num_tests_var = tk.StringVar(value="100")
+        num_tests_entry = tk.Entry(
+            tests_frame,
+            textvariable=num_tests_var,
+            width=8,
+            font=('Segoe UI', 10),
+            bg=theme.get('entry_bg', '#ffffff'),
+            fg=theme.get('entry_fg', '#000000')
+        )
+        num_tests_entry.pack(side=tk.LEFT)
+        
+        tk.Label(
+            tests_frame,
+            text="(200+ recommended)",
+            bg=theme['bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 8)
+        ).pack(side=tk.LEFT, padx=(10, 0))
+        
         # Buttons
         btn_frame = tk.Frame(dialog, bg=theme['bg'])
         btn_frame.pack(pady=20)
         
-        selected_strategies = []
+        result = {'strategies': [], 'num_tests': 100}
         
         def on_ok():
-            nonlocal selected_strategies
-            selected_strategies = [key for key, var in strategy_vars.items() if var.get()]
-            if not selected_strategies:
+            selected = [key for key, var in strategy_vars.items() if var.get()]
+            if not selected:
                 messagebox.showwarning("No Selection", "Please select at least one strategy.")
                 return
             
+            # Parse num_tests
+            try:
+                num_tests = int(num_tests_var.get())
+                if num_tests < 10:
+                    num_tests = 10
+                elif num_tests > 1000:
+                    num_tests = 1000
+            except ValueError:
+                num_tests = 100
+            
+            result['strategies'] = selected
+            result['num_tests'] = num_tests
+            
             # Save preferences
-            self.preferences.set_backtest_strategies(selected_strategies)
+            self.preferences.set_backtest_strategies(selected)
             dialog.destroy()
         
         def on_cancel():
@@ -9324,7 +10682,7 @@ By using this application, you acknowledge that you understand and accept these 
         # Wait for dialog to close
         dialog.wait_window()
         
-        return selected_strategies if selected_strategies else None
+        return result if result['strategies'] else None
     
     def _show_backtest_results(self):
         """Show backtest results dialog"""

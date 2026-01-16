@@ -1566,7 +1566,7 @@ class StockPredictionML:
             # Determine number of features to select (top 50-70 features to reduce overfitting)
             # Reduced feature count to prevent overfitting while maintaining performance
             total_features = len(X_train[0])
-            n_features_to_select = max(50, min(70, int(total_features * 0.5)))  # 50% of features, clamped to 50-70 range
+            n_features_to_select = max(30, min(50, int(total_features * 0.4)))  # Reduced to 30-50 features to prevent overfitting
             
             if self.feature_selection_method == 'rfe' and len(X_train) > n_features_to_select:
                 # Use RFE for feature selection
@@ -1791,7 +1791,7 @@ class StockPredictionML:
                 # Stacking ensemble: meta-learner learns optimal combination
                 self.model = StackingClassifier(
                     estimators=[('rf', rf), ('gb', gb), ('lr', lr)],
-                    final_estimator=LogisticRegression(max_iter=1000, C=0.2, class_weight='balanced', random_state=random_seed, penalty='l2'),  # Reduced C from 0.5 for stronger regularization
+                    final_estimator=LogisticRegression(max_iter=1000, C=0.1, class_weight='balanced', random_state=random_seed, penalty='l2'),  # Reduced C from 0.2 for stronger regularization
                     cv=5,  # 5-fold cross-validation for meta-learner
                     stack_method='predict_proba',  # Use probabilities for better combination
                     n_jobs=get_safe_n_jobs(ML_TRAINING_CPU_CORES)
@@ -1948,6 +1948,9 @@ class StockPredictionML:
         self.test_accuracy = float(test_score)
         
         # Prepare metadata
+        # CRITICAL: Store scaler's expected feature count to prevent mismatch during prediction
+        scaler_n_features = self.scaler.n_features_in_ if hasattr(self.scaler, 'n_features_in_') else X_train_scaled.shape[1]
+        
         self.metadata = {
             'strategy': self.strategy,
             'samples': len(training_samples),
@@ -1958,6 +1961,8 @@ class StockPredictionML:
             'trained_date': datetime.now().isoformat(),
             'feature_importance': self.feature_importance,
             'selected_features': self.selected_features.tolist() if self.selected_features is not None else None,
+            'selected_feature_names': selected_feature_names if 'selected_feature_names' in dir() else None,
+            'scaler_n_features': scaler_n_features,  # Store exact feature count scaler was trained on
             'feature_selection_threshold': self.feature_selection_threshold,
             'feature_selection_method': self.feature_selection_method,
             'total_features': len(self.feature_extractor.get_feature_names()),
@@ -2358,6 +2363,15 @@ class StockPredictionML:
                 
                 # Store the regime model
                 regime_models[regime] = regime_ml
+                
+                # Get scaler feature count from regime model
+                regime_scaler_n_features = regime_ml.scaler.n_features_in_ if hasattr(regime_ml.scaler, 'n_features_in_') else None
+                
+                # Get selected_feature_names from regime model's metadata
+                regime_selected_feature_names = None
+                if regime_ml.metadata and 'selected_feature_names' in regime_ml.metadata:
+                    regime_selected_feature_names = regime_ml.metadata['selected_feature_names']
+                
                 regime_metadata[regime] = {
                     'train_accuracy': train_acc,
                     'test_accuracy': test_acc,
@@ -2365,8 +2379,11 @@ class StockPredictionML:
                     'cv_std': cv_std,
                     'samples': len(regime_X),
                     'selected_features': regime_ml.selected_features.tolist() if regime_ml.selected_features is not None else None,
+                    'selected_feature_names': regime_selected_feature_names,  # Store feature names for prediction
+                    'scaler_n_features': regime_scaler_n_features,  # Store scaler's expected feature count
                     'num_features': len(regime_ml.selected_features) if regime_ml.selected_features is not None else None
                 }
+
                 
                 # Weighted average for overall metrics
                 overall_train_acc += train_acc * len(regime_X)
@@ -2598,26 +2615,35 @@ class StockPredictionML:
             logger.debug(f"Detected interactions: scaler expects {scaler_expected_features} features, we have {num_selected} after selection")
         
         if use_interactions:
-            # Get feature names for selected features
-            all_feature_names = self.feature_extractor.get_feature_names()
-            if self.selected_features is not None and len(self.selected_features) > 0:
-                selected_feature_names = [all_feature_names[i] for i in self.selected_features if i < len(all_feature_names)]
+            # IMPROVEMENT: Use stored feature names from metadata if available
+            # This ensures we use the EXACT same feature names that were used during training
+            selected_feature_names = None
+            if self.metadata and 'selected_feature_names' in self.metadata and self.metadata['selected_feature_names']:
+                selected_feature_names = self.metadata['selected_feature_names']
+                logger.debug(f"Using stored selected_feature_names from metadata ({len(selected_feature_names)} names)")
             else:
-                selected_feature_names = all_feature_names[:num_selected]
+                # Fallback: reconstruct from indices (may differ from training)
+                all_feature_names = self.feature_extractor.get_feature_names()
+                if self.selected_features is not None and len(self.selected_features) > 0:
+                    selected_feature_names = [all_feature_names[i] for i in self.selected_features if i < len(all_feature_names)]
+                else:
+                    selected_feature_names = all_feature_names[:num_selected]
+                logger.debug(f"Reconstructed selected_feature_names from indices ({len(selected_feature_names)} names)")
             
             # Add interactions using the same logic as training (method is on FeatureExtractor)
             try:
-                features, _ = self.feature_extractor._add_feature_interactions(features, selected_feature_names, fit=False)
-                logger.debug(f"Added feature interactions: {len(features[0])} features total (was {num_selected})")
+                features, interaction_names = self.feature_extractor._add_feature_interactions(features, selected_feature_names, fit=False)
+                logger.debug(f"Added {len(interaction_names)} feature interactions: {len(features[0])} features total (was {num_selected})")
             except Exception as e:
-                logger.warning(f"Could not add feature interactions during prediction: {e}. Using features without interactions.")
-                # If interactions fail, we can't proceed - return error
+                logger.warning(f"Could not add feature interactions during prediction: {e}. Falling back to rule-based.")
+                # If interactions fail, don't crash - return HOLD with low confidence
                 return {
                     'action': 'HOLD',
                     'confidence': 0.0,
                     'error': f'Feature interaction error: {e}',
                     'probabilities': {'BUY': 0.0, 'SELL': 0.0, 'HOLD': 100.0}
                 }
+
         
         # Final check: ensure feature count matches scaler expectations
         if scaler_expected_features is not None and len(features[0]) != scaler_expected_features:
@@ -2728,9 +2754,9 @@ class StockPredictionML:
         
         if is_binary_mode:
             if action == 'UP':
-                action = 'SELL'  # UP prediction = price goes up = sell signal
+                action = 'BUY'   # UP prediction = price goes up = buy signal
             elif action == 'DOWN':
-                action = 'BUY'  # DOWN prediction = price goes down = buy signal
+                action = 'SELL'  # DOWN prediction = price goes down = sell signal
             # Note: Binary mode doesn't predict HOLD, so we use the action directly
             logger.debug(f"Binary mode conversion: {original_action} → {action}")
 
@@ -2743,9 +2769,9 @@ class StockPredictionML:
             # Convert binary class names to BUY/SELL for compatibility
             display_name = class_name
             if class_name == 'UP':
-                display_name = 'SELL'
-            elif class_name == 'DOWN':
                 display_name = 'BUY'
+            elif class_name == 'DOWN':
+                display_name = 'SELL'
             prob_dict[display_name] = float(probabilities[i] * 100)
         
         # Ensure all expected actions are in prob_dict (for 3-class compatibility)
@@ -2962,6 +2988,10 @@ class StockPredictionML:
                                 # Extract selected_features and other info from regime's own metadata
                                 if 'selected_features' in regime_own_metadata:
                                     regime_metadata['selected_features'] = regime_own_metadata['selected_features']
+                                if 'selected_feature_names' in regime_own_metadata:
+                                    regime_metadata['selected_feature_names'] = regime_own_metadata['selected_feature_names']
+                                if 'scaler_n_features' in regime_own_metadata:
+                                    regime_metadata['scaler_n_features'] = regime_own_metadata['scaler_n_features']
                                 if 'train_accuracy' in regime_own_metadata:
                                     regime_metadata['train_accuracy'] = regime_own_metadata['train_accuracy']
                                 if 'test_accuracy' in regime_own_metadata:
@@ -2969,6 +2999,7 @@ class StockPredictionML:
                                 logger.debug(f"Loaded regime metadata from {regime_ml.metadata_file.name}")
                         except Exception as e:
                             logger.debug(f"Could not load regime metadata from {regime_ml.metadata_file.name}: {e}")
+
                     
                     regime_ml.metadata = regime_metadata if regime_metadata else {}
                     regime_ml.train_accuracy = regime_metadata.get('train_accuracy', 0) if regime_metadata else 0

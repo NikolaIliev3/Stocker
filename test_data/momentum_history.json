@@ -1,0 +1,18 @@
+[
+  {
+    "symbol": "AAPL",
+    "action": "BUY",
+    "changes": {
+      "recommendation": {
+        "action": "BUY"
+      }
+    },
+    "strategy": "mixed",
+    "time": "2024-01-01 12:00:00",
+    "price_at_change": 100.0,
+    "status": "correct",
+    "verified": true,
+    "verification_price": 150.0,
+    "verification_time": "2026-01-15 19:11:24"
+  }
+]

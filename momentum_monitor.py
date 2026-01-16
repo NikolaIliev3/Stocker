@@ -62,7 +62,7 @@ class MomentumMonitor:
         except Exception as e:
             logger.error(f"Error saving momentum history: {e}")
             
-    def add_to_history(self, symbol: str, action: str, changes: dict, strategy: str = 'mixed'):
+    def add_to_history(self, symbol: str, action: str, changes: dict, strategy: str = 'mixed', current_price: float = None):
         """Add a momentum change event to history"""
         
         # Check for duplicates (same symbol, same changes, same recommendation)
@@ -90,10 +90,83 @@ class MomentumMonitor:
             'action': action,  # Previous action or signal
             'changes': changes,
             'strategy': strategy,
-            'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'price_at_change': current_price,
+            'status': 'pending',  # pending, correct, incorrect
+            'verified': False
         }
         self.history.append(entry)
         self.save_history()
+
+    def verify_history(self, data_fetcher) -> List[Dict]:
+        """Verify past momentum changes"""
+        verified_items = []
+        now = datetime.now()
+        
+        for entry in self.history:
+            if entry.get('verified') or entry.get('status') != 'pending':
+                continue
+                
+            # Parse timestamp
+            try:
+                entry_time = datetime.strptime(entry.get('time', ''), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+                
+            # Verify after 24 hours
+            if (now - entry_time).total_seconds() >= 24 * 3600:
+                symbol = entry.get('symbol')
+                price_at_change = entry.get('price_at_change')
+                
+                if not price_at_change:
+                    # Can't verify without original price
+                    entry['status'] = 'expired'
+                    entry['verified'] = True
+                    continue
+                
+                # Get current price
+                try:
+                    current_data = data_fetcher.fetch_stock_data(symbol)
+                    current_price = current_data.get('price', 0)
+                    
+                    if current_price > 0:
+                        recommendation = entry.get('changes', {}).get('recommendation', {})
+                        action = recommendation.get('action', 'HOLD')
+                        
+                        entry['verification_price'] = current_price
+                        entry['verification_time'] = now.strftime("%Y-%m-%d %H:%M:%S")
+                        
+                        # Determine correctness
+                        is_correct = False
+                        
+                        if action == 'BUY' or action == 'STRONG_BUY':
+                            # Correct if price went up
+                            if current_price > price_at_change:
+                                is_correct = True
+                        elif action == 'SELL' or action == 'STRONG_SELL':
+                            # Correct if price went down (assuming looking for lower re-entry or taking profit)
+                            # NOTE: Context matters, but generally SELL means price expected to drop or stay flat
+                            if current_price < price_at_change:
+                                is_correct = True
+                        else:
+                            # HOLD - Neutral, hard to verify automatically without more context
+                            # For now, mark as expired/neutral
+                            entry['status'] = 'neutral'
+                            entry['verified'] = True
+                            continue
+                            
+                        entry['status'] = 'correct' if is_correct else 'incorrect'
+                        entry['verified'] = True
+                        
+                        verified_items.append(entry)
+                        
+                except Exception as e:
+                    logger.error(f"Error verifying momentum history for {symbol}: {e}")
+        
+        if verified_items:
+            self.save_history()
+            
+        return verified_items
         
     def clear_history(self):
         """Clear momentum history"""
@@ -301,7 +374,7 @@ class MomentumMonitor:
     
     def _determine_recommendation(self, previous_state: dict, current_state: dict, 
                                   trend_reversed: bool, momentum_changed: bool) -> dict:
-        """Determine recommendation based on trend and momentum changes (INVERTED logic)"""
+        """Determine recommendation based on trend and momentum changes (STANDARD LOGIC)"""
         if not previous_state:
             return {'action': 'HOLD', 'confidence': 50, 'reason': 'Initial state'}
         
@@ -318,82 +391,82 @@ class MomentumMonitor:
         confidence = 50
         reasons = []
         
-        # INVERTED LOGIC:
-        # Bullish (Stock rising/recovering) -> SELL (Target: Take Profits)
-        # Bearish (Stock falling/overbought) -> BUY (Target: Buy at Discount)
+        # STANDARD LOGIC:
+        # Bullish (Stock rising/recovering) -> BUY (Follow Trend / Dip Buy)
+        # Bearish (Stock falling/overbought) -> SELL (Take Profit / Short)
         
         # Trend reversal analysis
         if trend_reversed:
             if prev_trend == 'downtrend' and curr_trend == 'uptrend':
-                action = 'SELL'  # Bullish reversal
+                action = 'BUY'  # Bullish reversal
                 confidence = 70
                 reasons.append("Trend reversed from downtrend to uptrend (Bullish)")
             elif prev_trend == 'uptrend' and curr_trend == 'downtrend':
-                action = 'BUY'  # Bearish reversal
+                action = 'SELL'  # Bearish reversal
                 confidence = 70
                 reasons.append("Trend reversed from uptrend to downtrend (Bearish)")
         
         # Golden Cross / Death Cross
         if golden_cross and not previous_state.get('golden_cross', False):
-            action = 'SELL'  # Bullish
+            action = 'BUY'  # Bullish
             confidence = max(confidence, 75)
             reasons.append("Golden Cross detected - strong bullish signal")
         elif death_cross and not previous_state.get('death_cross', False):
-            action = 'BUY'  # Bearish
+            action = 'SELL'  # Bearish
             confidence = max(confidence, 75)
             reasons.append("Death Cross detected - strong bearish signal")
         
         # RSI analysis
         if curr_rsi < 30:
             if action == 'HOLD':
-                action = 'SELL'  # Bullish (Oversold recovery)
+                action = 'BUY'  # Bullish (Oversold bounce)
                 confidence = 65
             reasons.append(f"RSI oversold ({curr_rsi:.1f}) - potential recovery")
         elif curr_rsi > 70:
             if action == 'HOLD':
-                action = 'BUY'  # Bearish (Overbought exhaustion)
+                action = 'SELL'  # Bearish (Overbought pullback)
                 confidence = 65
             reasons.append(f"RSI overbought ({curr_rsi:.1f}) - potential pullback")
         
         # MFI analysis
         if curr_mfi < 20:
             if action == 'HOLD':
-                action = 'SELL'  # Bullish
+                action = 'BUY'  # Bullish
                 confidence = max(confidence, 60)
             reasons.append(f"MFI oversold ({curr_mfi:.1f}) - buying pressure")
         elif curr_mfi > 80:
             if action == 'HOLD':
-                action = 'BUY'  # Bearish
+                action = 'SELL'  # Bearish
                 confidence = max(confidence, 60)
             reasons.append(f"MFI overbought ({curr_mfi:.1f}) - selling pressure")
         
         # MACD analysis
         if curr_macd_diff > 0:
             if action == 'HOLD' and curr_momentum > 0:
-                action = 'SELL'  # Bullish
+                action = 'BUY'  # Bullish
                 confidence = max(confidence, 55)
             reasons.append("MACD bullish - upward momentum")
         elif curr_macd_diff < 0:
             if action == 'HOLD' and curr_momentum < 0:
-                action = 'BUY'  # Bearish
+                action = 'SELL'  # Bearish
                 confidence = max(confidence, 55)
             reasons.append("MACD bearish - downward momentum")
         
         # Momentum score
         if curr_momentum >= 3:
             if action == 'HOLD':
-                action = 'SELL'  # Bullish
+                action = 'BUY'  # Bullish
                 confidence = max(confidence, 60)
             reasons.append("Strong bullish momentum")
         elif curr_momentum <= -3:
             if action == 'HOLD':
-                action = 'BUY'  # Bearish
+                action = 'SELL'  # Bearish
                 confidence = max(confidence, 60)
             reasons.append("Strong bearish momentum")
         
         # If conflicting signals, reduce confidence
-        if (action == 'SELL' and (curr_rsi > 70 or curr_mfi > 80)) or \
-           (action == 'BUY' and (curr_rsi < 30 or curr_mfi < 20)):
+        if (action == 'BUY' and (curr_rsi > 70 or curr_mfi > 80)) or \
+           (action == 'SELL' and (curr_rsi < 30 or curr_mfi < 20)):
             confidence = max(50, confidence - 15)
             reasons.append("⚠️ Conflicting signals - reduced confidence")
         
