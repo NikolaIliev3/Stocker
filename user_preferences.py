@@ -93,6 +93,23 @@ class UserPreferences:
         """Set list of monitored stocks"""
         self.set('monitored_stocks', stocks)
     
+    def toggle_favorite(self, symbol: str) -> bool:
+        """Toggle favorite status for a stock. Returns new favorite status."""
+        stocks = self.get_monitored_stocks()
+        symbol = symbol.upper().strip()
+        if symbol in stocks:
+            stocks.remove(symbol)
+            is_favorite = False
+        else:
+            stocks.append(symbol)
+            is_favorite = True
+        self.set_monitored_stocks(stocks)
+        return is_favorite
+    
+    def is_favorite(self, symbol: str) -> bool:
+        """Check if a stock is in favorites"""
+        return symbol.upper().strip() in self.get_monitored_stocks()
+    
     def get_budget(self, current_currency: str = None) -> float:
         """Get saved budget, converted to current currency if needed"""
         from localization import Localization

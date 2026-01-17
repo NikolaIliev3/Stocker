@@ -193,11 +193,11 @@ class TrendChangePredictor:
                 convergence_rate = self._calculate_macd_convergence_rate(macd_line, signal_line)
                 
                 if convergence_rate and convergence_rate > 0:
-                    base_days = max(3, min(30, int(1 / convergence_rate * 5)))  # 3-30 days range
+                    base_days = max(1, min(180, int(1 / convergence_rate * 5)))  # 1-180 days range
                     # Apply learned adjustment
                     multiplier = self.learned_adjustments.get('macd_convergence_multiplier', 1.0)
                     estimated_days = int(base_days * multiplier)
-                    estimated_days = max(3, min(30, estimated_days))  # Keep in range
+                    estimated_days = max(1, min(180, estimated_days))  # Keep in reasonable range but allow freedom
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
                     # Higher confidence if closer to crossover
                     if macd_diff_abs < 0.1:
@@ -220,11 +220,11 @@ class TrendChangePredictor:
                 convergence_rate = self._calculate_macd_convergence_rate(macd_line, signal_line)
                 
                 if convergence_rate and convergence_rate > 0:
-                    base_days = max(3, min(30, int(1 / convergence_rate * 5)))
+                    base_days = max(1, min(180, int(1 / convergence_rate * 5)))
                     # Apply learned adjustment
                     multiplier = self.learned_adjustments.get('macd_convergence_multiplier', 1.0)
                     estimated_days = int(base_days * multiplier)
-                    estimated_days = max(3, min(30, estimated_days))  # Keep in range
+                    estimated_days = max(1, min(180, estimated_days))  # Keep in reasonable range but allow freedom
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
                     # Higher confidence if closer to crossover
                     if macd_diff_abs < 0.1:
@@ -285,11 +285,11 @@ class TrendChangePredictor:
                 convergence_rate = self._calculate_ema_convergence_rate(ema_20_vals, ema_50_vals)
                 
                 if convergence_rate and convergence_rate > 0:
-                    base_days = max(5, min(40, int(1 / convergence_rate * 10)))
+                    base_days = max(1, min(180, int(1 / convergence_rate * 10)))
                     # Apply learned adjustment
                     multiplier = self.learned_adjustments.get('ema_convergence_multiplier', 1.0)
                     estimated_days = int(base_days * multiplier)
-                    estimated_days = max(5, min(40, estimated_days))  # Keep in range
+                    estimated_days = max(1, min(180, estimated_days))  # Keep in reasonable range but allow freedom
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
                     # Higher confidence if closer together
                     if abs(ema_diff_pct) < 2:
@@ -312,11 +312,11 @@ class TrendChangePredictor:
                 convergence_rate = self._calculate_ema_convergence_rate(ema_20_vals, ema_50_vals)
                 
                 if convergence_rate and convergence_rate > 0:
-                    base_days = max(5, min(40, int(1 / convergence_rate * 10)))
+                    base_days = max(1, min(180, int(1 / convergence_rate * 10)))
                     # Apply learned adjustment
                     multiplier = self.learned_adjustments.get('ema_convergence_multiplier', 1.0)
                     estimated_days = int(base_days * multiplier)
-                    estimated_days = max(5, min(40, estimated_days))  # Keep in range
+                    estimated_days = max(1, min(180, estimated_days))  # Keep in reasonable range but allow freedom
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
                     # Higher confidence if closer together
                     if abs(ema_diff_pct) < 2:
@@ -359,7 +359,10 @@ class TrendChangePredictor:
                 
                 if recent_price_trend and recent_momentum:
                     # Bearish divergence detected
-                    estimated_days = 10  # Typical divergence to reversal time
+                    # Bearish divergence detected
+                    # Calculate estimated days based on divergence strength (dynamic)
+                    divergence_strength = abs(np.mean(momentum[-5:]) - np.mean(momentum[-10:-5]))
+                    estimated_days = max(3, min(60, int(15 - divergence_strength * 2)))  # 3-60 days dynamic range
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
                     
                     return {
@@ -379,7 +382,10 @@ class TrendChangePredictor:
                 
                 if recent_price_trend and recent_momentum:
                     # Bullish divergence detected
-                    estimated_days = 10
+                    # Bullish divergence detected
+                    # Calculate estimated days based on divergence strength (dynamic)
+                    divergence_strength = abs(np.mean(momentum[-5:]) - np.mean(momentum[-10:-5]))
+                    estimated_days = max(3, min(60, int(15 - divergence_strength * 2)))  # 3-60 days dynamic range
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
                     
                     return {
@@ -762,14 +768,14 @@ class TrendChangePredictor:
         if not periods:
             return None
         
-        # Use historical patterns - typically 5-15 days for RSI recovery
+        # Use historical patterns - typically 5-15 days for RSI recovery, but allow freedom
         avg_period = np.mean(periods) if periods else 10
-        base_estimate = min(30, max(3, avg_period))
+        base_estimate = min(120, max(1, avg_period))
         
         # Apply learned adjustment
         multiplier = self.learned_adjustments.get('rsi_recovery_multiplier', 1.0)
         adjusted = base_estimate * multiplier
-        return min(30, max(3, adjusted))
+        return min(120, max(1, adjusted))
     
     def _calculate_avg_reversal_time(self, periods: List[int], df: pd.DataFrame) -> Optional[float]:
         """Calculate average reversal time from overbought periods"""
@@ -777,12 +783,12 @@ class TrendChangePredictor:
             return None
         
         avg_period = np.mean(periods) if periods else 10
-        base_estimate = min(30, max(3, avg_period))
+        base_estimate = min(120, max(1, avg_period))
         
         # Apply learned adjustment
         multiplier = self.learned_adjustments.get('rsi_reversal_multiplier', 1.0)
         adjusted = base_estimate * multiplier
-        return min(30, max(3, adjusted))
+        return min(120, max(1, adjusted))
     
     def _calculate_macd_convergence_rate(self, macd_line: pd.Series, 
                                          signal_line: pd.Series) -> Optional[float]:

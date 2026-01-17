@@ -1112,8 +1112,36 @@ class TradingAnalyzer:
             "target_price": float(target_price),
             "stop_loss": float(stop_loss),
             "score": score,
-            "reasons": reasons
+            "reasons": reasons,
+            "estimated_days": self._calculate_estimated_days(entry_price, target_price, indicators.get('atr', 0))
         }
+
+    def _calculate_estimated_days(self, entry: float, target: float, atr: float) -> int:
+        """
+        Calculate estimated days to reach target based on ATR (Volatility).
+        Formula: Days = (Distance / ATR) * Safety_Factor
+        """
+        if atr <= 0 or entry <= 0:
+            return 10  # Fallback default
+            
+        distance = abs(target - entry)
+        if distance == 0:
+            return 10
+            
+        # Raw days needed if price moved perfectly linearly (impossible)
+        raw_days = distance / atr
+        
+        # Safety factor: Price rarely moves in a straight line. 
+        # 1.5 = Aggressive trend
+        # 2.0 = Normal trend (zig-zag)
+        # 3.0 = Slow/Choppy trend
+        safety_factor = 2.0
+        
+        estimated_days = int(raw_days * safety_factor)
+        
+        # Clamp result to prevent absurd values, but give "full freedom" as requested
+        # Allow anywhere from 1 day to 1 year based on pure math/volatility
+        return max(1, min(365, estimated_days))
     
     def _generate_reasoning(self, recommendation: dict, indicators: dict,
                            price_action: dict, volume_analysis: dict,

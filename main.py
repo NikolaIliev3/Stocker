@@ -286,6 +286,9 @@ class StockerApp:
         # Verify buy opportunities at startup
         self.root.after(7000, self._verify_buy_opportunities_at_startup)
         
+        # Verify potentials at startup (and feed to Megamind)
+        self.root.after(8000, self._verify_potentials_at_startup)
+        
         # Schedule automatic training checks
         self._schedule_auto_training()
         
@@ -3028,12 +3031,16 @@ class StockerApp:
         strategy = self.strategy_var.get()
         
         # Calculate estimated days based on strategy
-        if strategy == "trading":
-            estimated_days = 10  # Short-term: ~10 days
-        elif strategy == "mixed":
-            estimated_days = 21  # Medium-term: ~3 weeks
-        else:  # investing
-            estimated_days = 547  # Long-term: ~1.5 years
+        estimated_days = recommendation.get('estimated_days')
+        
+        if not estimated_days:
+            # Fallback to defaults if not provided by analyzer
+            if strategy == "trading":
+                estimated_days = 10  # Short-term: ~10 days
+            elif strategy == "mixed":
+                estimated_days = 21  # Medium-term: ~3 weeks
+            else:  # investing
+                estimated_days = 547  # Long-term: ~1.5 years
         
         prediction = self.predictions_tracker.add_prediction(
             self.current_symbol, strategy, action, entry_price, 
@@ -4091,12 +4098,17 @@ class StockerApp:
                         stop_loss = current_price
                     
                     # Calculate estimated days
-                    if strategy == "trading":
-                        estimated_days = 10
-                    elif strategy == "mixed":
-                        estimated_days = 21
-                    else:  # investing
-                        estimated_days = 547
+                    # Use dynamic date from recommendation if available
+                    rec = analysis.get('recommendation', {})
+                    estimated_days = rec.get('estimated_days')
+                    
+                    if not estimated_days:
+                        if strategy == "trading":
+                            estimated_days = 21 # Default to medium if unknown
+                        elif strategy == "mixed":
+                            estimated_days = 30
+                        else:  # investing
+                            estimated_days = 547
                     
                     # Save prediction
                     prediction = self.predictions_tracker.add_prediction(
@@ -5063,6 +5075,8 @@ SELL SIGNALS:
         self.trend_change_tree.bind("<MouseWheel>", on_trend_tree_mousewheel)
         self.trend_change_tree.bind("<Button-4>", lambda e: self.trend_change_tree.yview_scroll(-3, "units") or "break")
         self.trend_change_tree.bind("<Button-5>", lambda e: self.trend_change_tree.yview_scroll(3, "units") or "break")
+        # Right-click context menu
+        self.trend_change_tree.bind('<Button-3>', self._on_trend_tree_right_click)
         
         self.trend_change_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
@@ -5334,6 +5348,8 @@ SELL SIGNALS:
             return "break"
         
         self.momentum_changes_tree.bind("<MouseWheel>", on_mom_tree_mousewheel)
+        # Right-click context menu
+        self.momentum_changes_tree.bind('<Button-3>', self._on_momentum_tree_right_click)
         self.momentum_changes_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
         
@@ -5456,6 +5472,127 @@ SELL SIGNALS:
         except Exception as e:
             logger.error(f"Error in momentum click handler: {e}")
 
+    def _on_momentum_tree_right_click(self, event):
+        """Show context menu on right-click in momentum changes tree"""
+        try:
+            item_id = self.momentum_changes_tree.identify_row(event.y)
+            if not item_id:
+                return
+            
+            # Select the row
+            self.momentum_changes_tree.selection_set(item_id)
+            values = self.momentum_changes_tree.item(item_id, 'values')
+            
+            if not values or len(values) < 3:
+                return
+            
+            symbol = values[2]  # Symbol is at index 2
+            is_fav = symbol.upper() in [s.upper() for s in self.monitored_stocks]
+            
+            # Create context menu
+            menu = tk.Menu(self.root, tearoff=0)
+            
+            # Favorite toggle
+            if is_fav:
+                menu.add_command(label="☆ Remove from Favorites", 
+                               command=lambda: self._toggle_favorite_from_menu(symbol))
+            else:
+                menu.add_command(label="★ Add to Favorites", 
+                               command=lambda: self._toggle_favorite_from_menu(symbol))
+            
+            menu.add_separator()
+            menu.add_command(label="📊 Analyze Stock", 
+                           command=lambda: self._analyze_stock_from_menu(symbol))
+            menu.add_command(label="📋 Copy Symbol", 
+                           command=lambda: self._copy_symbol_to_clipboard(symbol))
+            
+            # Show menu
+            menu.tk_popup(event.x_root, event.y_root)
+        except Exception as e:
+            logger.error(f"Error showing momentum context menu: {e}")
+        finally:
+            try:
+                menu.grab_release()
+            except:
+                pass
+
+    def _on_trend_tree_right_click(self, event):
+        """Show context menu on right-click in trend changes tree"""
+        try:
+            item_id = self.trend_change_tree.identify_row(event.y)
+            if not item_id:
+                return
+            
+            # Select the row
+            self.trend_change_tree.selection_set(item_id)
+            values = self.trend_change_tree.item(item_id, 'values')
+            
+            if not values or len(values) < 3:
+                return
+            
+            symbol = values[2]  # Symbol is at index 2 (Fav, ID, Symbol)
+            is_fav = symbol.upper() in [s.upper() for s in self.monitored_stocks]
+            
+            # Create context menu
+            menu = tk.Menu(self.root, tearoff=0)
+            
+            # Favorite toggle
+            if is_fav:
+                menu.add_command(label="☆ Remove from Favorites", 
+                               command=lambda: self._toggle_favorite_from_menu(symbol))
+            else:
+                menu.add_command(label="★ Add to Favorites", 
+                               command=lambda: self._toggle_favorite_from_menu(symbol))
+            
+            menu.add_separator()
+            menu.add_command(label="📊 Analyze Stock", 
+                           command=lambda: self._analyze_stock_from_menu(symbol))
+            menu.add_command(label="📋 Copy Symbol", 
+                           command=lambda: self._copy_symbol_to_clipboard(symbol))
+            
+            # Show menu
+            menu.tk_popup(event.x_root, event.y_root)
+        except Exception as e:
+            logger.error(f"Error showing trend context menu: {e}")
+        finally:
+            try:
+                menu.grab_release()
+            except:
+                pass
+
+    def _toggle_favorite_from_menu(self, symbol: str):
+        """Toggle favorite status from context menu and refresh all displays"""
+        try:
+            # Use preferences to toggle and persist
+            is_now_favorite = self.preferences.toggle_favorite(symbol)
+            
+            # Update local cache
+            self.monitored_stocks = self.preferences.get_monitored_stocks()
+            
+            # Log the change
+            status = "added to" if is_now_favorite else "removed from"
+            logger.info(f"★ {symbol} {status} favorites")
+            
+            # Refresh both displays
+            self._update_momentum_changes_display()
+            self._update_trend_change_display()
+            
+        except Exception as e:
+            logger.error(f"Error toggling favorite: {e}")
+
+    def _analyze_stock_from_menu(self, symbol: str):
+        """Analyze stock from context menu"""
+        self.symbol_entry.delete(0, tk.END)
+        self.symbol_entry.insert(0, symbol)
+        self.notebook.select(0)  # Analysis tab
+        self._analyze_stock()
+
+    def _copy_symbol_to_clipboard(self, symbol: str):
+        """Copy symbol to clipboard"""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(symbol)
+        logger.info(f"Copied {symbol} to clipboard")
+
     def _on_trend_change_tree_click(self, event):
         """Handle clicks on trend change tree (specifically Fav and Delete columns)"""
         try:
@@ -5470,46 +5607,41 @@ SELL SIGNALS:
             
             if not item_id:
                 return
+            
+            values = self.trend_change_tree.item(item_id, 'values')
+            if not values:
+                return
                 
             # Fav column (index 0 -> #1)
             if column == '#1':
-                values = self.trend_change_tree.item(item_id, 'values')
                 logger.info(f"DEBUG: Trend Tree Values: {values}")
-                if values and len(values) > 2:
-                    symbol = values[2] # Symbol is at index 2 (Fav, ID, Symbol)
-                    logger.info(f"DEBUG: Toggling {symbol} from Trend Tree")
-                    self._toggle_trend_monitoring(symbol, quiet=True)
-                    
-                    # Refresh UI
-                    self._update_trend_change_display()
-                    self._update_momentum_changes_display()
+                if len(values) > 2:
+                    symbol = values[2]  # Symbol is at index 2 (Fav, ID, Symbol)
+                    logger.info(f"DEBUG: Toggling favorite for {symbol} from Trend Tree")
+                    self._toggle_favorite_from_menu(symbol)
                 return
 
             # Delete column (index 9 -> #10)
             if column == '#10': 
-                values = self.trend_change_tree.item(item_id, 'values')
-                if values and len(values) > 1:
+                logger.info(f"DEBUG: Delete clicked, values: {values}")
+                if len(values) > 1:
                     # ID is at index 1 (Fav, ID, ...)
                     try:
                         prediction_id = int(values[1])
+                        logger.info(f"DEBUG: Deleting prediction ID: {prediction_id}")
                         if self.trend_change_tracker.delete_prediction(prediction_id):
                             self.trend_change_tree.delete(item_id)
                             # Remove from local list if exists
                             self.trend_change_predictions = [p for p in self.trend_change_predictions if p.get('id') != prediction_id]
-                    except ValueError:
-                        pass
+                            logger.info(f"DEBUG: Successfully deleted prediction {prediction_id}")
+                        else:
+                            logger.warning(f"DEBUG: delete_prediction returned False for ID {prediction_id}")
+                    except ValueError as ve:
+                        logger.error(f"DEBUG: ValueError parsing prediction ID: {ve}")
+                return
+                
         except Exception as e:
             logger.error(f"Error in trend click handler: {e}")
-            if values and len(values) > 1:
-                # ID is at index 1 (Fav, ID, ...)
-                try:
-                    prediction_id = int(values[1])
-                    if self.trend_change_tracker.delete_prediction(prediction_id):
-                        self.trend_change_tree.delete(item_id)
-                        # Remove from local list if exists
-                        self.trend_change_predictions = [p for p in self.trend_change_predictions if p.get('id') != prediction_id]
-                except ValueError:
-                    pass
 
 
     def _on_momentum_changes_tree_double_click(self, event):
@@ -5732,120 +5864,128 @@ SELL SIGNALS:
                     
                     current_price = data.get('price', 0)
                     
-                    # Get the required data structures for predict_trend_changes
-                    # history_data needs to be a dict with 'data' key containing the list
+                    # Get history data - fetch separately if not in stock data
                     history_list = data.get('history', [])
+                    if not history_list:
+                        # Fetch history separately
+                        history_result = self.data_fetcher.fetch_stock_history(symbol, period='1y')
+                        history_list = history_result.get('data', []) if history_result else []
+                    
                     if isinstance(history_list, list):
                         history_data = {'data': history_list}
                     else:
                         history_data = history_list if isinstance(history_list, dict) else {'data': []}
                     
-                    indicators = data.get('indicators', {})
-                    price_action = data.get('price_action', {'trend': 'sideways'})
-                    
-                    # Use trend change predictor for dip predictions
-                    predictions = self.trend_change_predictor.predict_trend_changes(
-                        symbol, history_data, indicators, price_action
-                    )
-                    
-                    found_for_symbol = False
-                    
-                    # Look for bullish reversal or dip opportunities (FUTURE)
-                    for pred in predictions:
-                        predicted_change = pred.get('predicted_change', '').lower()
-                        if 'bullish' in predicted_change:
-                            confidence = pred.get('confidence', 0)
-                            if confidence >= 50:  # Minimum threshold
-                                target_price = pred.get('target_low_price', current_price * 0.95)
-                                target_date = pred.get('estimated_date', '')
-                                reasoning = pred.get('reasoning', 'Bullish reversal expected')
-                                
-                                # Add to tracker
-                                self.potentials_tracker.add_potential(
-                                    symbol=symbol,
-                                    current_price=current_price,
-                                    target_price=target_price,
-                                    target_date=target_date,
-                                    confidence=confidence,
-                                    reasoning=f"📅 FUTURE: {reasoning}",
-                                    indicators=pred.get('key_indicators', {})
-                                )
-                                potentials_found.append(symbol)
-                                found_for_symbol = True
-                                break  # One per symbol
-                    
-                    # Also check for CURRENT buy opportunities
-                    if not found_for_symbol:
-                        rsi = indicators.get('rsi', 50)
-                        mfi = indicators.get('mfi', 50)
-                        macd_diff = indicators.get('macd_diff', 0)
-                        trend = price_action.get('trend', 'sideways')
-                        
-                        logger.info(f"DEBUG {symbol}: RSI={rsi:.1f}, MFI={mfi:.1f}, trend={trend}")
-                        
-                        # Current buy signals (relaxed thresholds)
-                        buy_signals = []
-                        confidence = 50
-                        
-                        # RSI signals
-                        if rsi < 30:
-                            buy_signals.append(f"RSI oversold ({rsi:.1f})")
-                            confidence += 20
-                        elif rsi < 45:
-                            buy_signals.append(f"RSI low ({rsi:.1f})")
-                            confidence += 8
-                        
-                        # MFI signals
-                        if mfi < 30:
-                            buy_signals.append(f"MFI low ({mfi:.1f})")
-                            confidence += 10
-                        
-                        # Golden cross
-                        if indicators.get('golden_cross', False):
-                            buy_signals.append("Golden cross")
-                            confidence += 20
-                        
-                        # MACD bullish
-                        if macd_diff > 0:
-                            buy_signals.append("MACD bullish")
-                            confidence += 5
-                        
-                        # Support level
-                        if price_action.get('at_support', False):
-                            buy_signals.append("At support")
-                            confidence += 10
-                        
-                        # Dip in uptrend
-                        if trend == 'uptrend':
-                            buy_signals.append("Uptrend")
-                            confidence += 10
-                            if rsi < 50:
-                                buy_signals.append("Pullback opportunity")
-                                confidence += 5
-                        
-                        # Downtrend reversal potential
-                        if trend == 'downtrend' and rsi < 35:
-                            buy_signals.append("Reversal potential")
-                            confidence += 10
-                        
-                        logger.info(f"DEBUG {symbol}: signals={buy_signals}, confidence={confidence}")
-                        
-                        # Lower threshold to 50 to catch more
-                        if buy_signals and confidence >= 50:
-                            from datetime import timedelta
-                            target_date = (datetime.now() + timedelta(days=7)).isoformat()
+                    # USE HYBRID ML PREDICTOR for enhanced predictions
+                    # This combines rule-based analysis with trained ML model
+                    try:
+                        hybrid_predictor = self.hybrid_predictors.get('trading')
+                        if hybrid_predictor and len(history_data.get('data', [])) >= 20:
+                            # Get full hybrid prediction (Rules + ML)
+                            analysis = hybrid_predictor.predict(data, history_data, None)
                             
-                            self.potentials_tracker.add_potential(
-                                symbol=symbol,
-                                current_price=current_price,
-                                target_price=current_price,
-                                target_date=target_date,
-                                confidence=min(confidence, 90),
-                                reasoning=f"🔥 NOW: {', '.join(buy_signals[:3])}",  # Top 3 reasons
-                                indicators=indicators
-                            )
-                            potentials_found.append(symbol)
-                            logger.info(f"DEBUG {symbol}: ADDED as potential!")
+                            if 'error' not in analysis:
+                                recommendation = analysis.get('recommendation', {})
+                                action = recommendation.get('action', 'HOLD')
+                                ml_confidence = recommendation.get('confidence', 50)
+                                
+                                # Get indicators from analysis
+                                indicators = analysis.get('indicators', {})
+                                price_action = analysis.get('price_action', {'trend': 'sideways'})
+                                
+                                rsi = indicators.get('rsi', 50)
+                                mfi = indicators.get('mfi', 50)
+                                trend = price_action.get('trend', 'sideways')
+                                
+                                # Check if ML says BUY or if indicators show opportunity
+                                is_ml_buy = action == 'BUY' and ml_confidence >= 55
+                                is_oversold = rsi < 40 or mfi < 35
+                                is_at_support = price_action.get('at_support', False)
+                                has_golden_cross = indicators.get('golden_cross', False)
+                                
+                                # Build buy signals list
+                                buy_signals = []
+                                confidence = 50
+                                
+                                # ML-based signals (highest priority)
+                                if is_ml_buy:
+                                    buy_signals.append(f"🤖 ML BUY ({ml_confidence:.0f}%)")
+                                    confidence += min(30, (ml_confidence - 50))
+                                
+                                # Technical signals
+                                if rsi < 30:
+                                    buy_signals.append(f"RSI oversold ({rsi:.1f})")
+                                    confidence += 15
+                                elif rsi < 40:
+                                    buy_signals.append(f"RSI low ({rsi:.1f})")
+                                    confidence += 8
+                                
+                                if mfi < 30:
+                                    buy_signals.append(f"MFI low ({mfi:.1f})")
+                                    confidence += 10
+                                
+                                if has_golden_cross:
+                                    buy_signals.append("Golden cross")
+                                    confidence += 15
+                                
+                                if is_at_support:
+                                    buy_signals.append("At support")
+                                    confidence += 10
+                                
+                                if trend == 'uptrend':
+                                    buy_signals.append("Uptrend")
+                                    confidence += 10
+                                elif trend == 'downtrend' and rsi < 35:
+                                    buy_signals.append("Reversal potential")
+                                    confidence += 10
+                                
+                                # Use ML confidence as floor if ML says BUY
+                                if is_ml_buy:
+                                    confidence = max(confidence, ml_confidence)
+                                
+                                # BEARISH HOLD: Include stocks that are bearish but waiting for entry
+                                is_bearish_hold = (action == 'HOLD' and trend == 'downtrend')
+                                if is_bearish_hold and not buy_signals:
+                                    buy_signals.append(f"🔜 Watching (Bearish HOLD)")
+                                    confidence = max(45, ml_confidence * 0.8)  # Lower confidence for watching
+                                
+                                logger.info(f"DEBUG {symbol}: ML={action}({ml_confidence:.0f}%), RSI={rsi:.1f}, MFI={mfi:.1f}, trend={trend}")
+                                logger.info(f"DEBUG {symbol}: signals={buy_signals}, confidence={confidence}")
+                                
+                                # Add potential if signals exist and confidence is high enough
+                                # Include BEARISH HOLD with lower threshold (45) vs normal (55)
+                                min_confidence = 45 if is_bearish_hold else 55
+                                if buy_signals and confidence >= min_confidence:
+                                    from datetime import timedelta
+                                    
+                                    # DYNAMIC TARGET DATE based on volatility/ATR
+                                    estimated_days = recommendation.get('estimated_days')
+                                    if not estimated_days or estimated_days <= 0:
+                                        # Fallback: use 10 days for trading-like potentials
+                                        estimated_days = 10
+                                    target_date = (datetime.now() + timedelta(days=estimated_days)).isoformat()
+                                    
+                                    # Use ML's target price if available
+                                    target_price = recommendation.get('target_price', current_price * 1.05)
+                                    
+                                    # Build reasoning with ML info
+                                    ml_method = analysis.get('method', 'rule_based')
+                                    reasoning_prefix = "🤖 ML+" if 'hybrid' in ml_method else "📊 Rules:"
+                                    
+                                    self.potentials_tracker.add_potential(
+                                        symbol=symbol,
+                                        current_price=current_price,
+                                        target_price=target_price,
+                                        target_date=target_date,
+                                        confidence=min(confidence, 95),
+                                        reasoning=f"{reasoning_prefix} {', '.join(buy_signals[:3])}",
+                                        indicators={k: v for k, v in indicators.items() if not isinstance(v, bool) or v}
+                                    )
+                                    potentials_found.append(symbol)
+                                    logger.info(f"DEBUG {symbol}: ADDED as potential (ML-enhanced, {estimated_days} days)!")
+                                    
+                    except Exception as e:
+                        logger.warning(f"Hybrid prediction failed for {symbol}: {e}, skipping")
                                 
                 except Exception as e:
                     logger.error(f"Error scanning {symbol}: {e}")
@@ -5859,6 +5999,21 @@ SELL SIGNALS:
         thread = threading.Thread(target=scan_in_background)
         thread.daemon = True
         thread.start()
+    
+    def _verify_potentials_at_startup(self):
+        """Verify potentials at startup and feed results to Megamind for recalibration"""
+        try:
+            verified = self.potentials_tracker.check_for_verification(
+                self.data_fetcher, 
+                self.calibration_manager
+            )
+            if verified:
+                logger.info(f"🎯 Verified {len(verified)} potentials at startup, fed to Megamind for learning")
+                # Update the display if potentials tab is visible
+                if hasattr(self, 'potentials_tree'):
+                    self.root.after(0, self._update_potentials_display)
+        except Exception as e:
+            logger.error(f"Error verifying potentials at startup: {e}")
     
     def _on_potentials_tree_click(self, event):
         """Handle clicks on potentials tree (Fav column)"""
@@ -6233,7 +6388,8 @@ Confidence: {prediction['confidence']:.0f}%
                 try:
                     col_num = int(column.replace('#', ''))
                     col_index = col_num - 1  # Convert to 0-indexed
-                    columns = ('ID', 'Symbol', 'Action', 'Entry', 'Target', 'Target Date', 'Status', 'Result', 'Delete')
+                    # MATCH COLUMNS WITH _create_predictions_tab
+                    columns = ('ID', 'Symbol', 'Sentiment', 'Action', 'Wait %', 'Entry', 'Target', 'Target Date', 'Status', 'Result', 'Delete')
                     
                     logger.debug(f"Column number: {col_num}, index: {col_index}, total columns: {len(columns)}")
                     

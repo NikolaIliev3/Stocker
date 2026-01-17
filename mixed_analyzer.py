@@ -372,7 +372,10 @@ class MixedAnalyzer:
                 'target_price': target_price,
                 'stop_loss': stop_loss,
                 'confidence': confidence,
-                'holding_period_days': (self.holding_period_min + self.holding_period_max) // 2
+                'confidence': confidence,
+                'confidence': confidence,
+                'holding_period_days': int(min(120, max(3, 20 + (10 - volatility) * 2))),  # Dynamic: 3 days to 4 months
+                'estimated_days': int(min(120, max(3, 20 + (10 - volatility) * 2)))
             }
         
         except Exception as e:
