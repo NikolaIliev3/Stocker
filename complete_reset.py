@@ -18,7 +18,10 @@ if sys.platform == 'win32':
 
 def find_data_files():
     """Find all prediction and ML model files"""
-    base_dir = Path(".")
+    # FIXED: Search in ~/.stocker where data actually lives, not current directory
+    from config import APP_DATA_DIR
+    base_dir = APP_DATA_DIR
+    
     files_found = {
         'predictions': [],
         'learning': [],
@@ -56,28 +59,36 @@ def find_data_files():
         "model_checksums.json"
     ]
     
-    # Search recursively in current dir
-    for pattern in prediction_patterns:
-        for file_path in base_dir.rglob(pattern):
-            files_found['predictions'].append(file_path)
+    print(f"Searching in: {base_dir}")
     
-    for pattern in learning_patterns:
-        for file_path in base_dir.rglob(pattern):
-            files_found['learning'].append(file_path)
-    
-    for pattern in ml_model_patterns:
-        for file_path in base_dir.rglob(pattern):
-            files_found['ml_models'].append(file_path)
-
-    # Also check user home directory .stocker/data
-    home_dir = Path.home() / ".stocker"
-    if home_dir.exists():
-        print(f"Checking home directory: {home_dir}")
+    # Search in the data directory
+    if base_dir.exists():
+        for pattern in prediction_patterns:
+            for file_path in base_dir.rglob(pattern):
+                files_found['predictions'].append(file_path)
+        
         for pattern in learning_patterns:
-            for file_path in home_dir.rglob(pattern):
-                if file_path not in files_found['learning']:
+            for file_path in base_dir.rglob(pattern):
+                files_found['learning'].append(file_path)
+        
+        for pattern in ml_model_patterns:
+            for file_path in base_dir.rglob(pattern):
+                files_found['ml_models'].append(file_path)
+    else:
+        print(f"Data directory does not exist: {base_dir}")
+    
+    # Also check current directory for any stray files
+    current_dir = Path(".")
+    for pattern in prediction_patterns + learning_patterns + ml_model_patterns:
+        for file_path in current_dir.rglob(pattern):
+            # Don't duplicate if already found
+            if file_path not in files_found['predictions'] and file_path not in files_found['learning'] and file_path not in files_found['ml_models']:
+                if 'prediction' in pattern or pattern.startswith('verified'):
+                    files_found['predictions'].append(file_path)
+                elif '.pkl' in pattern or 'checksums' in pattern or 'features' in pattern:
+                    files_found['ml_models'].append(file_path)
+                else:
                     files_found['learning'].append(file_path)
-
     
     return files_found
 

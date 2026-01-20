@@ -37,8 +37,23 @@ class PotentialsTracker:
     def save(self):
         """Save potentials to file"""
         try:
+            import math
+            
+            def clean_for_json(obj):
+                """Recursively clean data for JSON (convert NaN/Inf to None)"""
+                if isinstance(obj, dict):
+                    return {k: clean_for_json(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [clean_for_json(item) for item in obj]
+                elif isinstance(obj, float):
+                    if math.isnan(obj) or math.isinf(obj):
+                        return None
+                    return obj
+                else:
+                    return obj
+            
             data = {
-                'potentials': self.potentials,
+                'potentials': clean_for_json(self.potentials),
                 'last_updated': datetime.now().isoformat()
             }
             with open(self.potentials_file, 'w') as f:

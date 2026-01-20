@@ -18,6 +18,8 @@ import logging
 
 from algorithm_improvements import MarketRegimeDetector, VolumeWeightedLevels, MultiTimeframeAnalyzer, RelativeStrengthAnalyzer
 from pattern_recognition import PatternRecognizer
+from sector_momentum import SectorMomentumAnalyzer
+from catalyst_detector import CatalystDetector
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,8 @@ class TradingAnalyzer:
         self.timeframe_analyzer = MultiTimeframeAnalyzer()
         self.relative_strength_analyzer = RelativeStrengthAnalyzer()
         self.pattern_recognizer = PatternRecognizer()
+        self.sector_analyzer = SectorMomentumAnalyzer(data_fetcher)
+        self.catalyst_detector = CatalystDetector(data_fetcher)
         self.data_fetcher = data_fetcher  # For fetching SPY data
         self._market_regime_cache = None
         self._market_regime_cache_time = None
@@ -55,6 +59,9 @@ class TradingAnalyzer:
             df.set_index('date', inplace=True)
             df = df.sort_index()
             
+            # Get symbol for catalyst detection
+            symbol = stock_data.get('symbol', stock_data.get('info', {}).get('symbol', ''))
+            
             # Detect market regime (using SPY as market proxy)
             market_regime = self._get_market_regime()
             
@@ -64,13 +71,19 @@ class TradingAnalyzer:
             # Relative strength analysis (stock vs market)
             relative_strength = self._calculate_relative_strength(df)
             
+            # Sector momentum analysis (stock vs sector ETF)
+            sector_analysis = self.sector_analyzer.analyze(stock_data, df)
+            
+            # Catalyst detection (earnings, dividends)
+            catalyst_info = self.catalyst_detector.detect_catalysts(symbol, stock_data)
+            
             # Calculate technical indicators
             indicators = self._calculate_indicators(df)
             
             # Analyze price action
             price_action = self._analyze_price_action(df)
             
-            # Analyze volume
+            # Analyze volume with enhanced liquidity
             volume_analysis = self._analyze_volume(df)
             
             # Analyze momentum
@@ -79,10 +92,11 @@ class TradingAnalyzer:
             # Identify support and resistance
             support_resistance = self._identify_levels(df)
             
-            # Determine recommendation (with market regime, timeframe, and relative strength adjustment)
+            # Determine recommendation (with all analysis inputs)
             recommendation = self._make_recommendation(
                 indicators, price_action, volume_analysis, 
-                momentum_analysis, support_resistance, df, market_regime, timeframe_analysis, relative_strength
+                momentum_analysis, support_resistance, df, market_regime, 
+                timeframe_analysis, relative_strength, sector_analysis, catalyst_info
             )
             
             return {
@@ -96,10 +110,13 @@ class TradingAnalyzer:
                 "market_regime": market_regime,
                 "timeframe_analysis": timeframe_analysis,
                 "relative_strength": relative_strength,
+                "sector_analysis": sector_analysis,
+                "catalyst_info": catalyst_info,
                 "reasoning": self._generate_reasoning(
                     recommendation, indicators, price_action, 
                     volume_analysis, momentum_analysis, support_resistance, 
-                    market_regime, timeframe_analysis, relative_strength
+                    market_regime, timeframe_analysis, relative_strength,
+                    sector_analysis, catalyst_info
                 )
             }
         
@@ -309,7 +326,7 @@ class TradingAnalyzer:
         }
     
     def _analyze_volume(self, df: pd.DataFrame) -> dict:
-        """Analyze volume patterns"""
+        """Analyze volume patterns and liquidity"""
         current_volume = df['volume'].iloc[-1]
         avg_volume = df['volume'].tail(20).mean()
         volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
@@ -318,12 +335,28 @@ class TradingAnalyzer:
         recent_volumes = df['volume'].tail(10)
         volume_trend = "increasing" if recent_volumes.iloc[-1] > recent_volumes.iloc[0] else "decreasing"
         
+        # Calculate average daily dollar volume for liquidity assessment
+        avg_price = df['close'].tail(20).mean()
+        avg_dollar_volume = avg_volume * avg_price
+        
+        # Liquidity grade based on daily dollar volume
+        if avg_dollar_volume >= 50_000_000:  # $50M+/day
+            liquidity_grade = 'high'
+        elif avg_dollar_volume >= 10_000_000:  # $10M-$50M/day
+            liquidity_grade = 'medium'
+        elif avg_dollar_volume >= 1_000_000:  # $1M-$10M/day
+            liquidity_grade = 'low'
+        else:
+            liquidity_grade = 'very_low'
+        
         return {
             "current_volume": int(current_volume),
             "average_volume": int(avg_volume),
             "volume_ratio": float(volume_ratio),
             "volume_trend": volume_trend,
-            "is_high_volume": volume_ratio > 1.5
+            "is_high_volume": volume_ratio > 1.5,
+            "avg_dollar_volume": float(avg_dollar_volume),
+            "liquidity_grade": liquidity_grade
         }
     
     def _analyze_momentum(self, indicators: dict) -> dict:
@@ -662,7 +695,8 @@ class TradingAnalyzer:
                            volume_analysis: dict, momentum_analysis: dict,
                            support_resistance: dict, df: pd.DataFrame, 
                            market_regime: dict = None, timeframe_analysis: dict = None,
-                           relative_strength: dict = None) -> dict:
+                           relative_strength: dict = None, sector_analysis: dict = None,
+                           catalyst_info: dict = None) -> dict:
         """Make buy/sell recommendation based on analysis"""
         score = 0
         reasons = []
@@ -868,10 +902,10 @@ class TradingAnalyzer:
                 # If excessively overbought, treat as negative factor
                 score = min(score, 1) 
         
-        # STANDARD LOGIC RESTORED & ENHANCED (User-Centric Aggressive Mode):
-        # 1. Downtrend/Weakness -> BUY (Accumulate/Dip Buy) with warnings.
-        # 2. Uptrend/Strength -> BUY (Trend Follow) OR SELL (Scale Out) if overextended.
-        # 3. HOLD -> ONLY when signals are conflicting/unsure.
+        # STANDARDIZED "SMART CONTRARIAN" LOGIC (User-Centric Update):
+        # 1. Downtrend -> BUY ONLY if "Good Dip" (Long-Term Uptrend) OR "Strong Reversal" (Volume + Oversold)
+        # 2. Uptrend -> BUY (Trend Follow) unless Extreme Overbought
+        # 3. HOLD -> Default safe position
         
         # Determine strict signal states
         is_oversold = rsi < self.rsi_oversold or mfi < 20
@@ -893,36 +927,60 @@ class TradingAnalyzer:
         
         # --- LOGIC TREE ---
         
+        # Smart Contrarian Logic for Downtrends
+        current_price = price_action.get('current_price', 0)
+        ema_200 = indicators.get('ema_200', 0)
+        
+        # 1. 200 EMA Filter (The "Golden Rule")
+        # If price > 200 EMA, the long-term trend is UP, so dips are buying opportunities.
+        in_long_term_uptrend = current_price > ema_200 if ema_200 and not np.isnan(ema_200) else True 
+        
         if trend == "downtrend" or trend == "sideways":
             # STRATEGIC VIEW: Price is low/falling.
-            # User Intent: Wants to BUY cheap.
-            action = "BUY"
             
-            if is_oversold:
-                # Prime buying opportunity
-                confidence = 90
-                reasons.append("💎 OVERSOLD in downtrend - Prime buying opportunity")
-            elif score > 0:
-                # Deductive reasoning: Downtrend but indicators improving (Divergence?)
-                confidence = 75
-                reasons.append("📉 Price falling but indicators showing strength (Bullish Divergence)")
-            else:
-                # Standard Accumulation / "Buy the Dip"
-                # Formerly HOLD, now enabled as requested by user
+            if in_long_term_uptrend:
+                # "Good Dip" - Pullback in an uptrend
                 action = "BUY"
-                confidence = 65
-                reasons.append("📉 Aggressive Accumulation - Buying the Dip")
+                if is_oversold:
+                    confidence = 90
+                    reasons.append("💎 PERFECT SETUP: Oversold Dip in Long-Term Uptrend (>200 EMA)")
+                elif score > 0:
+                    confidence = 80
+                    reasons.append("📉 Buying the Dip (Price > 200 EMA, Indicators Improving)")
+                else:
+                    confidence = 65
+                    reasons.append("📉 Accumulating Dip in Long-Term Uptrend")
+                    
+            else:
+                # "Bad Dip" - Price < 200 EMA (Long Term Downtrend)
+                # Only buy if there is massive confirmation (Volume + Oversold)
+                is_high_volume = volume_analysis.get('is_high_volume', False) or volume_analysis.get('volume_ratio', 1) > 1.2
                 
-                # Boost confidence if near support
-                if distance_to_support < 8:
+                if is_oversold and is_high_volume:
+                    action = "BUY"
+                    confidence = 75 # Lower confidence than "Good Dip"
+                    reasons.append("⚠️ Contrarian Play: Oversold + Volume Spike in Downtrend")
+                elif is_oversold:
+                    action = "HOLD" # Wait for volume
+                    confidence = 55
+                    reasons.append("✋ Oversold but in Downtrend - Waiting for Volume/Confirmation")
+                else:
+                    action = "HOLD" # Avoid
+                    confidence = 50
+                    reasons.append("⛔ AVOIDING: Price below 200 EMA (Long Term Downtrend)")
+                 
+            # Boost confidence if near support
+            distance_to_support = support_resistance.get('current_distance_to_support', 100)
+            if distance_to_support < 8:
+                 if action == "BUY":
                      confidence += 5
-                     reasons.append(f"✅ Near support zone ({distance_to_support:.1f}%)")
-                
-                # Check for severe weakness to potentially revert to HOLD
-                if score < -3:
-                     action = "HOLD"
-                     confidence = 50
-                     reasons.append("⚠️ Bearish momentum too strong for entry yet")
+                 reasons.append(f"✅ Near support zone ({distance_to_support:.1f}%)")
+            
+            # Check for severe weakness to override BUY (Stop Loss Prevention)
+            if score < -5 and action == "BUY":
+                 action = "HOLD"
+                 confidence = 50
+                 reasons.append("⚠️ Bearish momentum too strong (Score < -5) - Cancelling Buy")
                 
         elif trend == "uptrend":
              # STRATEGIC VIEW: Price is high/rising.
@@ -1015,6 +1073,25 @@ class TradingAnalyzer:
              elif outperformance < -5:
                  reasons.append(f"📉 Stock is underperforming market by {abs(outperformance):.1f}%")
 
+        # Sector Momentum Analysis
+        if sector_analysis and sector_analysis.get('available', False):
+            sector_context = self.sector_analyzer.get_sector_context_for_recommendation(sector_analysis)
+            score += sector_context.get('score_adjustment', 0)
+            reasons.extend(sector_context.get('reasoning', []))
+            
+            # Additional confidence adjustment for sector alignment
+            sector_signal = sector_analysis.get('sector_signal', 'neutral')
+            if action == "BUY" and sector_signal in ['strong_outperform', 'outperform']:
+                confidence = min(95, confidence + 5)
+            elif action == "SELL" and sector_signal in ['strong_underperform', 'underperform']:
+                confidence = min(95, confidence + 5)
+        
+        # Catalyst Detection and Confidence Adjustment
+        if catalyst_info and catalyst_info.get('available', False):
+            catalyst_adj = self.catalyst_detector.get_catalyst_adjustment(catalyst_info)
+            confidence = max(30, confidence + catalyst_adj.get('confidence_adjustment', 0))
+            reasons.extend(catalyst_adj.get('reasoning', []))
+
         # Estimate entry/exit based on User Intent
         entry_price = current_price
         
@@ -1044,7 +1121,13 @@ class TradingAnalyzer:
                     # Support too far, use recent low or volatility based stop
                     stop_loss = max(recent_low * 0.98, current_price * 0.95)
             else:
-                 stop_loss = current_price * 0.96 # Fallback tight stop
+                 # Dynamic Volatility Stop (ATR)
+                 atr = indicators.get('atr', 0)
+                 if atr > 0:
+                     # 2.0 ATR captures normal volatility noise
+                     stop_loss = current_price - (2.0 * atr)
+                 else:
+                     stop_loss = current_price * 0.95 # Fallback to 5% fixed stop
             
             # Sanity check for stop loss
             if stop_loss >= current_price:
@@ -1089,7 +1172,12 @@ class TradingAnalyzer:
                  else:
                      stop_loss = min(recent_high * 1.02, current_price * 1.05)
             else:
-                 stop_loss = current_price * 1.05
+                 # Dynamic Volatility Stop (ATR) for Shorts
+                 atr = indicators.get('atr', 0)
+                 if atr > 0:
+                     stop_loss = current_price + (2.0 * atr)
+                 else:
+                     stop_loss = current_price * 1.05
                  
             # 2. TARGET PRICE (Downside / Support)
             if support and support < current_price:
@@ -1105,12 +1193,59 @@ class TradingAnalyzer:
              target_price = current_price
              stop_loss = current_price
         
+        # Calculate explicit Risk-to-Reward ratio
+        if action == "BUY":
+            potential_reward = target_price - entry_price
+            potential_risk = entry_price - stop_loss
+        elif action == "SELL":
+            potential_reward = entry_price - target_price
+            potential_risk = stop_loss - entry_price
+        else:
+            potential_reward = 0
+            potential_risk = 0
+        
+        if potential_risk > 0:
+            rr_ratio = potential_reward / potential_risk
+        else:
+            rr_ratio = 0
+        
+        # R:R quality assessment
+        if rr_ratio >= 3.0:
+            rr_quality = "Excellent"
+        elif rr_ratio >= 2.0:
+            rr_quality = "Good"
+        elif rr_ratio >= 1.5:
+            rr_quality = "Acceptable"
+        elif rr_ratio >= 1.0:
+            rr_quality = "Marginal"
+            if action != "HOLD":
+                confidence = max(30, confidence - 10)
+                reasons.append(f"⚠️ Marginal R:R ratio ({rr_ratio:.1f}:1)")
+        else:
+            rr_quality = "Poor"
+            if action != "HOLD":
+                # Very poor R:R - consider forcing HOLD
+                reasons.append(f"⚠️ Poor R:R ratio ({rr_ratio:.1f}:1) - trade may not be worth risk")
+                confidence = max(25, confidence - 15)
+        
+        # Add R:R to reasons for good trades
+        if rr_ratio >= 2.0 and action != "HOLD":
+            reasons.append(f"✅ {rr_quality} Risk/Reward: {rr_ratio:.1f}:1")
+        
+        # Get liquidity grade from volume analysis
+        liquidity_grade = volume_analysis.get('liquidity_grade', 'unknown')
+        if liquidity_grade == 'low' and action != "HOLD":
+            confidence = max(30, confidence - 10)
+            reasons.append("⚠️ Low liquidity - increased execution risk")
+        
         return {
             "action": action,
             "confidence": confidence,
             "entry_price": float(entry_price),
             "target_price": float(target_price),
             "stop_loss": float(stop_loss),
+            "risk_reward_ratio": round(rr_ratio, 2),
+            "rr_quality": rr_quality,
             "score": score,
             "reasons": reasons,
             "estimated_days": self._calculate_estimated_days(entry_price, target_price, indicators.get('atr', 0))
@@ -1147,7 +1282,8 @@ class TradingAnalyzer:
                            price_action: dict, volume_analysis: dict,
                            momentum_analysis: dict, support_resistance: dict = None,
                            market_regime: dict = None, timeframe_analysis: dict = None,
-                           relative_strength: dict = None) -> str:
+                           relative_strength: dict = None, sector_analysis: dict = None,
+                           catalyst_info: dict = None) -> str:
         """Generate human-readable reasoning for the recommendation"""
         action = recommendation.get('action', 'HOLD')
         reasons = recommendation.get('reasons', [])

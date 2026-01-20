@@ -193,6 +193,7 @@ class StockerApp:
             logger.warning(f"Could not initialize ML Scheduler: {e}")
             self.ml_scheduler = None
         
+        
         # Initialize new modules if available
         if HAS_NEW_MODULES:
             try:
@@ -5092,15 +5093,44 @@ SELL SIGNALS:
         try:
             # Get all predictions instead of just active ones
             all_predictions = self.trend_change_tracker.predictions
-            # Sort: Active first, then by date newest
+            
+            # Separate active from verified/expired
             active_preds = [p for p in all_predictions if p.get('status') == 'active']
             other_preds = [p for p in all_predictions if p.get('status') != 'active']
             
-            # Sort others by verification date or timestamp
+            # Custom sorting for active predictions:
+            # 1. Favorites (starred) first, sorted by shortest date until confirmation
+            # 2. Non-favorites sorted by proximity to today (shortest predicted date first)
+            from datetime import datetime
+            now = datetime.now()
+            
+            def get_days_until(pred):
+                """Get days until estimated date (negative if past)"""
+                try:
+                    est_date = datetime.fromisoformat(pred.get('estimated_date', ''))
+                    return (est_date - now).days
+                except:
+                    return 9999  # Default to far future if parsing fails
+            
+            # Separate favorites from non-favorites (based on monitored_stocks)
+            monitored = getattr(self, 'monitored_stocks', [])
+            fav_preds = [p for p in active_preds if p.get('symbol', '') in monitored]
+            nonfav_preds = [p for p in active_preds if p.get('symbol', '') not in monitored]
+            
+            # Sort favorites by shortest date (ascending - closest first)
+            fav_preds.sort(key=get_days_until)
+            
+            # Sort non-favorites by shortest date (ascending - closest first)
+            nonfav_preds.sort(key=get_days_until)
+            
+            # Combine: Favorites first, then non-favorites, then historical
+            active_sorted = fav_preds + nonfav_preds
+            
+            # Sort others by verification date or timestamp (newest first for history)
             other_preds.sort(key=lambda x: x.get('verification_date') or x.get('timestamp', ''), reverse=True)
             
-            # Combine
-            self.trend_change_predictions = active_preds + other_preds
+            # Combine all
+            self.trend_change_predictions = active_sorted + other_preds
         except Exception as e:
             logger.error(f"Error loading trend change predictions: {e}")
             self.trend_change_predictions = []
@@ -6005,7 +6035,7 @@ SELL SIGNALS:
         try:
             verified = self.potentials_tracker.check_for_verification(
                 self.data_fetcher, 
-                self.calibration_manager
+                self.learning_tracker.calibration_manager if hasattr(self, 'learning_tracker') else None
             )
             if verified:
                 logger.info(f"🎯 Verified {len(verified)} potentials at startup, fed to Megamind for learning")
@@ -9617,7 +9647,197 @@ By using this application, you acknowledge that you understand and accept these 
             font=('Segoe UI', 8),
             justify=tk.LEFT
         )
-        info_label.pack(anchor=tk.W, pady=(5, 0))
+        # ====================================================================
+        # SECTOR MODEL TRAINING SECTION
+        # ====================================================================
+        sector_frame = tk.Frame(dialog, bg=theme['bg'])
+        sector_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        sector_header = tk.Label(
+            sector_frame,
+            text="🏭 Sector Model Training",
+            bg=theme['bg'],
+            fg=theme['accent'],
+            font=('Segoe UI', 10, 'bold')
+        )
+        sector_header.pack(anchor=tk.W)
+        
+        sector_info = tk.Label(
+            sector_frame,
+            text="Train specialized models per sector (Tech, Financial, Healthcare, etc.).\n"
+                 "Sector models use 10+ stocks for better pattern recognition.",
+            bg=theme['bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 8),
+            justify=tk.LEFT
+        )
+        sector_info.pack(anchor=tk.W, pady=(0, 5))
+        
+        sector_input_frame = tk.Frame(sector_frame, bg=theme['bg'])
+        sector_input_frame.pack(fill=tk.X)
+        
+        # Sector dropdown
+        tk.Label(
+            sector_input_frame,
+            text="Sector:",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 9)
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        
+        sector_options = [
+            "technology", "financial", "healthcare", "consumer", "energy",
+            "industrials", "materials", "utilities", "real_estate", "communication"
+        ]
+        sector_display_map = {
+            "technology": "💻 Technology",
+            "financial": "🏦 Financial",
+            "healthcare": "🏥 Healthcare",
+            "consumer": "🛒 Consumer",
+            "energy": "⚡ Energy",
+            "industrials": "🏭 Industrials",
+            "materials": "🧱 Materials",
+            "utilities": "💡 Utilities",
+            "real_estate": "🏠 Real Estate",
+            "communication": "📡 Communication"
+        }
+        
+        sector_var = tk.StringVar(value="technology")
+        sector_combo = ttk.Combobox(
+            sector_input_frame,
+            textvariable=sector_var,
+            values=[sector_display_map.get(s, s) for s in sector_options],
+            state='readonly',
+            width=18
+        )
+        sector_combo.pack(side=tk.LEFT, padx=5)
+        sector_combo.current(0)
+        
+        # Stock count
+        tk.Label(
+            sector_input_frame,
+            text="Stocks:",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 9)
+        ).pack(side=tk.LEFT, padx=(10, 5))
+        
+        stock_count_var = tk.StringVar(value="10")
+        stock_count_entry = tk.Entry(
+            sector_input_frame,
+            textvariable=stock_count_var,
+            font=('Segoe UI', 10),
+            bg=theme['entry_bg'],
+            fg=theme['entry_fg'],
+            width=5
+        )
+        stock_count_entry.pack(side=tk.LEFT, padx=5)
+        
+        def train_sector_model():
+            """Train a Sector ML model"""
+            # Get sector from display name
+            selected_display = sector_var.get()
+            selected_sector = None
+            for key, val in sector_display_map.items():
+                if val == selected_display:
+                    selected_sector = key
+                    break
+            if not selected_sector:
+                selected_sector = selected_display.lower()
+            
+            try:
+                stock_count = int(stock_count_var.get())
+            except ValueError:
+                stock_count = 10
+            
+            start_date = start_entry.get()
+            end_date = end_entry.get()
+            strategy = strategy_var.get()
+            
+            status_text.delete(1.0, tk.END)
+            status_text.insert(tk.END, f"🏭 Training {sector_display_map.get(selected_sector, selected_sector)} model...\\n")
+            status_text.insert(tk.END, f"Strategy: {strategy}\\n")
+            status_text.insert(tk.END, f"Stocks: {stock_count}\\n")
+            status_text.insert(tk.END, f"Period: {start_date} to {end_date}\\n\\n")
+            status_text.update()
+            
+            def train_sector_async():
+                try:
+                    from sector_ml import SectorML
+                    
+                    sector_ml = SectorML(self.data_dir, selected_sector, strategy)
+                    result = sector_ml.train(
+                        self.data_fetcher,
+                        start_date,
+                        end_date,
+                        stock_count=stock_count,
+                        progress_callback=lambda msg: dialog.after(0, lambda: safe_insert_sector(msg))
+                    )
+                    
+                    if 'error' in result:
+                        dialog.after(0, lambda: safe_insert_sector(f"\\n❌ Error: {result['error']}"))
+                    elif result.get('kept_existing'):
+                        dialog.after(0, lambda: safe_insert_sector(
+                            f"\\n⚠️ {result.get('message', 'New model worse than existing')}"
+                        ))
+                    else:
+                        improved_msg = " (IMPROVED! 🚀)" if result.get('improved') else ""
+                        dialog.after(0, lambda: safe_insert_sector(
+                            f"\\n✅ {result.get('sector_display', selected_sector)} Model Trained!{improved_msg}\\n"
+                            f"Stocks Used: {len(result.get('stocks_used', []))}\\n"
+                            f"Training Samples: {result.get('training_samples', 0)}\\n"
+                            f"Test Accuracy: {result.get('test_accuracy', 0)*100:.1f}%\\n"
+                            f"Cross-Validation: {result.get('cross_validation_accuracy', 0)*100:.1f}% ± {result.get('cv_std', 0)*100:.1f}%\\n\\n"
+                            f"This sector model will now be used for all stocks in this sector."
+                        ))
+                except Exception as e:
+                    error_msg = str(e)
+                    dialog.after(0, lambda msg=error_msg: safe_insert_sector(f"\\n❌ Error: {msg}"))
+            
+            def safe_insert_sector(text):
+                try:
+                    if dialog.winfo_exists():
+                        status_text.insert(tk.END, text + "\\n")
+                        status_text.see(tk.END)
+                except (tk.TclError, AttributeError):
+                    pass
+            
+            thread = threading.Thread(target=train_sector_async)
+            thread.daemon = True
+            thread.start()
+        
+        sector_train_btn = tk.Button(
+            sector_input_frame,
+            text="🏭 Train Sector",
+            command=train_sector_model,
+            bg=theme['button_bg'],
+            fg=theme['button_fg'],
+            font=('Segoe UI', 9, 'bold'),
+            relief=tk.FLAT,
+            cursor='hand2',
+            padx=10
+        )
+        sector_train_btn.pack(side=tk.LEFT, padx=10)
+        
+        # Show existing sector models
+        try:
+            from sector_ml import SectorMLManager, SECTOR_DISPLAY_NAMES
+            sector_manager = SectorMLManager(self.data_dir, strategy_var.get())
+            sector_list = sector_manager.list_models()
+            if sector_list:
+                sector_text = ", ".join([f"{SECTOR_DISPLAY_NAMES.get(s['sector'], s['sector'])} ({s['accuracy']*100:.0f}%)" for s in sector_list[:4]])
+                if len(sector_list) > 4:
+                    sector_text += f" +{len(sector_list) - 4} more"
+                existing_label = tk.Label(
+                    sector_frame,
+                    text=f"Trained sectors: {sector_text}",
+                    bg=theme['bg'],
+                    fg=theme['text_secondary'],
+                    font=('Segoe UI', 8)
+                )
+                existing_label.pack(anchor=tk.W, pady=(5, 0))
+        except:
+            pass
         
         # Retrain from verified predictions option
         retrain_frame = tk.Frame(dialog, bg=theme['bg'])
@@ -9754,15 +9974,22 @@ By using this application, you acknowledge that you understand and accept these 
         
         def load_config():
             """Load a saved ML training configuration"""
+            # Debug: show where we're looking for configs
+            status_text.insert(tk.END, f"📂 Looking for configs in: {config_manager.configs_dir}\n")
+            status_text.see(tk.END)
+            
             configs = config_manager.list_configs()
             
+            status_text.insert(tk.END, f"📋 Found {len(configs)} configurations\n")
+            status_text.see(tk.END)
+            
             if not configs:
-                messagebox.showinfo("No Configurations", "No saved configurations found.\n\nSave your current configuration first!")
+                messagebox.showinfo("No Configurations", f"No saved configurations found in:\n{config_manager.configs_dir}\n\nSave your current configuration first!")
                 return
             
             load_dialog = tk.Toplevel(dialog)
             load_dialog.title("Load Configuration")
-            load_dialog.geometry("500x400")
+            load_dialog.geometry("600x450")
             load_dialog.transient(dialog)
             load_dialog.config(bg=theme['bg'])
             
@@ -9774,88 +10001,115 @@ By using this application, you acknowledge that you understand and accept these 
                 font=('Segoe UI', 12, 'bold')
             ).pack(pady=10)
             
-            # Listbox with scrollbar
-            list_frame = tk.Frame(load_dialog, bg=theme['bg'])
+            # Use a simple frame with standard scrollbar
+            list_frame = tk.Frame(load_dialog, bg='white', relief=tk.SUNKEN, bd=2)
             list_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
             
-            scrollbar = ModernScrollbar(list_frame)
+            # Standard scrollbar (not custom)
+            scrollbar = ttk.Scrollbar(list_frame)
             scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
             
-            config_listbox = tk.Listbox(
+            # Use Text widget instead of Listbox for better visibility
+            config_text = tk.Text(
                 list_frame,
-                font=('Segoe UI', 10),
-                bg=theme['frame_bg'],
-                fg=theme['fg'],
-                selectbackground=theme['accent'],
+                font=('Consolas', 10),
+                bg='white',
+                fg='black',
+                cursor='arrow',
+                height=15,
+                width=70,
                 yscrollcommand=scrollbar.set,
-                height=10
+                state=tk.NORMAL
             )
-            config_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            scrollbar.config(command=config_listbox.yview)
+            config_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.config(command=config_text.yview)
             
-            # Populate list
-            for config in configs:
+            # Store config names for selection
+            config_names = []
+            
+            # Debug output
+            status_text.insert(tk.END, f"📝 Adding {len(configs)} configs to list:\n")
+            
+            # Populate with clickable items
+            config_text.insert(tk.END, "Click on a configuration name to select it:\n\n")
+            for i, config in enumerate(configs):
                 name = config.get('name', 'Unknown')
-                desc = config.get('description', '')
+                desc = config.get('description', '')[:40]
                 saved = config.get('saved_at', '')
-                display = f"{name}"
+                
+                display = f"  [{i+1}] {name}"
                 if desc:
-                    display += f" - {desc}"
+                    display += f"\n      {desc}"
                 if saved:
                     try:
                         saved_dt = datetime.fromisoformat(saved)
-                        display += f" ({saved_dt.strftime('%Y-%m-%d %H:%M')})"
+                        display += f"\n      Saved: {saved_dt.strftime('%Y-%m-%d %H:%M')}"
                     except:
                         pass
-                config_listbox.insert(tk.END, display)
+                display += "\n\n"
+                
+                config_text.insert(tk.END, display)
+                config_names.append(name)
+                status_text.insert(tk.END, f"  {i+1}. {name}\n")
             
-            if configs:
-                config_listbox.selection_set(0)
+            config_text.config(state=tk.DISABLED)  # Make read-only
+            status_text.see(tk.END)
             
-            selected_config = {'name': None}
+            # Selection via simple entry field
+            select_frame = tk.Frame(load_dialog, bg=theme['bg'])
+            select_frame.pack(pady=5, padx=20, fill=tk.X)
+            
+            tk.Label(select_frame, text="Enter number (1-9):", bg=theme['bg'], fg=theme['fg']).pack(side=tk.LEFT)
+            select_entry = tk.Entry(select_frame, width=5, font=('Segoe UI', 12))
+            select_entry.pack(side=tk.LEFT, padx=10)
+            select_entry.insert(0, "1")
             
             def do_load():
-                selection = config_listbox.curselection()
-                if not selection:
-                    messagebox.showwarning("No Selection", "Please select a configuration to load.")
-                    return
-                
-                selected_name = configs[selection[0]]['name']
-                config = config_manager.load_config(selected_name)
-                
-                if config:
-                    # Apply config to training (for next training run)
-                    # Store in a way that training can use it
-                    self._saved_training_config = config_manager.apply_config_to_training(config)
-                    messagebox.showinfo(
-                        "Configuration Loaded",
-                        f"Configuration '{selected_name}' loaded!\n\n"
-                        f"Description: {config.get('description', 'N/A')}\n\n"
-                        "This configuration will be used for the next training run."
-                    )
-                    load_dialog.destroy()
-                else:
-                    messagebox.showerror("Error", f"Failed to load configuration '{selected_name}'")
+                try:
+                    num = int(select_entry.get().strip())
+                    if num < 1 or num > len(config_names):
+                        messagebox.showwarning("Invalid Selection", f"Please enter a number between 1 and {len(config_names)}")
+                        return
+                    
+                    selected_name = config_names[num - 1]
+                    config = config_manager.load_config(selected_name)
+                    
+                    if config:
+                        self._saved_training_config = config_manager.apply_config_to_training(config)
+                        messagebox.showinfo(
+                            "Configuration Loaded",
+                            f"Configuration '{selected_name}' loaded!\n\n"
+                            f"Description: {config.get('description', 'N/A')}\n\n"
+                            "This configuration will be used for the next training run."
+                        )
+                        load_dialog.destroy()
+                    else:
+                        messagebox.showerror("Error", f"Failed to load configuration '{selected_name}'")
+                except ValueError:
+                    messagebox.showwarning("Invalid Input", "Please enter a valid number")
             
             def do_delete():
-                selection = config_listbox.curselection()
-                if not selection:
-                    messagebox.showwarning("No Selection", "Please select a configuration to delete.")
-                    return
-                
-                selected_name = configs[selection[0]]['name']
-                response = messagebox.askyesno(
-                    "Delete Configuration?",
-                    f"Are you sure you want to delete '{selected_name}'?\n\nThis cannot be undone."
-                )
-                
-                if response:
-                    if config_manager.delete_config(selected_name):
-                        messagebox.showinfo("Deleted", f"Configuration '{selected_name}' deleted.")
-                        load_dialog.destroy()
-                        load_config()  # Refresh list
-                    else:
-                        messagebox.showerror("Error", f"Failed to delete configuration '{selected_name}'")
+                try:
+                    num = int(select_entry.get().strip())
+                    if num < 1 or num > len(config_names):
+                        messagebox.showwarning("Invalid Selection", f"Please enter a number between 1 and {len(config_names)}")
+                        return
+                    
+                    selected_name = config_names[num - 1]
+                    response = messagebox.askyesno(
+                        "Delete Configuration?",
+                        f"Are you sure you want to delete '{selected_name}'?\n\nThis cannot be undone."
+                    )
+                    
+                    if response:
+                        if config_manager.delete_config(selected_name):
+                            messagebox.showinfo("Deleted", f"Configuration '{selected_name}' deleted.")
+                            load_dialog.destroy()
+                            load_config()  # Refresh list
+                        else:
+                            messagebox.showerror("Error", f"Failed to delete configuration '{selected_name}'")
+                except ValueError:
+                    messagebox.showwarning("Invalid Input", "Please enter a valid number")
             
             btn_frame_load = tk.Frame(load_dialog, bg=theme['bg'])
             btn_frame_load.pack(pady=10)

@@ -13,33 +13,47 @@ if sys.platform == 'win32':
 def clear_performance_stats():
     print("Cleaning up performance stats...")
     
-    # Files to delete
+    # FIXED: Use APP_DATA_DIR instead of hardcoded paths
+    from config import APP_DATA_DIR
+    data_dir = APP_DATA_DIR
+    
+    print(f"Looking in: {data_dir}")
+    
+    # Files to delete (relative to data_dir)
     files = [
-        "data/performance_attribution.json",
-        "data/production_monitoring_trading.json",
-        "data/ab_tests_trading.json",
-        "data/model_benchmarks.json"
+        "performance_attribution.json",
+        "production_monitoring_trading.json",
+        "production_monitoring_trading_bear.json",
+        "production_monitoring_trading_bull.json",
+        "production_monitoring_trading_sideways.json",
+        "ab_tests_trading.json",
+        "model_benchmarks.json",
+        "performance_history.json"
     ]
     
-    for relative_path in files:
-        path = Path(relative_path)
+    deleted = 0
+    for filename in files:
+        path = data_dir / filename
         if path.exists():
             try:
-                # Option 1: Delete file
                 path.unlink()
-                print(f"Deleted {path}")
+                print(f"✅ Deleted {filename}")
+                deleted += 1
             except Exception as e:
-                print(f"Failed to delete {path}: {e}")
+                print(f"❌ Failed to delete {filename}: {e}")
                 
                 # Option 2: Clear content if delete fails
                 try:
                     with open(path, 'w') as f:
                         json.dump({}, f)
-                    print(f"Cleared content of {path}")
+                    print(f"✅ Cleared content of {filename}")
+                    deleted += 1
                 except Exception as e2:
-                    print(f"Failed to clear {path}: {e2}")
+                    print(f"❌ Failed to clear {filename}: {e2}")
         else:
-            print(f"{path} not found (already clean)")
+            print(f"⏭️ {filename} not found (skipped)")
+    
+    print(f"\n✅ Cleaned {deleted} files")
 
 if __name__ == "__main__":
     clear_performance_stats()

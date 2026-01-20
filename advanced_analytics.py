@@ -277,9 +277,20 @@ class AdvancedAnalytics:
         market_mean = market.mean()
         alpha = stock_mean - (beta * market_mean)
         
-        # R-squared
-        correlation = np.corrcoef(stock, market)[0, 1]
-        r_squared = correlation ** 2
+        # R-squared (with NaN protection)
+        try:
+            # Check for constant series which causes NaN in corrcoef
+            if stock.std() == 0 or market.std() == 0:
+                correlation = 0.0
+                r_squared = 0.0
+            else:
+                correlation = np.corrcoef(stock, market)[0, 1]
+                if np.isnan(correlation):
+                    correlation = 0.0
+                r_squared = correlation ** 2
+        except Exception:
+            correlation = 0.0
+            r_squared = 0.0
         
         return {
             'beta': float(beta),
