@@ -16,6 +16,14 @@ from investing_analyzer import InvestingAnalyzer
 from mixed_analyzer import MixedAnalyzer
 from prediction_cache import get_cache
 
+# Import Sector ML if available
+try:
+    from sector_ml import SectorMLManager, SECTOR_DISPLAY_NAMES
+    from sector_mapper import SectorMapper
+    HAS_SECTOR_ML = True
+except ImportError:
+    HAS_SECTOR_ML = False
+
 # Import configuration
 from config import (ML_HIGH_ACCURACY_THRESHOLD, ML_VERY_HIGH_ACCURACY_THRESHOLD,
                    ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD, ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL,
@@ -58,6 +66,19 @@ class HybridStockPredictor:
         # Performance tracking
         self.performance_file = data_dir / "performance_history.json"
         self.performance_history = self._load_performance()
+        
+        # Sector ML Manager (for sector-specific specialized models)
+        self.sector_manager = None
+        self.sector_mapper = None
+        if HAS_SECTOR_ML:
+            try:
+                self.sector_manager = SectorMLManager(data_dir, strategy)
+                self.sector_mapper = SectorMapper(data_dir)
+                sector_count = len(self.sector_manager.list_models())
+                if sector_count > 0:
+                    logger.info(f"🏭 Loaded {sector_count} Sector model(s) for {strategy}")
+            except Exception as e:
+                logger.warning(f"Could not initialize Sector ML Manager: {e}")
     
     def _load_ensemble_weights(self) -> Dict:
         """Load ensemble weights"""
@@ -179,6 +200,58 @@ class HybridStockPredictor:
         else:
             logger.info(f"✓ ML model available for {self.strategy} strategy")
         
+        # Check for Sector-specific model (sector-specialized ML)
+        sector_result = None
+        used_sector_model = False
+        sector_fallback_reason = None
+        detected_sector = None
+        
+        if self.sector_manager and self.sector_mapper and symbol:
+            try:
+                # Detect sector for this stock
+                detected_sector = self.sector_mapper.get_sector(symbol)
+                
+                if detected_sector and self.sector_manager.has_model(detected_sector):
+                    # Get sector model accuracy
+                    sector_accuracy = self.sector_manager.get_accuracy(detected_sector)
+                    
+                    # Get general model accuracy
+                    general_accuracy = 0
+                    if hasattr(self.ml_predictor, 'metadata') and self.ml_predictor.metadata:
+                        general_accuracy = self.ml_predictor.metadata.get('test_accuracy', 0)
+                    
+                    sector_display = SECTOR_DISPLAY_NAMES.get(detected_sector, detected_sector)
+                    
+                    # Only use sector model if it's more accurate than general
+                    if sector_accuracy > general_accuracy:
+                        indicators = base_analysis.get('indicators', {})
+                        market_regime = base_analysis.get('market_regime', None)
+                        timeframe_analysis = base_analysis.get('timeframe_analysis', None)
+                        relative_strength = base_analysis.get('relative_strength', None)
+                        support_resistance = base_analysis.get('support_resistance', None)
+                        
+                        features = self.feature_extractor.extract_features(
+                            stock_data, history_data, financials_data, indicators,
+                            market_regime, timeframe_analysis, relative_strength, support_resistance
+                        )
+                        
+                        sector_result = self.sector_manager.predict(detected_sector, features, self.ml_predictor)
+                        used_sector_model = sector_result.get('used_sector_model', False)
+                        
+                        if used_sector_model:
+                            logger.info(f"🏭 Using {sector_display} model for {symbol}: {sector_result.get('action')} ({sector_result.get('confidence', 0):.0%}) [Sector: {sector_accuracy*100:.1f}% > General: {general_accuracy*100:.1f}%]")
+                    else:
+                        # Sector model exists but general is better
+                        sector_fallback_reason = f"General model ({general_accuracy*100:.1f}%) outperforms {sector_display} ({sector_accuracy*100:.1f}%)"
+                        logger.info(f"📊 {symbol}: {sector_fallback_reason} - Using general model")
+                elif detected_sector:
+                    sector_fallback_reason = f"No trained model for sector: {detected_sector}"
+                else:
+                    sector_fallback_reason = f"Unknown sector for {symbol}"
+                    
+            except Exception as e:
+                logger.warning(f"Sector ML prediction failed for {symbol}: {e}")
+        
         if ml_available:
             try:
                 indicators = base_analysis.get('indicators', {})
@@ -232,6 +305,21 @@ class HybridStockPredictor:
             log_parts.append(f"final={final_prediction.get('recommendation', {}).get('action')} "
                            f"(weights: rule={ensemble_weights.get('rule', 0):.2f}, ml={ensemble_weights.get('ml', 0):.2f})")
             logger.debug(", ".join(log_parts))
+        
+        # Add Sector ML metadata to final prediction
+        if sector_result and used_sector_model:
+            final_prediction['used_sector_model'] = True
+            final_prediction['sector'] = detected_sector
+            final_prediction['sector_display'] = SECTOR_DISPLAY_NAMES.get(detected_sector, detected_sector) if HAS_SECTOR_ML else detected_sector
+            final_prediction['sector_accuracy'] = sector_result.get('sector_accuracy', 0)
+        elif detected_sector:
+            final_prediction['used_sector_model'] = False
+            final_prediction['sector'] = detected_sector
+            final_prediction['sector_fallback_reason'] = sector_fallback_reason
+        else:
+            final_prediction['used_sector_model'] = False
+            final_prediction['sector'] = None
+            final_prediction['sector_fallback_reason'] = sector_fallback_reason
         
         # Store in cache for future use
         if symbol:

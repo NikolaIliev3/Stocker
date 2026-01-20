@@ -193,6 +193,7 @@ class StockerApp:
             logger.warning(f"Could not initialize ML Scheduler: {e}")
             self.ml_scheduler = None
         
+        
         # Initialize new modules if available
         if HAS_NEW_MODULES:
             try:
@@ -285,6 +286,9 @@ class StockerApp:
         
         # Verify buy opportunities at startup
         self.root.after(7000, self._verify_buy_opportunities_at_startup)
+        
+        # Verify potentials at startup (and feed to Megamind)
+        self.root.after(8000, self._verify_potentials_at_startup)
         
         # Schedule automatic training checks
         self._schedule_auto_training()
@@ -3028,12 +3032,16 @@ class StockerApp:
         strategy = self.strategy_var.get()
         
         # Calculate estimated days based on strategy
-        if strategy == "trading":
-            estimated_days = 10  # Short-term: ~10 days
-        elif strategy == "mixed":
-            estimated_days = 21  # Medium-term: ~3 weeks
-        else:  # investing
-            estimated_days = 547  # Long-term: ~1.5 years
+        estimated_days = recommendation.get('estimated_days')
+        
+        if not estimated_days:
+            # Fallback to defaults if not provided by analyzer
+            if strategy == "trading":
+                estimated_days = 10  # Short-term: ~10 days
+            elif strategy == "mixed":
+                estimated_days = 21  # Medium-term: ~3 weeks
+            else:  # investing
+                estimated_days = 547  # Long-term: ~1.5 years
         
         prediction = self.predictions_tracker.add_prediction(
             self.current_symbol, strategy, action, entry_price, 
@@ -4091,12 +4099,17 @@ class StockerApp:
                         stop_loss = current_price
                     
                     # Calculate estimated days
-                    if strategy == "trading":
-                        estimated_days = 10
-                    elif strategy == "mixed":
-                        estimated_days = 21
-                    else:  # investing
-                        estimated_days = 547
+                    # Use dynamic date from recommendation if available
+                    rec = analysis.get('recommendation', {})
+                    estimated_days = rec.get('estimated_days')
+                    
+                    if not estimated_days:
+                        if strategy == "trading":
+                            estimated_days = 21 # Default to medium if unknown
+                        elif strategy == "mixed":
+                            estimated_days = 30
+                        else:  # investing
+                            estimated_days = 547
                     
                     # Save prediction
                     prediction = self.predictions_tracker.add_prediction(
@@ -5063,6 +5076,8 @@ SELL SIGNALS:
         self.trend_change_tree.bind("<MouseWheel>", on_trend_tree_mousewheel)
         self.trend_change_tree.bind("<Button-4>", lambda e: self.trend_change_tree.yview_scroll(-3, "units") or "break")
         self.trend_change_tree.bind("<Button-5>", lambda e: self.trend_change_tree.yview_scroll(3, "units") or "break")
+        # Right-click context menu
+        self.trend_change_tree.bind('<Button-3>', self._on_trend_tree_right_click)
         
         self.trend_change_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
@@ -5078,15 +5093,44 @@ SELL SIGNALS:
         try:
             # Get all predictions instead of just active ones
             all_predictions = self.trend_change_tracker.predictions
-            # Sort: Active first, then by date newest
+            
+            # Separate active from verified/expired
             active_preds = [p for p in all_predictions if p.get('status') == 'active']
             other_preds = [p for p in all_predictions if p.get('status') != 'active']
             
-            # Sort others by verification date or timestamp
+            # Custom sorting for active predictions:
+            # 1. Favorites (starred) first, sorted by shortest date until confirmation
+            # 2. Non-favorites sorted by proximity to today (shortest predicted date first)
+            from datetime import datetime
+            now = datetime.now()
+            
+            def get_days_until(pred):
+                """Get days until estimated date (negative if past)"""
+                try:
+                    est_date = datetime.fromisoformat(pred.get('estimated_date', ''))
+                    return (est_date - now).days
+                except:
+                    return 9999  # Default to far future if parsing fails
+            
+            # Separate favorites from non-favorites (based on monitored_stocks)
+            monitored = getattr(self, 'monitored_stocks', [])
+            fav_preds = [p for p in active_preds if p.get('symbol', '') in monitored]
+            nonfav_preds = [p for p in active_preds if p.get('symbol', '') not in monitored]
+            
+            # Sort favorites by shortest date (ascending - closest first)
+            fav_preds.sort(key=get_days_until)
+            
+            # Sort non-favorites by shortest date (ascending - closest first)
+            nonfav_preds.sort(key=get_days_until)
+            
+            # Combine: Favorites first, then non-favorites, then historical
+            active_sorted = fav_preds + nonfav_preds
+            
+            # Sort others by verification date or timestamp (newest first for history)
             other_preds.sort(key=lambda x: x.get('verification_date') or x.get('timestamp', ''), reverse=True)
             
-            # Combine
-            self.trend_change_predictions = active_preds + other_preds
+            # Combine all
+            self.trend_change_predictions = active_sorted + other_preds
         except Exception as e:
             logger.error(f"Error loading trend change predictions: {e}")
             self.trend_change_predictions = []
@@ -5334,6 +5378,8 @@ SELL SIGNALS:
             return "break"
         
         self.momentum_changes_tree.bind("<MouseWheel>", on_mom_tree_mousewheel)
+        # Right-click context menu
+        self.momentum_changes_tree.bind('<Button-3>', self._on_momentum_tree_right_click)
         self.momentum_changes_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
         
@@ -5456,6 +5502,127 @@ SELL SIGNALS:
         except Exception as e:
             logger.error(f"Error in momentum click handler: {e}")
 
+    def _on_momentum_tree_right_click(self, event):
+        """Show context menu on right-click in momentum changes tree"""
+        try:
+            item_id = self.momentum_changes_tree.identify_row(event.y)
+            if not item_id:
+                return
+            
+            # Select the row
+            self.momentum_changes_tree.selection_set(item_id)
+            values = self.momentum_changes_tree.item(item_id, 'values')
+            
+            if not values or len(values) < 3:
+                return
+            
+            symbol = values[2]  # Symbol is at index 2
+            is_fav = symbol.upper() in [s.upper() for s in self.monitored_stocks]
+            
+            # Create context menu
+            menu = tk.Menu(self.root, tearoff=0)
+            
+            # Favorite toggle
+            if is_fav:
+                menu.add_command(label="☆ Remove from Favorites", 
+                               command=lambda: self._toggle_favorite_from_menu(symbol))
+            else:
+                menu.add_command(label="★ Add to Favorites", 
+                               command=lambda: self._toggle_favorite_from_menu(symbol))
+            
+            menu.add_separator()
+            menu.add_command(label="📊 Analyze Stock", 
+                           command=lambda: self._analyze_stock_from_menu(symbol))
+            menu.add_command(label="📋 Copy Symbol", 
+                           command=lambda: self._copy_symbol_to_clipboard(symbol))
+            
+            # Show menu
+            menu.tk_popup(event.x_root, event.y_root)
+        except Exception as e:
+            logger.error(f"Error showing momentum context menu: {e}")
+        finally:
+            try:
+                menu.grab_release()
+            except:
+                pass
+
+    def _on_trend_tree_right_click(self, event):
+        """Show context menu on right-click in trend changes tree"""
+        try:
+            item_id = self.trend_change_tree.identify_row(event.y)
+            if not item_id:
+                return
+            
+            # Select the row
+            self.trend_change_tree.selection_set(item_id)
+            values = self.trend_change_tree.item(item_id, 'values')
+            
+            if not values or len(values) < 3:
+                return
+            
+            symbol = values[2]  # Symbol is at index 2 (Fav, ID, Symbol)
+            is_fav = symbol.upper() in [s.upper() for s in self.monitored_stocks]
+            
+            # Create context menu
+            menu = tk.Menu(self.root, tearoff=0)
+            
+            # Favorite toggle
+            if is_fav:
+                menu.add_command(label="☆ Remove from Favorites", 
+                               command=lambda: self._toggle_favorite_from_menu(symbol))
+            else:
+                menu.add_command(label="★ Add to Favorites", 
+                               command=lambda: self._toggle_favorite_from_menu(symbol))
+            
+            menu.add_separator()
+            menu.add_command(label="📊 Analyze Stock", 
+                           command=lambda: self._analyze_stock_from_menu(symbol))
+            menu.add_command(label="📋 Copy Symbol", 
+                           command=lambda: self._copy_symbol_to_clipboard(symbol))
+            
+            # Show menu
+            menu.tk_popup(event.x_root, event.y_root)
+        except Exception as e:
+            logger.error(f"Error showing trend context menu: {e}")
+        finally:
+            try:
+                menu.grab_release()
+            except:
+                pass
+
+    def _toggle_favorite_from_menu(self, symbol: str):
+        """Toggle favorite status from context menu and refresh all displays"""
+        try:
+            # Use preferences to toggle and persist
+            is_now_favorite = self.preferences.toggle_favorite(symbol)
+            
+            # Update local cache
+            self.monitored_stocks = self.preferences.get_monitored_stocks()
+            
+            # Log the change
+            status = "added to" if is_now_favorite else "removed from"
+            logger.info(f"★ {symbol} {status} favorites")
+            
+            # Refresh both displays
+            self._update_momentum_changes_display()
+            self._update_trend_change_display()
+            
+        except Exception as e:
+            logger.error(f"Error toggling favorite: {e}")
+
+    def _analyze_stock_from_menu(self, symbol: str):
+        """Analyze stock from context menu"""
+        self.symbol_entry.delete(0, tk.END)
+        self.symbol_entry.insert(0, symbol)
+        self.notebook.select(0)  # Analysis tab
+        self._analyze_stock()
+
+    def _copy_symbol_to_clipboard(self, symbol: str):
+        """Copy symbol to clipboard"""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(symbol)
+        logger.info(f"Copied {symbol} to clipboard")
+
     def _on_trend_change_tree_click(self, event):
         """Handle clicks on trend change tree (specifically Fav and Delete columns)"""
         try:
@@ -5470,46 +5637,41 @@ SELL SIGNALS:
             
             if not item_id:
                 return
+            
+            values = self.trend_change_tree.item(item_id, 'values')
+            if not values:
+                return
                 
             # Fav column (index 0 -> #1)
             if column == '#1':
-                values = self.trend_change_tree.item(item_id, 'values')
                 logger.info(f"DEBUG: Trend Tree Values: {values}")
-                if values and len(values) > 2:
-                    symbol = values[2] # Symbol is at index 2 (Fav, ID, Symbol)
-                    logger.info(f"DEBUG: Toggling {symbol} from Trend Tree")
-                    self._toggle_trend_monitoring(symbol, quiet=True)
-                    
-                    # Refresh UI
-                    self._update_trend_change_display()
-                    self._update_momentum_changes_display()
+                if len(values) > 2:
+                    symbol = values[2]  # Symbol is at index 2 (Fav, ID, Symbol)
+                    logger.info(f"DEBUG: Toggling favorite for {symbol} from Trend Tree")
+                    self._toggle_favorite_from_menu(symbol)
                 return
 
             # Delete column (index 9 -> #10)
             if column == '#10': 
-                values = self.trend_change_tree.item(item_id, 'values')
-                if values and len(values) > 1:
+                logger.info(f"DEBUG: Delete clicked, values: {values}")
+                if len(values) > 1:
                     # ID is at index 1 (Fav, ID, ...)
                     try:
                         prediction_id = int(values[1])
+                        logger.info(f"DEBUG: Deleting prediction ID: {prediction_id}")
                         if self.trend_change_tracker.delete_prediction(prediction_id):
                             self.trend_change_tree.delete(item_id)
                             # Remove from local list if exists
                             self.trend_change_predictions = [p for p in self.trend_change_predictions if p.get('id') != prediction_id]
-                    except ValueError:
-                        pass
+                            logger.info(f"DEBUG: Successfully deleted prediction {prediction_id}")
+                        else:
+                            logger.warning(f"DEBUG: delete_prediction returned False for ID {prediction_id}")
+                    except ValueError as ve:
+                        logger.error(f"DEBUG: ValueError parsing prediction ID: {ve}")
+                return
+                
         except Exception as e:
             logger.error(f"Error in trend click handler: {e}")
-            if values and len(values) > 1:
-                # ID is at index 1 (Fav, ID, ...)
-                try:
-                    prediction_id = int(values[1])
-                    if self.trend_change_tracker.delete_prediction(prediction_id):
-                        self.trend_change_tree.delete(item_id)
-                        # Remove from local list if exists
-                        self.trend_change_predictions = [p for p in self.trend_change_predictions if p.get('id') != prediction_id]
-                except ValueError:
-                    pass
 
 
     def _on_momentum_changes_tree_double_click(self, event):
@@ -5732,120 +5894,128 @@ SELL SIGNALS:
                     
                     current_price = data.get('price', 0)
                     
-                    # Get the required data structures for predict_trend_changes
-                    # history_data needs to be a dict with 'data' key containing the list
+                    # Get history data - fetch separately if not in stock data
                     history_list = data.get('history', [])
+                    if not history_list:
+                        # Fetch history separately
+                        history_result = self.data_fetcher.fetch_stock_history(symbol, period='1y')
+                        history_list = history_result.get('data', []) if history_result else []
+                    
                     if isinstance(history_list, list):
                         history_data = {'data': history_list}
                     else:
                         history_data = history_list if isinstance(history_list, dict) else {'data': []}
                     
-                    indicators = data.get('indicators', {})
-                    price_action = data.get('price_action', {'trend': 'sideways'})
-                    
-                    # Use trend change predictor for dip predictions
-                    predictions = self.trend_change_predictor.predict_trend_changes(
-                        symbol, history_data, indicators, price_action
-                    )
-                    
-                    found_for_symbol = False
-                    
-                    # Look for bullish reversal or dip opportunities (FUTURE)
-                    for pred in predictions:
-                        predicted_change = pred.get('predicted_change', '').lower()
-                        if 'bullish' in predicted_change:
-                            confidence = pred.get('confidence', 0)
-                            if confidence >= 50:  # Minimum threshold
-                                target_price = pred.get('target_low_price', current_price * 0.95)
-                                target_date = pred.get('estimated_date', '')
-                                reasoning = pred.get('reasoning', 'Bullish reversal expected')
-                                
-                                # Add to tracker
-                                self.potentials_tracker.add_potential(
-                                    symbol=symbol,
-                                    current_price=current_price,
-                                    target_price=target_price,
-                                    target_date=target_date,
-                                    confidence=confidence,
-                                    reasoning=f"📅 FUTURE: {reasoning}",
-                                    indicators=pred.get('key_indicators', {})
-                                )
-                                potentials_found.append(symbol)
-                                found_for_symbol = True
-                                break  # One per symbol
-                    
-                    # Also check for CURRENT buy opportunities
-                    if not found_for_symbol:
-                        rsi = indicators.get('rsi', 50)
-                        mfi = indicators.get('mfi', 50)
-                        macd_diff = indicators.get('macd_diff', 0)
-                        trend = price_action.get('trend', 'sideways')
-                        
-                        logger.info(f"DEBUG {symbol}: RSI={rsi:.1f}, MFI={mfi:.1f}, trend={trend}")
-                        
-                        # Current buy signals (relaxed thresholds)
-                        buy_signals = []
-                        confidence = 50
-                        
-                        # RSI signals
-                        if rsi < 30:
-                            buy_signals.append(f"RSI oversold ({rsi:.1f})")
-                            confidence += 20
-                        elif rsi < 45:
-                            buy_signals.append(f"RSI low ({rsi:.1f})")
-                            confidence += 8
-                        
-                        # MFI signals
-                        if mfi < 30:
-                            buy_signals.append(f"MFI low ({mfi:.1f})")
-                            confidence += 10
-                        
-                        # Golden cross
-                        if indicators.get('golden_cross', False):
-                            buy_signals.append("Golden cross")
-                            confidence += 20
-                        
-                        # MACD bullish
-                        if macd_diff > 0:
-                            buy_signals.append("MACD bullish")
-                            confidence += 5
-                        
-                        # Support level
-                        if price_action.get('at_support', False):
-                            buy_signals.append("At support")
-                            confidence += 10
-                        
-                        # Dip in uptrend
-                        if trend == 'uptrend':
-                            buy_signals.append("Uptrend")
-                            confidence += 10
-                            if rsi < 50:
-                                buy_signals.append("Pullback opportunity")
-                                confidence += 5
-                        
-                        # Downtrend reversal potential
-                        if trend == 'downtrend' and rsi < 35:
-                            buy_signals.append("Reversal potential")
-                            confidence += 10
-                        
-                        logger.info(f"DEBUG {symbol}: signals={buy_signals}, confidence={confidence}")
-                        
-                        # Lower threshold to 50 to catch more
-                        if buy_signals and confidence >= 50:
-                            from datetime import timedelta
-                            target_date = (datetime.now() + timedelta(days=7)).isoformat()
+                    # USE HYBRID ML PREDICTOR for enhanced predictions
+                    # This combines rule-based analysis with trained ML model
+                    try:
+                        hybrid_predictor = self.hybrid_predictors.get('trading')
+                        if hybrid_predictor and len(history_data.get('data', [])) >= 20:
+                            # Get full hybrid prediction (Rules + ML)
+                            analysis = hybrid_predictor.predict(data, history_data, None)
                             
-                            self.potentials_tracker.add_potential(
-                                symbol=symbol,
-                                current_price=current_price,
-                                target_price=current_price,
-                                target_date=target_date,
-                                confidence=min(confidence, 90),
-                                reasoning=f"🔥 NOW: {', '.join(buy_signals[:3])}",  # Top 3 reasons
-                                indicators=indicators
-                            )
-                            potentials_found.append(symbol)
-                            logger.info(f"DEBUG {symbol}: ADDED as potential!")
+                            if 'error' not in analysis:
+                                recommendation = analysis.get('recommendation', {})
+                                action = recommendation.get('action', 'HOLD')
+                                ml_confidence = recommendation.get('confidence', 50)
+                                
+                                # Get indicators from analysis
+                                indicators = analysis.get('indicators', {})
+                                price_action = analysis.get('price_action', {'trend': 'sideways'})
+                                
+                                rsi = indicators.get('rsi', 50)
+                                mfi = indicators.get('mfi', 50)
+                                trend = price_action.get('trend', 'sideways')
+                                
+                                # Check if ML says BUY or if indicators show opportunity
+                                is_ml_buy = action == 'BUY' and ml_confidence >= 55
+                                is_oversold = rsi < 40 or mfi < 35
+                                is_at_support = price_action.get('at_support', False)
+                                has_golden_cross = indicators.get('golden_cross', False)
+                                
+                                # Build buy signals list
+                                buy_signals = []
+                                confidence = 50
+                                
+                                # ML-based signals (highest priority)
+                                if is_ml_buy:
+                                    buy_signals.append(f"🤖 ML BUY ({ml_confidence:.0f}%)")
+                                    confidence += min(30, (ml_confidence - 50))
+                                
+                                # Technical signals
+                                if rsi < 30:
+                                    buy_signals.append(f"RSI oversold ({rsi:.1f})")
+                                    confidence += 15
+                                elif rsi < 40:
+                                    buy_signals.append(f"RSI low ({rsi:.1f})")
+                                    confidence += 8
+                                
+                                if mfi < 30:
+                                    buy_signals.append(f"MFI low ({mfi:.1f})")
+                                    confidence += 10
+                                
+                                if has_golden_cross:
+                                    buy_signals.append("Golden cross")
+                                    confidence += 15
+                                
+                                if is_at_support:
+                                    buy_signals.append("At support")
+                                    confidence += 10
+                                
+                                if trend == 'uptrend':
+                                    buy_signals.append("Uptrend")
+                                    confidence += 10
+                                elif trend == 'downtrend' and rsi < 35:
+                                    buy_signals.append("Reversal potential")
+                                    confidence += 10
+                                
+                                # Use ML confidence as floor if ML says BUY
+                                if is_ml_buy:
+                                    confidence = max(confidence, ml_confidence)
+                                
+                                # BEARISH HOLD: Include stocks that are bearish but waiting for entry
+                                is_bearish_hold = (action == 'HOLD' and trend == 'downtrend')
+                                if is_bearish_hold and not buy_signals:
+                                    buy_signals.append(f"🔜 Watching (Bearish HOLD)")
+                                    confidence = max(45, ml_confidence * 0.8)  # Lower confidence for watching
+                                
+                                logger.info(f"DEBUG {symbol}: ML={action}({ml_confidence:.0f}%), RSI={rsi:.1f}, MFI={mfi:.1f}, trend={trend}")
+                                logger.info(f"DEBUG {symbol}: signals={buy_signals}, confidence={confidence}")
+                                
+                                # Add potential if signals exist and confidence is high enough
+                                # Include BEARISH HOLD with lower threshold (45) vs normal (55)
+                                min_confidence = 45 if is_bearish_hold else 55
+                                if buy_signals and confidence >= min_confidence:
+                                    from datetime import timedelta
+                                    
+                                    # DYNAMIC TARGET DATE based on volatility/ATR
+                                    estimated_days = recommendation.get('estimated_days')
+                                    if not estimated_days or estimated_days <= 0:
+                                        # Fallback: use 10 days for trading-like potentials
+                                        estimated_days = 10
+                                    target_date = (datetime.now() + timedelta(days=estimated_days)).isoformat()
+                                    
+                                    # Use ML's target price if available
+                                    target_price = recommendation.get('target_price', current_price * 1.05)
+                                    
+                                    # Build reasoning with ML info
+                                    ml_method = analysis.get('method', 'rule_based')
+                                    reasoning_prefix = "🤖 ML+" if 'hybrid' in ml_method else "📊 Rules:"
+                                    
+                                    self.potentials_tracker.add_potential(
+                                        symbol=symbol,
+                                        current_price=current_price,
+                                        target_price=target_price,
+                                        target_date=target_date,
+                                        confidence=min(confidence, 95),
+                                        reasoning=f"{reasoning_prefix} {', '.join(buy_signals[:3])}",
+                                        indicators={k: v for k, v in indicators.items() if not isinstance(v, bool) or v}
+                                    )
+                                    potentials_found.append(symbol)
+                                    logger.info(f"DEBUG {symbol}: ADDED as potential (ML-enhanced, {estimated_days} days)!")
+                                    
+                    except Exception as e:
+                        logger.warning(f"Hybrid prediction failed for {symbol}: {e}, skipping")
                                 
                 except Exception as e:
                     logger.error(f"Error scanning {symbol}: {e}")
@@ -5859,6 +6029,21 @@ SELL SIGNALS:
         thread = threading.Thread(target=scan_in_background)
         thread.daemon = True
         thread.start()
+    
+    def _verify_potentials_at_startup(self):
+        """Verify potentials at startup and feed results to Megamind for recalibration"""
+        try:
+            verified = self.potentials_tracker.check_for_verification(
+                self.data_fetcher, 
+                self.learning_tracker.calibration_manager if hasattr(self, 'learning_tracker') else None
+            )
+            if verified:
+                logger.info(f"🎯 Verified {len(verified)} potentials at startup, fed to Megamind for learning")
+                # Update the display if potentials tab is visible
+                if hasattr(self, 'potentials_tree'):
+                    self.root.after(0, self._update_potentials_display)
+        except Exception as e:
+            logger.error(f"Error verifying potentials at startup: {e}")
     
     def _on_potentials_tree_click(self, event):
         """Handle clicks on potentials tree (Fav column)"""
@@ -6233,7 +6418,8 @@ Confidence: {prediction['confidence']:.0f}%
                 try:
                     col_num = int(column.replace('#', ''))
                     col_index = col_num - 1  # Convert to 0-indexed
-                    columns = ('ID', 'Symbol', 'Action', 'Entry', 'Target', 'Target Date', 'Status', 'Result', 'Delete')
+                    # MATCH COLUMNS WITH _create_predictions_tab
+                    columns = ('ID', 'Symbol', 'Sentiment', 'Action', 'Wait %', 'Entry', 'Target', 'Target Date', 'Status', 'Result', 'Delete')
                     
                     logger.debug(f"Column number: {col_num}, index: {col_index}, total columns: {len(columns)}")
                     
@@ -9461,7 +9647,197 @@ By using this application, you acknowledge that you understand and accept these 
             font=('Segoe UI', 8),
             justify=tk.LEFT
         )
-        info_label.pack(anchor=tk.W, pady=(5, 0))
+        # ====================================================================
+        # SECTOR MODEL TRAINING SECTION
+        # ====================================================================
+        sector_frame = tk.Frame(dialog, bg=theme['bg'])
+        sector_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        sector_header = tk.Label(
+            sector_frame,
+            text="🏭 Sector Model Training",
+            bg=theme['bg'],
+            fg=theme['accent'],
+            font=('Segoe UI', 10, 'bold')
+        )
+        sector_header.pack(anchor=tk.W)
+        
+        sector_info = tk.Label(
+            sector_frame,
+            text="Train specialized models per sector (Tech, Financial, Healthcare, etc.).\n"
+                 "Sector models use 10+ stocks for better pattern recognition.",
+            bg=theme['bg'],
+            fg=theme['text_secondary'],
+            font=('Segoe UI', 8),
+            justify=tk.LEFT
+        )
+        sector_info.pack(anchor=tk.W, pady=(0, 5))
+        
+        sector_input_frame = tk.Frame(sector_frame, bg=theme['bg'])
+        sector_input_frame.pack(fill=tk.X)
+        
+        # Sector dropdown
+        tk.Label(
+            sector_input_frame,
+            text="Sector:",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 9)
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        
+        sector_options = [
+            "technology", "financial", "healthcare", "consumer", "energy",
+            "industrials", "materials", "utilities", "real_estate", "communication"
+        ]
+        sector_display_map = {
+            "technology": "💻 Technology",
+            "financial": "🏦 Financial",
+            "healthcare": "🏥 Healthcare",
+            "consumer": "🛒 Consumer",
+            "energy": "⚡ Energy",
+            "industrials": "🏭 Industrials",
+            "materials": "🧱 Materials",
+            "utilities": "💡 Utilities",
+            "real_estate": "🏠 Real Estate",
+            "communication": "📡 Communication"
+        }
+        
+        sector_var = tk.StringVar(value="technology")
+        sector_combo = ttk.Combobox(
+            sector_input_frame,
+            textvariable=sector_var,
+            values=[sector_display_map.get(s, s) for s in sector_options],
+            state='readonly',
+            width=18
+        )
+        sector_combo.pack(side=tk.LEFT, padx=5)
+        sector_combo.current(0)
+        
+        # Stock count
+        tk.Label(
+            sector_input_frame,
+            text="Stocks:",
+            bg=theme['bg'],
+            fg=theme['fg'],
+            font=('Segoe UI', 9)
+        ).pack(side=tk.LEFT, padx=(10, 5))
+        
+        stock_count_var = tk.StringVar(value="10")
+        stock_count_entry = tk.Entry(
+            sector_input_frame,
+            textvariable=stock_count_var,
+            font=('Segoe UI', 10),
+            bg=theme['entry_bg'],
+            fg=theme['entry_fg'],
+            width=5
+        )
+        stock_count_entry.pack(side=tk.LEFT, padx=5)
+        
+        def train_sector_model():
+            """Train a Sector ML model"""
+            # Get sector from display name
+            selected_display = sector_var.get()
+            selected_sector = None
+            for key, val in sector_display_map.items():
+                if val == selected_display:
+                    selected_sector = key
+                    break
+            if not selected_sector:
+                selected_sector = selected_display.lower()
+            
+            try:
+                stock_count = int(stock_count_var.get())
+            except ValueError:
+                stock_count = 10
+            
+            start_date = start_entry.get()
+            end_date = end_entry.get()
+            strategy = strategy_var.get()
+            
+            status_text.delete(1.0, tk.END)
+            status_text.insert(tk.END, f"🏭 Training {sector_display_map.get(selected_sector, selected_sector)} model...\\n")
+            status_text.insert(tk.END, f"Strategy: {strategy}\\n")
+            status_text.insert(tk.END, f"Stocks: {stock_count}\\n")
+            status_text.insert(tk.END, f"Period: {start_date} to {end_date}\\n\\n")
+            status_text.update()
+            
+            def train_sector_async():
+                try:
+                    from sector_ml import SectorML
+                    
+                    sector_ml = SectorML(self.data_dir, selected_sector, strategy)
+                    result = sector_ml.train(
+                        self.data_fetcher,
+                        start_date,
+                        end_date,
+                        stock_count=stock_count,
+                        progress_callback=lambda msg: dialog.after(0, lambda: safe_insert_sector(msg))
+                    )
+                    
+                    if 'error' in result:
+                        dialog.after(0, lambda: safe_insert_sector(f"\\n❌ Error: {result['error']}"))
+                    elif result.get('kept_existing'):
+                        dialog.after(0, lambda: safe_insert_sector(
+                            f"\\n⚠️ {result.get('message', 'New model worse than existing')}"
+                        ))
+                    else:
+                        improved_msg = " (IMPROVED! 🚀)" if result.get('improved') else ""
+                        dialog.after(0, lambda: safe_insert_sector(
+                            f"\\n✅ {result.get('sector_display', selected_sector)} Model Trained!{improved_msg}\\n"
+                            f"Stocks Used: {len(result.get('stocks_used', []))}\\n"
+                            f"Training Samples: {result.get('training_samples', 0)}\\n"
+                            f"Test Accuracy: {result.get('test_accuracy', 0)*100:.1f}%\\n"
+                            f"Cross-Validation: {result.get('cross_validation_accuracy', 0)*100:.1f}% ± {result.get('cv_std', 0)*100:.1f}%\\n\\n"
+                            f"This sector model will now be used for all stocks in this sector."
+                        ))
+                except Exception as e:
+                    error_msg = str(e)
+                    dialog.after(0, lambda msg=error_msg: safe_insert_sector(f"\\n❌ Error: {msg}"))
+            
+            def safe_insert_sector(text):
+                try:
+                    if dialog.winfo_exists():
+                        status_text.insert(tk.END, text + "\\n")
+                        status_text.see(tk.END)
+                except (tk.TclError, AttributeError):
+                    pass
+            
+            thread = threading.Thread(target=train_sector_async)
+            thread.daemon = True
+            thread.start()
+        
+        sector_train_btn = tk.Button(
+            sector_input_frame,
+            text="🏭 Train Sector",
+            command=train_sector_model,
+            bg=theme['button_bg'],
+            fg=theme['button_fg'],
+            font=('Segoe UI', 9, 'bold'),
+            relief=tk.FLAT,
+            cursor='hand2',
+            padx=10
+        )
+        sector_train_btn.pack(side=tk.LEFT, padx=10)
+        
+        # Show existing sector models
+        try:
+            from sector_ml import SectorMLManager, SECTOR_DISPLAY_NAMES
+            sector_manager = SectorMLManager(self.data_dir, strategy_var.get())
+            sector_list = sector_manager.list_models()
+            if sector_list:
+                sector_text = ", ".join([f"{SECTOR_DISPLAY_NAMES.get(s['sector'], s['sector'])} ({s['accuracy']*100:.0f}%)" for s in sector_list[:4]])
+                if len(sector_list) > 4:
+                    sector_text += f" +{len(sector_list) - 4} more"
+                existing_label = tk.Label(
+                    sector_frame,
+                    text=f"Trained sectors: {sector_text}",
+                    bg=theme['bg'],
+                    fg=theme['text_secondary'],
+                    font=('Segoe UI', 8)
+                )
+                existing_label.pack(anchor=tk.W, pady=(5, 0))
+        except:
+            pass
         
         # Retrain from verified predictions option
         retrain_frame = tk.Frame(dialog, bg=theme['bg'])
@@ -9598,15 +9974,22 @@ By using this application, you acknowledge that you understand and accept these 
         
         def load_config():
             """Load a saved ML training configuration"""
+            # Debug: show where we're looking for configs
+            status_text.insert(tk.END, f"📂 Looking for configs in: {config_manager.configs_dir}\n")
+            status_text.see(tk.END)
+            
             configs = config_manager.list_configs()
             
+            status_text.insert(tk.END, f"📋 Found {len(configs)} configurations\n")
+            status_text.see(tk.END)
+            
             if not configs:
-                messagebox.showinfo("No Configurations", "No saved configurations found.\n\nSave your current configuration first!")
+                messagebox.showinfo("No Configurations", f"No saved configurations found in:\n{config_manager.configs_dir}\n\nSave your current configuration first!")
                 return
             
             load_dialog = tk.Toplevel(dialog)
             load_dialog.title("Load Configuration")
-            load_dialog.geometry("500x400")
+            load_dialog.geometry("600x450")
             load_dialog.transient(dialog)
             load_dialog.config(bg=theme['bg'])
             
@@ -9618,88 +10001,115 @@ By using this application, you acknowledge that you understand and accept these 
                 font=('Segoe UI', 12, 'bold')
             ).pack(pady=10)
             
-            # Listbox with scrollbar
-            list_frame = tk.Frame(load_dialog, bg=theme['bg'])
+            # Use a simple frame with standard scrollbar
+            list_frame = tk.Frame(load_dialog, bg='white', relief=tk.SUNKEN, bd=2)
             list_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
             
-            scrollbar = ModernScrollbar(list_frame)
+            # Standard scrollbar (not custom)
+            scrollbar = ttk.Scrollbar(list_frame)
             scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
             
-            config_listbox = tk.Listbox(
+            # Use Text widget instead of Listbox for better visibility
+            config_text = tk.Text(
                 list_frame,
-                font=('Segoe UI', 10),
-                bg=theme['frame_bg'],
-                fg=theme['fg'],
-                selectbackground=theme['accent'],
+                font=('Consolas', 10),
+                bg='white',
+                fg='black',
+                cursor='arrow',
+                height=15,
+                width=70,
                 yscrollcommand=scrollbar.set,
-                height=10
+                state=tk.NORMAL
             )
-            config_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            scrollbar.config(command=config_listbox.yview)
+            config_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.config(command=config_text.yview)
             
-            # Populate list
-            for config in configs:
+            # Store config names for selection
+            config_names = []
+            
+            # Debug output
+            status_text.insert(tk.END, f"📝 Adding {len(configs)} configs to list:\n")
+            
+            # Populate with clickable items
+            config_text.insert(tk.END, "Click on a configuration name to select it:\n\n")
+            for i, config in enumerate(configs):
                 name = config.get('name', 'Unknown')
-                desc = config.get('description', '')
+                desc = config.get('description', '')[:40]
                 saved = config.get('saved_at', '')
-                display = f"{name}"
+                
+                display = f"  [{i+1}] {name}"
                 if desc:
-                    display += f" - {desc}"
+                    display += f"\n      {desc}"
                 if saved:
                     try:
                         saved_dt = datetime.fromisoformat(saved)
-                        display += f" ({saved_dt.strftime('%Y-%m-%d %H:%M')})"
+                        display += f"\n      Saved: {saved_dt.strftime('%Y-%m-%d %H:%M')}"
                     except:
                         pass
-                config_listbox.insert(tk.END, display)
+                display += "\n\n"
+                
+                config_text.insert(tk.END, display)
+                config_names.append(name)
+                status_text.insert(tk.END, f"  {i+1}. {name}\n")
             
-            if configs:
-                config_listbox.selection_set(0)
+            config_text.config(state=tk.DISABLED)  # Make read-only
+            status_text.see(tk.END)
             
-            selected_config = {'name': None}
+            # Selection via simple entry field
+            select_frame = tk.Frame(load_dialog, bg=theme['bg'])
+            select_frame.pack(pady=5, padx=20, fill=tk.X)
+            
+            tk.Label(select_frame, text="Enter number (1-9):", bg=theme['bg'], fg=theme['fg']).pack(side=tk.LEFT)
+            select_entry = tk.Entry(select_frame, width=5, font=('Segoe UI', 12))
+            select_entry.pack(side=tk.LEFT, padx=10)
+            select_entry.insert(0, "1")
             
             def do_load():
-                selection = config_listbox.curselection()
-                if not selection:
-                    messagebox.showwarning("No Selection", "Please select a configuration to load.")
-                    return
-                
-                selected_name = configs[selection[0]]['name']
-                config = config_manager.load_config(selected_name)
-                
-                if config:
-                    # Apply config to training (for next training run)
-                    # Store in a way that training can use it
-                    self._saved_training_config = config_manager.apply_config_to_training(config)
-                    messagebox.showinfo(
-                        "Configuration Loaded",
-                        f"Configuration '{selected_name}' loaded!\n\n"
-                        f"Description: {config.get('description', 'N/A')}\n\n"
-                        "This configuration will be used for the next training run."
-                    )
-                    load_dialog.destroy()
-                else:
-                    messagebox.showerror("Error", f"Failed to load configuration '{selected_name}'")
+                try:
+                    num = int(select_entry.get().strip())
+                    if num < 1 or num > len(config_names):
+                        messagebox.showwarning("Invalid Selection", f"Please enter a number between 1 and {len(config_names)}")
+                        return
+                    
+                    selected_name = config_names[num - 1]
+                    config = config_manager.load_config(selected_name)
+                    
+                    if config:
+                        self._saved_training_config = config_manager.apply_config_to_training(config)
+                        messagebox.showinfo(
+                            "Configuration Loaded",
+                            f"Configuration '{selected_name}' loaded!\n\n"
+                            f"Description: {config.get('description', 'N/A')}\n\n"
+                            "This configuration will be used for the next training run."
+                        )
+                        load_dialog.destroy()
+                    else:
+                        messagebox.showerror("Error", f"Failed to load configuration '{selected_name}'")
+                except ValueError:
+                    messagebox.showwarning("Invalid Input", "Please enter a valid number")
             
             def do_delete():
-                selection = config_listbox.curselection()
-                if not selection:
-                    messagebox.showwarning("No Selection", "Please select a configuration to delete.")
-                    return
-                
-                selected_name = configs[selection[0]]['name']
-                response = messagebox.askyesno(
-                    "Delete Configuration?",
-                    f"Are you sure you want to delete '{selected_name}'?\n\nThis cannot be undone."
-                )
-                
-                if response:
-                    if config_manager.delete_config(selected_name):
-                        messagebox.showinfo("Deleted", f"Configuration '{selected_name}' deleted.")
-                        load_dialog.destroy()
-                        load_config()  # Refresh list
-                    else:
-                        messagebox.showerror("Error", f"Failed to delete configuration '{selected_name}'")
+                try:
+                    num = int(select_entry.get().strip())
+                    if num < 1 or num > len(config_names):
+                        messagebox.showwarning("Invalid Selection", f"Please enter a number between 1 and {len(config_names)}")
+                        return
+                    
+                    selected_name = config_names[num - 1]
+                    response = messagebox.askyesno(
+                        "Delete Configuration?",
+                        f"Are you sure you want to delete '{selected_name}'?\n\nThis cannot be undone."
+                    )
+                    
+                    if response:
+                        if config_manager.delete_config(selected_name):
+                            messagebox.showinfo("Deleted", f"Configuration '{selected_name}' deleted.")
+                            load_dialog.destroy()
+                            load_config()  # Refresh list
+                        else:
+                            messagebox.showerror("Error", f"Failed to delete configuration '{selected_name}'")
+                except ValueError:
+                    messagebox.showwarning("Invalid Input", "Please enter a valid number")
             
             btn_frame_load = tk.Frame(load_dialog, bg=theme['bg'])
             btn_frame_load.pack(pady=10)

@@ -177,12 +177,16 @@ class AutoLearner:
                             reasoning = rec.get('reasoning', 'Auto-generated prediction')
                             
                             # Calculate estimated days based on strategy
-                            if strategy == "trading":
-                                estimated_days = 10
-                            elif strategy == "mixed":
-                                estimated_days = 21
-                            else:  # investing
-                                estimated_days = 547
+                            # Use dynamic date from recommendation if available
+                            estimated_days = rec.get('estimated_days')
+                            
+                            if not estimated_days:
+                                if strategy == "trading":
+                                    estimated_days = 10
+                                elif strategy == "mixed":
+                                    estimated_days = 21
+                                else:  # investing
+                                    estimated_days = 547
                             
                             # Add prediction
                             prediction = self.app.predictions_tracker.add_prediction(

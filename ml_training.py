@@ -118,19 +118,13 @@ except ImportError:
 
 # Helper function to safely get n_jobs value (Windows-specific fix)
 def get_safe_n_jobs(requested_cores):
-    """Get safe n_jobs value, accounting for Windows deadlock issues"""
-    if sys.platform == 'win32':
-        # Windows: limit to max 4 cores to prevent multiprocessing deadlocks
-        if requested_cores == -1:
-            return min(4, multiprocessing.cpu_count())
-        else:
-            return min(4, requested_cores, multiprocessing.cpu_count())
+    """Get safe n_jobs value for parallel processing"""
+    # MAXIMUM PERFORMANCE MODE: Use all available cores
+    # User has Ryzen 7 7735HS (8 cores/16 threads) and wants max speed
+    if requested_cores == -1:
+        return multiprocessing.cpu_count()  # Use ALL cores
     else:
-        # Non-Windows: use requested value
-        if requested_cores == -1:
-            return -1  # Use all cores
-        else:
-            return min(requested_cores, multiprocessing.cpu_count())
+        return min(requested_cores, multiprocessing.cpu_count())
 
 # Import enhanced features if available
 try:
@@ -163,20 +157,28 @@ class FeatureExtractor:
                         financials_data: dict = None, indicators: dict = None,
                         market_regime: dict = None, timeframe_analysis: dict = None,
                         relative_strength: dict = None, support_resistance: dict = None,
-                        news_data: list = None) -> np.ndarray:
+                        news_data: list = None, sector_analysis: dict = None,
+                        catalyst_info: dict = None, volume_analysis: dict = None) -> np.ndarray:
         """Extract comprehensive feature vector for ML model with enhanced features"""
         features = []
         
-        # Technical Indicators (26 features)
+        # Technical Indicators (28 features - Added MFI and EMA Dist)
         if indicators:
+            # Calculate Distance to EMA 200 (Trend Context)
+            current_close = stock_data.get('current_price', 0) if stock_data else 0
+            ema_200 = indicators.get('ema_200', 0)
+            dist_ema_200 = (current_close - ema_200) / ema_200 if ema_200 and ema_200 != 0 else 0
+
             features.extend([
                 indicators.get('rsi', 50),
+                indicators.get('mfi', 50), # Added MFI
                 indicators.get('macd', 0),
                 indicators.get('macd_signal', 0),
                 indicators.get('macd_diff', 0),
                 indicators.get('ema_20', 0),
                 indicators.get('ema_50', 0),
                 indicators.get('ema_200', 0),
+                dist_ema_200,              # Added EMA 200 Distance
                 indicators.get('bb_upper', 0),
                 indicators.get('bb_lower', 0),
                 indicators.get('bb_middle', 0),
@@ -202,7 +204,7 @@ class FeatureExtractor:
                 1 if indicators.get('price_above_ema200', False) else 0,
             ])
         else:
-            features.extend([0] * 26)
+            features.extend([0] * 28)
         
         # Price Action Features (8 features)
         if history_data and history_data.get('data'):
@@ -346,6 +348,16 @@ class FeatureExtractor:
                 features.extend([0.0] * 10)  # Actual count: 10 pattern features
         else:
             features.extend([0.0] * 10)  # Actual count: 10 pattern features
+        
+        # ===== VOLUME ANALYSIS (3 features) =====
+        if volume_analysis:
+            features.extend([
+                float(volume_analysis.get('volume_ratio', 1.0)),
+                1.0 if volume_analysis.get('volume_trend') == 'increasing' else 0.0,
+                1.0 if volume_analysis.get('is_high_volume', False) else 0.0
+            ])
+        else:
+            features.extend([1.0, 0.0, 0.0])
 
         # ===== ENHANCED FEATURES (Moved to end to preserve index alignment) =====
         # Extract additional enhanced features if available
@@ -494,6 +506,116 @@ class FeatureExtractor:
                 features.extend([0.0, 0.0])
         else:
             features.extend([0.0, 0.0])
+        
+        # ===== NEW TRADING STRATEGY FEATURES (12 features) =====
+        
+        # 7. Sector Momentum Features (5 features)
+        if sector_analysis and sector_analysis.get('available', False):
+            sector_momentum = sector_analysis.get('sector_momentum', 0) / 100.0  # Normalize to -1 to 1
+            stock_momentum = sector_analysis.get('stock_momentum', 0) / 100.0
+            stock_vs_sector = sector_analysis.get('stock_vs_sector', 0) / 100.0
+            
+            # Sector signal encoded: strong_outperform=1, outperform=0.75, inline=0.5, underperform=0.25, strong_underperform=0
+            sector_signal = sector_analysis.get('sector_signal', 'neutral')
+            signal_score = 0.5  # Default: neutral
+            if sector_signal == 'strong_outperform':
+                signal_score = 1.0
+            elif sector_signal == 'outperform':
+                signal_score = 0.75
+            elif sector_signal == 'underperform':
+                signal_score = 0.25
+            elif sector_signal == 'strong_underperform':
+                signal_score = 0.0
+            
+            # Sector trend encoded
+            sector_trend = sector_analysis.get('sector_trend', 'unknown')
+            trend_score = 0.5  # Default: sideways
+            if sector_trend == 'strong_uptrend':
+                trend_score = 1.0
+            elif sector_trend == 'uptrend':
+                trend_score = 0.75
+            elif sector_trend == 'downtrend':
+                trend_score = 0.25
+            elif sector_trend == 'strong_downtrend':
+                trend_score = 0.0
+            
+            features.extend([
+                sector_momentum,
+                stock_vs_sector,
+                signal_score,
+                trend_score,
+                1.0 if sector_analysis.get('outperforming_sector', False) else 0.0
+            ])
+        else:
+            features.extend([0.0, 0.0, 0.5, 0.5, 0.0])
+        
+        # 8. Catalyst Features (4 features)
+        if catalyst_info and catalyst_info.get('available', False):
+            days_to_earnings = catalyst_info.get('days_to_earnings')
+            days_to_dividend = catalyst_info.get('days_to_dividend')
+            
+            # Normalize days to 0-1 scale (0 = imminent, 1 = far away)
+            earnings_proximity = 0.0
+            if days_to_earnings is not None:
+                if days_to_earnings <= 2:
+                    earnings_proximity = 1.0  # Very close
+                elif days_to_earnings <= 7:
+                    earnings_proximity = 0.7
+                elif days_to_earnings <= 14:
+                    earnings_proximity = 0.4
+                elif days_to_earnings <= 30:
+                    earnings_proximity = 0.2
+                else:
+                    earnings_proximity = 0.0
+            
+            dividend_proximity = 0.0
+            if days_to_dividend is not None:
+                if days_to_dividend <= 3:
+                    dividend_proximity = 1.0
+                elif days_to_dividend <= 7:
+                    dividend_proximity = 0.5
+                else:
+                    dividend_proximity = 0.0
+            
+            features.extend([
+                earnings_proximity,
+                dividend_proximity,
+                1.0 if catalyst_info.get('has_upcoming_catalyst', False) else 0.0,
+                1.0 if catalyst_info.get('catalyst_warning', False) else 0.0
+            ])
+        else:
+            features.extend([0.0, 0.0, 0.0, 0.0])
+        
+        # 9. Liquidity Features (3 features)
+        if volume_analysis:
+            # Liquidity grade encoded
+            liquidity_grade = volume_analysis.get('liquidity_grade', 'unknown')
+            liquidity_score = 0.5  # Default: medium
+            if liquidity_grade == 'high':
+                liquidity_score = 1.0
+            elif liquidity_grade == 'medium':
+                liquidity_score = 0.66
+            elif liquidity_grade == 'low':
+                liquidity_score = 0.33
+            elif liquidity_grade == 'very_low':
+                liquidity_score = 0.0
+            
+            # Average dollar volume (log normalized)
+            avg_dollar_vol = volume_analysis.get('avg_dollar_volume', 0)
+            if avg_dollar_vol > 0:
+                log_dollar_vol = np.log10(avg_dollar_vol) / 10.0  # Normalize: $1B = 0.9, $10M = 0.7
+            else:
+                log_dollar_vol = 0.0
+            
+            volume_ratio = volume_analysis.get('volume_ratio', 1.0)
+            
+            features.extend([
+                liquidity_score,
+                log_dollar_vol,
+                min(volume_ratio / 3.0, 1.0)  # Clip at 3x average
+            ])
+        else:
+            features.extend([0.5, 0.5, 0.33])
         
         return np.array(features, dtype=np.float32)
     
@@ -1026,7 +1148,7 @@ class StockPredictionML:
             self._load_regime_models()
             if len(self.regime_models) > 0:
                 logger.info(f"Successfully loaded {len(self.regime_models)} regime model(s) without metadata")
-                return
+                # Continue to load main model as fallback
         
         # Load single model (non-regime)
         if self.storage.model_exists(self.model_file):
@@ -1296,6 +1418,41 @@ class StockPredictionML:
         # Check class distribution
         label_counts = Counter(y)
         logger.info(f"Training data distribution: {dict(label_counts)}")
+        
+        # ===== SAMPLE LIMITING TO PREVENT OVERFITTING =====
+        # Large datasets cause overfitting - cap at optimal size with stratified sampling
+        MAX_TRAINING_SAMPLES = 5000  # Optimal balance between learning and generalization
+        
+        if len(X) > MAX_TRAINING_SAMPLES:
+            logger.warning(f"⚠️ Large dataset detected ({len(X)} samples). "
+                          f"Limiting to {MAX_TRAINING_SAMPLES} to prevent overfitting.")
+            
+            # Use stratified sampling to maintain class balance
+            try:
+                # Get indices for stratified subsample
+                # train_test_split returns (train, test) - we want TRAIN portion which is the smaller 5000
+                all_indices = np.arange(len(X))
+                keep_indices, _ = train_test_split(
+                    all_indices,
+                    train_size=MAX_TRAINING_SAMPLES,
+                    stratify=y,
+                    random_state=random_seed
+                )
+                
+                X = X[keep_indices]
+                y = y[keep_indices]
+                sample_weights = sample_weights[keep_indices]
+                
+                # Log new class distribution
+                new_label_counts = Counter(y)
+                logger.info(f"📉 Reduced to {len(X)} samples. New distribution: {dict(new_label_counts)}")
+            except Exception as e:
+                logger.warning(f"Stratified sampling failed: {e}. Using random sampling.")
+                # Fallback to random sampling
+                keep_indices = np.random.choice(len(X), MAX_TRAINING_SAMPLES, replace=False)
+                X = X[keep_indices]
+                y = y[keep_indices]
+                sample_weights = sample_weights[keep_indices]
         
         # Warn if severe class imbalance
         if len(label_counts) > 1:
@@ -1733,9 +1890,9 @@ class StockPredictionML:
                     'n_estimators': gb_n_estimators if gb_n_estimators is not None else ML_GB_N_ESTIMATORS,
                     'max_depth': gb_max_depth if gb_max_depth is not None else ML_GB_MAX_DEPTH,
                     'learning_rate': ML_GB_LEARNING_RATE,
-                    'subsample': lgb_subsample if lgb_subsample is not None else 0.6,  # Configurable
-                    'colsample_bytree': lgb_colsample_bytree if lgb_colsample_bytree is not None else 0.6,  # Configurable
-                    'min_child_samples': lgb_min_child_samples if lgb_min_child_samples is not None else 50,  # Configurable
+                    'subsample': lgb_subsample if lgb_subsample is not None else 0.5,  # Reduced from 0.6 for regularization
+                    'colsample_bytree': lgb_colsample_bytree if lgb_colsample_bytree is not None else 0.5,  # Reduced from 0.6
+                    'min_child_samples': lgb_min_child_samples if lgb_min_child_samples is not None else 80,  # Increased from 50
                     'reg_alpha': lgb_reg_alpha if lgb_reg_alpha is not None else 1.0,  # Configurable
                     'reg_lambda': lgb_reg_lambda if lgb_reg_lambda is not None else 3.0,  # Configurable
                     'random_state': random_seed,
@@ -1751,10 +1908,10 @@ class StockPredictionML:
                     'n_estimators': gb_n_estimators if gb_n_estimators is not None else ML_GB_N_ESTIMATORS,
                     'max_depth': gb_max_depth if gb_max_depth is not None else ML_GB_MAX_DEPTH,
                     'learning_rate': ML_GB_LEARNING_RATE,
-                    'subsample': xgb_subsample if xgb_subsample is not None else 0.6,  # Configurable
-                    'colsample_bytree': xgb_colsample_bytree if xgb_colsample_bytree is not None else 0.6,  # Configurable
-                    'min_child_weight': xgb_min_child_weight if xgb_min_child_weight is not None else 5,  # Configurable
-                    'gamma': xgb_gamma if xgb_gamma is not None else 0.2,  # Configurable
+                    'subsample': xgb_subsample if xgb_subsample is not None else 0.5,  # Reduced from 0.6 for regularization
+                    'colsample_bytree': xgb_colsample_bytree if xgb_colsample_bytree is not None else 0.5,  # Reduced from 0.6
+                    'min_child_weight': xgb_min_child_weight if xgb_min_child_weight is not None else 8,  # Increased from 5
+                    'gamma': xgb_gamma if xgb_gamma is not None else 0.3,  # Increased from 0.2
                     'reg_alpha': xgb_reg_alpha if xgb_reg_alpha is not None else 1.0,  # Configurable
                     'reg_lambda': xgb_reg_lambda if xgb_reg_lambda is not None else 3.0,  # Configurable
                     'random_state': random_seed,
@@ -1786,17 +1943,19 @@ class StockPredictionML:
                 penalty='l2'  # Explicit L2 regularization
             )
             
-            # Use StackingClassifier instead of VotingClassifier for better performance
+            # Use VotingClassifier for ANTI-OVERFITTING
+            # Stacking causes 100% train accuracy (meta-learner overfits)
+            # Voting averages probabilities without overfitting
             if HAS_LIGHTGBM or HAS_XGBOOST:
-                # Stacking ensemble: meta-learner learns optimal combination
-                self.model = StackingClassifier(
+                # Soft voting: average predicted probabilities
+                # This prevents the 40% train-test gap we saw with stacking
+                self.model = VotingClassifier(
                     estimators=[('rf', rf), ('gb', gb), ('lr', lr)],
-                    final_estimator=LogisticRegression(max_iter=1000, C=0.1, class_weight='balanced', random_state=random_seed, penalty='l2'),  # Reduced C from 0.2 for stronger regularization
-                    cv=5,  # 5-fold cross-validation for meta-learner
-                    stack_method='predict_proba',  # Use probabilities for better combination
+                    voting='soft',  # Average probabilities
+                    weights=[2, 2, 1],  # RF and GB weighted higher than LR
                     n_jobs=get_safe_n_jobs(ML_TRAINING_CPU_CORES)
                 )
-                logger.info("Using Stacking ensemble with LightGBM/XGBoost (optimal performance)")
+                logger.info("Using Voting ensemble (anti-overfitting mode)")
             else:
                 # Fallback to VotingClassifier if advanced libraries not available
                 self.model = VotingClassifier(
@@ -2849,27 +3008,27 @@ class StockPredictionML:
             
             if HAS_LIGHTGBM:
                 params['lgb'] = {
-                    'n_estimators': trial.suggest_int('lgb_n_estimators', 100, 300),  # Reduced max from 500
-                    'max_depth': trial.suggest_int('lgb_max_depth', 3, 5),  # Reduced max from 10 to prevent overfitting
-                    'learning_rate': trial.suggest_float('lgb_learning_rate', 0.01, 0.1, log=True),  # Reduced max from 0.3
-                    'subsample': trial.suggest_float('lgb_subsample', 0.6, 0.8),  # Reduced max from 1.0
-                    'colsample_bytree': trial.suggest_float('lgb_colsample_bytree', 0.6, 0.8),  # Reduced max from 1.0
-                    'min_child_samples': trial.suggest_int('lgb_min_child_samples', 20, 50),  # Increased min from 10
-                    'reg_alpha': trial.suggest_float('lgb_reg_alpha', 0.1, 1.0),  # Increased min from 0
-                    'reg_lambda': trial.suggest_float('lgb_reg_lambda', 1.0, 3.0),  # Increased min from 0, max from 2
+                    'n_estimators': trial.suggest_int('lgb_n_estimators', 80, 400),  # Expanded range
+                    'max_depth': trial.suggest_int('lgb_max_depth', 3, 6),  # Allow slightly deeper trees
+                    'learning_rate': trial.suggest_float('lgb_learning_rate', 0.01, 0.1, log=True),
+                    'subsample': trial.suggest_float('lgb_subsample', 0.5, 0.8),  # Reduced max for regularization
+                    'colsample_bytree': trial.suggest_float('lgb_colsample_bytree', 0.5, 0.8),
+                    'min_child_samples': trial.suggest_int('lgb_min_child_samples', 20, 60),  # Increased range
+                    'reg_alpha': trial.suggest_float('lgb_reg_alpha', 0.1, 2.0),  # Increased reg for balance
+                    'reg_lambda': trial.suggest_float('lgb_reg_lambda', 1.0, 5.0),  # Increased reg for balance
                 }
             
             if HAS_XGBOOST:
                 params['xgb'] = {
-                    'n_estimators': trial.suggest_int('xgb_n_estimators', 100, 300),  # Reduced max from 500
-                    'max_depth': trial.suggest_int('xgb_max_depth', 3, 5),  # Reduced max from 10 to prevent overfitting
-                    'learning_rate': trial.suggest_float('xgb_learning_rate', 0.01, 0.1, log=True),  # Reduced max from 0.3
-                    'subsample': trial.suggest_float('xgb_subsample', 0.6, 0.8),  # Reduced max from 1.0
-                    'colsample_bytree': trial.suggest_float('xgb_colsample_bytree', 0.6, 0.8),  # Reduced max from 1.0
-                    'min_child_weight': trial.suggest_int('xgb_min_child_weight', 2, 10),  # Increased min from 1
-                    'gamma': trial.suggest_float('xgb_gamma', 0.1, 0.5),  # Increased min from 0
-                    'reg_alpha': trial.suggest_float('xgb_reg_alpha', 0.1, 1.0),  # Increased min from 0
-                    'reg_lambda': trial.suggest_float('xgb_reg_lambda', 1.0, 3.0),  # Increased min from 0, max from 2
+                    'n_estimators': trial.suggest_int('xgb_n_estimators', 80, 400),  # Expanded range
+                    'max_depth': trial.suggest_int('xgb_max_depth', 3, 6),  # Allow slightly deeper trees
+                    'learning_rate': trial.suggest_float('xgb_learning_rate', 0.01, 0.1, log=True),
+                    'subsample': trial.suggest_float('xgb_subsample', 0.5, 0.8),
+                    'colsample_bytree': trial.suggest_float('xgb_colsample_bytree', 0.5, 0.8),
+                    'min_child_weight': trial.suggest_int('xgb_min_child_weight', 2, 12),  # Slightly expanded
+                    'gamma': trial.suggest_float('xgb_gamma', 0.1, 0.6),  # Slightly expanded
+                    'reg_alpha': trial.suggest_float('xgb_reg_alpha', 0.1, 2.0),  # Increased reg
+                    'reg_lambda': trial.suggest_float('xgb_reg_lambda', 1.0, 5.0),  # Increased reg
                 }
             
             # Create model with suggested parameters
@@ -2901,11 +3060,11 @@ class StockPredictionML:
             study_name='ml_optimization'
         )
         
-        # INCREASED from 20 to 50 trials for better optimization
-        # More trials = better chance of finding optimal parameters for YOUR data
+        # REDUCED to 15 trials to prevent overfitting to validation set
+        # Too many trials = model overfits to cross-validation splits
         logger.info(f"Starting hyperparameter tuning with {n_workers} parallel workers (using {multiprocessing.cpu_count()} CPU cores)...")
-        logger.info("Running 50 trials (increased from 20 for better optimization)...")
-        study.optimize(objective, n_trials=50, timeout=1200, n_jobs=n_workers)  # 50 trials, 20 min timeout
+        logger.info("Running 15 trials (reduced from 50 to prevent overfitting)...")
+        study.optimize(objective, n_trials=15, timeout=600, n_jobs=n_workers)  # 15 trials, 10 min timeout
         
         # Extract best parameters
         best_params = {}
@@ -2919,7 +3078,8 @@ class StockPredictionML:
     
     def _load_regime_models(self):
         """Load regime-specific models if they exist"""
-        if not self.metadata.get('use_regime_models', False):
+        # Trust self.use_regime_models if set (e.g. forced by _load_model), otherwise check metadata
+        if not self.use_regime_models and not self.metadata.get('use_regime_models', False):
             return
         
         self.regime_models = {}

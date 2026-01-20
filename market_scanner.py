@@ -206,6 +206,7 @@ class MarketScanner:
                         'entry_price': recommendation.get('entry_price', 0),
                         'target_price': recommendation.get('target_price', 0),
                         'stop_loss': recommendation.get('stop_loss', 0),
+                        'estimated_days': recommendation.get('estimated_days'), # Pass dynamic date
                         'reasoning': analysis.get('reasoning', '')[:200]  # Truncate
                     })
                 
@@ -264,12 +265,17 @@ class MarketScanner:
                 if progress_callback:
                     progress_callback(idx + 1, total_stocks, symbol)
                 
+                # Log progress every 10 stocks
+                if idx % 10 == 0:
+                    logger.info(f"🔻 Scanning dips progress: {idx+1}/{total_stocks} ({symbol})")
+                
                 # Fetch historical data
                 history_data = self.data_fetcher.fetch_stock_history(symbol, period='3mo')
                 if not history_data or 'error' in history_data:
                     continue
                 
-                prices = history_data.get('prices', [])
+                # FIX: fetch_stock_history returns {'data': [...]}, not {'prices': [...]}
+                prices = history_data.get('data', [])
                 if len(prices) < 20:
                     continue
                 

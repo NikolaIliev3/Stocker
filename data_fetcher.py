@@ -167,6 +167,9 @@ class StockDataFetcher:
             force_refresh: If True, bypasses cache to get fresh data
             check_quality: If True, perform data quality checks
         """
+        # Normalize symbol (e.g., BRK.B -> BRK-B)
+        symbol = symbol.replace('.', '-')
+        
         # Try backend first if available (prioritized for better reliability/workarounds)
         if self._check_backend_available():
             try:
@@ -255,6 +258,9 @@ class StockDataFetcher:
             start_date: Start date in YYYY-MM-DD format (optional, overrides period)
             end_date: End date in YYYY-MM-DD format (optional, overrides period)
         """
+        # Normalize symbol (e.g., BRK.B -> BRK-B)
+        symbol = symbol.replace('.', '-')
+
         # If start_date and end_date are provided, use them directly with yfinance
         if start_date and end_date:
             try:
@@ -347,6 +353,9 @@ class StockDataFetcher:
     
     def fetch_financials(self, symbol: str) -> dict:
         """Fetch financial statements for investing analysis"""
+        # Normalize symbol (e.g., BRK.B -> BRK-B)
+        symbol = symbol.replace('.', '-')
+
         # Try backend first if available
         if self._check_backend_available():
             try:

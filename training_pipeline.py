@@ -330,11 +330,55 @@ class TrainingDataGenerator:
                     relative_strength = None
                     support_resistance = None
                 
+                # Calculate volume analysis for liquidity features (no API calls needed)
+                volume_analysis = None
+                if history_data and history_data.get('data') and len(history_data['data']) >= 20:
+                    try:
+                        hist_df = pd.DataFrame(history_data['data'])
+                        if 'close' in hist_df.columns and 'volume' in hist_df.columns:
+                            avg_volume = hist_df['volume'].tail(20).mean()
+                            avg_price = hist_df['close'].tail(20).mean()
+                            avg_dollar_volume = avg_volume * avg_price
+                            current_volume = hist_df['volume'].iloc[-1] if len(hist_df) > 0 else 0
+                            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
+                            
+                            # Calculate volume trend (last vs 10 days ago)
+                            if len(hist_df) >= 10:
+                                volume_trend = "increasing" if hist_df['volume'].iloc[-1] > hist_df['volume'].iloc[-10] else "decreasing"
+                            else:
+                                volume_trend = "neutral"
+                                
+                            is_high_volume = volume_ratio > 1.5
+                            
+                            # Liquidity grade based on daily dollar volume
+                            if avg_dollar_volume >= 50_000_000:
+                                liquidity_grade = 'high'
+                            elif avg_dollar_volume >= 10_000_000:
+                                liquidity_grade = 'medium'
+                            elif avg_dollar_volume >= 1_000_000:
+                                liquidity_grade = 'low'
+                            else:
+                                liquidity_grade = 'very_low'
+                            
+                            volume_analysis = {
+                                'volume_ratio': float(volume_ratio),
+                                'avg_dollar_volume': float(avg_dollar_volume),
+                                'liquidity_grade': liquidity_grade,
+                                'volume_trend': volume_trend,
+                                'is_high_volume': is_high_volume
+                            }
+                    except Exception as vol_error:
+                        pass  # Use default if calculation fails
+                
                 # Extract features with enhanced analysis data (will use defaults if not available)
                 try:
                     features = self.feature_extractor.extract_features(
                         stock_data, history_data, None, indicators if indicators else None,
-                        market_regime, timeframe_analysis, relative_strength, support_resistance
+                        market_regime, timeframe_analysis, relative_strength, support_resistance,
+                        None,  # news_data
+                        None,  # sector_analysis (requires API, skip during training)
+                        None,  # catalyst_info (requires API, skip during training)
+                        volume_analysis  # liquidity features (calculated from history)
                     )
                 except Exception as feat_error:
                     error_count += 1
@@ -445,6 +489,27 @@ class MLTrainingPipeline:
                 if progress_callback:
                     progress_callback(f"Error processing {symbol}: {str(e)}")
         
+        # Auto-merge verified predictions (weighted 20x) if available
+        # This fixes the "Retrain from verified overwrites main model" bug by merging instead
+        if self.app and hasattr(self.app, 'predictions_tracker'):
+            try:
+                verified = self.app.predictions_tracker.get_verified_predictions()
+                strategy_verified = [p for p in verified if p.get('strategy') == strategy]
+                
+                if strategy_verified:
+                    verified_samples = self._convert_verified_to_training_samples(strategy_verified, strategy)
+                    if verified_samples:
+                        # Add high weight to verified samples (20x)
+                        for s in verified_samples:
+                            s['sample_weight'] = 20.0
+                        
+                        # PREPEND verified samples so they survive duplicate removal (which keeps first occurrence)
+                        # This works because np.unique with return_index keeps the first index
+                        all_samples = verified_samples + all_samples
+                        logger.info(f"✨ Merged {len(verified_samples)} verified predictions into training set with BOOSTER weight (20x)")
+            except Exception as e:
+                logger.error(f"Error merging verified predictions: {e}")
+        
         if len(all_samples) < 100:
             return {
                 'error': f'Insufficient total samples: {len(all_samples)} < 100',
@@ -471,6 +536,7 @@ class MLTrainingPipeline:
         # Binary mode removes ambiguous HOLD class and focuses on clear UP/DOWN signals
         # Apply saved config parameters if available, otherwise use defaults
         train_kwargs = {
+            'use_hyperparameter_tuning': training_params.get('use_hyperparameter_tuning', False),  # DISABLED: HP tuning can cause overfitting
             'use_binary_classification': training_params.get('use_binary_classification', True),
             'use_regime_models': training_params.get('use_regime_models', True),
             'feature_selection_method': training_params.get('feature_selection_method', 'importance'),
@@ -672,11 +738,44 @@ class MLTrainingPipeline:
                 except Exception as e:
                     logger.debug(f"Error calculating indicators for {symbol}: {e}")
                 
+                # Calculate volume analysis for liquidity features
+                volume_analysis = None
+                if history_data and history_data.get('data') and len(history_data['data']) >= 20:
+                    try:
+                        hist_df = pd.DataFrame(history_data['data'])
+                        if 'close' in hist_df.columns and 'volume' in hist_df.columns:
+                            avg_volume = hist_df['volume'].tail(20).mean()
+                            avg_price = hist_df['close'].tail(20).mean()
+                            avg_dollar_volume = avg_volume * avg_price
+                            current_volume = hist_df['volume'].iloc[-1] if len(hist_df) > 0 else 0
+                            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
+                            
+                            if avg_dollar_volume >= 50_000_000:
+                                liquidity_grade = 'high'
+                            elif avg_dollar_volume >= 10_000_000:
+                                liquidity_grade = 'medium'
+                            elif avg_dollar_volume >= 1_000_000:
+                                liquidity_grade = 'low'
+                            else:
+                                liquidity_grade = 'very_low'
+                            
+                            volume_analysis = {
+                                'volume_ratio': float(volume_ratio),
+                                'avg_dollar_volume': float(avg_dollar_volume),
+                                'liquidity_grade': liquidity_grade
+                            }
+                    except:
+                        pass
+                
                 # Extract features with enhanced analysis data
                 try:
                     features = self.feature_extractor.extract_features(
                         stock_data, history_data, None, indicators if indicators else None,
-                        market_regime, timeframe_analysis, relative_strength, support_resistance
+                        market_regime, timeframe_analysis, relative_strength, support_resistance,
+                        None,  # news_data
+                        None,  # sector_analysis
+                        None,  # catalyst_info
+                        volume_analysis
                     )
                     
                     if features is None or len(features) == 0:

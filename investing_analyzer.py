@@ -606,7 +606,9 @@ class InvestingAnalyzer:
             "entry_price": float(current_price),
             "target_price": float(target_price),
             "stop_loss": float(stop_loss),
+            "stop_loss": float(stop_loss),
             "time_horizon": "1-3 years",
+            "estimated_days": 547, # Approx 1.5 years
             "score": score,
             "reasons": reasons
         }

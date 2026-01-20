@@ -87,15 +87,16 @@ HYPERPARAMETER_TUNING_PARALLEL_TRIALS = None  # None = auto (uses all cores), or
 # Note: Setting to -1 uses all available CPU cores, which maximizes speed but uses more resources
 # If you want to leave some cores free for other tasks, set to a lower number (e.g., 4 or 6)
 
-# ML Model Configuration
+# ML Model Configuration - ANTI-OVERFITTING MODE (RESTORED)
+# Conservative parameters to keep train-test gap under 15%
 ML_FEATURE_SELECTION_THRESHOLD = 0.005  # Threshold for feature selection importance
-ML_RF_N_ESTIMATORS = 60  # Reduced from 80 to prevent overfitting
-ML_RF_MAX_DEPTH = 5  # Increased from 3 to allow some granularity
-ML_RF_MIN_SAMPLES_SPLIT = 20  # Reduced from 40 for small datasets
-ML_RF_MIN_SAMPLES_LEAF = 10  # Reduced from 30 to allow model to find sub-patterns
-ML_GB_N_ESTIMATORS = 80  # Reduced from 100
-ML_GB_MAX_DEPTH = 3  
-ML_GB_LEARNING_RATE = 0.03  
+ML_RF_N_ESTIMATORS = 50     # Low count prevents overfitting
+ML_RF_MAX_DEPTH = 4         # Shallow trees generalize better
+ML_RF_MIN_SAMPLES_SPLIT = 25  # Higher = more regularization
+ML_RF_MIN_SAMPLES_LEAF = 12   # Higher = simpler trees
+ML_GB_N_ESTIMATORS = 60     # Low count prevents overfitting  
+ML_GB_MAX_DEPTH = 3         # Shallow = less overfitting
+ML_GB_LEARNING_RATE = 0.02  # Lower = more regularization
 ML_HIGH_ACCURACY_THRESHOLD = 0.60  
 ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.62  
 ML_MIN_TRAINING_SAMPLES = 80  # Reduced from 100 to allow earlier learning

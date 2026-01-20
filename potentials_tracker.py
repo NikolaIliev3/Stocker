@@ -37,8 +37,23 @@ class PotentialsTracker:
     def save(self):
         """Save potentials to file"""
         try:
+            import math
+            
+            def clean_for_json(obj):
+                """Recursively clean data for JSON (convert NaN/Inf to None)"""
+                if isinstance(obj, dict):
+                    return {k: clean_for_json(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [clean_for_json(item) for item in obj]
+                elif isinstance(obj, float):
+                    if math.isnan(obj) or math.isinf(obj):
+                        return None
+                    return obj
+                else:
+                    return obj
+            
             data = {
-                'potentials': self.potentials,
+                'potentials': clean_for_json(self.potentials),
                 'last_updated': datetime.now().isoformat()
             }
             with open(self.potentials_file, 'w') as f:
@@ -107,8 +122,8 @@ class PotentialsTracker:
         self.save()
         return potential
     
-    def check_for_verification(self, data_fetcher) -> List[Dict]:
-        """Check active potentials for verification conditions"""
+    def check_for_verification(self, data_fetcher, calibration_manager=None) -> List[Dict]:
+        """Check active potentials for verification conditions and feed to Megamind"""
         verified_items = []
         active = self.get_active_potentials()
         
@@ -116,6 +131,7 @@ class PotentialsTracker:
             try:
                 symbol = p.get('symbol')
                 target_price = p.get('target_price', 0)
+                original_price = p.get('current_price', 0)
                 target_date_str = p.get('target_date', '')
                 
                 # Get current price
@@ -142,12 +158,45 @@ class PotentialsTracker:
                     p['was_correct'] = True
                     verified_items.append(p)
                     logger.info(f"Potential {symbol} verified CORRECT - price hit ${current_price:.2f}")
+                    
+                    # Feed to Megamind for recalibration
+                    if calibration_manager:
+                        try:
+                            calibration_manager.record_result(
+                                strategy='trading',
+                                symbol=symbol,
+                                action='BUY',  # Potentials are buy opportunities
+                                entry_price=original_price,
+                                target_price=target_price,
+                                actual_price=current_price,
+                                was_correct=True
+                            )
+                            logger.info(f"🧠 Megamind learning from {symbol} potential (CORRECT)")
+                        except Exception as e:
+                            logger.warning(f"Failed to feed Megamind for {symbol}: {e}")
+                            
                 elif date_passed:
                     # Date passed but price never hit target - FAIL
                     self.verify_potential(p['id'], False, current_price)
                     p['was_correct'] = False
                     verified_items.append(p)
                     logger.info(f"Potential {symbol} verified INCORRECT - date passed, price at ${current_price:.2f}")
+                    
+                    # Feed to Megamind for recalibration
+                    if calibration_manager:
+                        try:
+                            calibration_manager.record_result(
+                                strategy='trading',
+                                symbol=symbol,
+                                action='BUY',
+                                entry_price=original_price,
+                                target_price=target_price,
+                                actual_price=current_price,
+                                was_correct=False
+                            )
+                            logger.info(f"🧠 Megamind learning from {symbol} potential (INCORRECT)")
+                        except Exception as e:
+                            logger.warning(f"Failed to feed Megamind for {symbol}: {e}")
                     
             except Exception as e:
                 logger.error(f"Error checking potential {p.get('id')}: {e}")

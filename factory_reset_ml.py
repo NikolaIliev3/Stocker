@@ -53,6 +53,9 @@ def factory_reset_ml(data_dir: Path = None, confirm: bool = False):
     print("  • Model version history (model_versions_*.json)")
     print("  • SPY cache data (spy_cache_*.json)")
     print()
+    print("This will PRESERVE:")
+    print("  • Saved ML configurations (ml_configs/)")
+    print()
     
     # Count files to be deleted
     patterns_to_delete = [
