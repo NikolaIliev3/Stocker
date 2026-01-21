@@ -52,6 +52,7 @@ from llm_ai_predictor import LLMAIPredictor
 from price_move_predictor import PriceMovePredictor
 from holdings_tracker import HoldingsTracker
 from potentials_tracker import PotentialsTracker
+from market_dashboard import MarketDashboard
 
 # Import new modules
 try:
@@ -1127,7 +1128,9 @@ class StockerApp:
                                     'target_price': recommendation.get('target_price', 0),
                                     'strategy': strategy
                                 })
-                                logger.info(f"🟢 BULLISH SIGNAL: {symbol} changed to SELL ({new_confidence:.1f}% confidence)")
+                                icon = "🟢" if new_action == "BUY" else "🔴"
+                                signal_type = "BULLISH" if new_action == "BUY" else "BEARISH"
+                                logger.info(f"{icon} {signal_type} SIGNAL: {symbol} changed to {new_action} ({new_confidence:.1f}% confidence)")
                         
                         except Exception as e:
                             logger.error(f"Error monitoring {symbol}: {e}")
@@ -2364,6 +2367,13 @@ class StockerApp:
         # Store notebook container reference
         self.notebook_container = notebook_container
         
+        # Market Intelligence Tab (NEW)
+        self.market_frame = tk.Frame(self.notebook, bg=theme['frame_bg'])
+        self.notebook.add(self.market_frame, text="🌍 Market Intel")
+        
+        self.market_dashboard = MarketDashboard(self.market_frame)
+        self.market_dashboard.pack(fill=tk.BOTH, expand=True)
+
         # Analysis tab
         self.analysis_frame = tk.Frame(self.notebook, bg=theme['frame_bg'])
         self.notebook.add(self.analysis_frame, text=self.localization.t('analysis'))
@@ -7405,6 +7415,10 @@ Confidence: {prediction['confidence']:.0f}%
                 return
             
             self.current_analysis = analysis
+            
+            # Update Market Dashboard
+            if hasattr(self, 'market_dashboard'):
+                self.root.after(0, lambda: self.market_dashboard.update_data(analysis))
             
             # Check for momentum/trend changes (for currently analyzed stock)
             # For trading strategy, we have full indicator data

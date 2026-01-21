@@ -4,6 +4,7 @@ Combines rule-based weight adjustment with ML for optimal predictions
 """
 import json
 import numpy as np
+import pandas as pd
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -261,10 +262,71 @@ class HybridStockPredictor:
                 relative_strength = base_analysis.get('relative_strength', None)
                 support_resistance = base_analysis.get('support_resistance', None)
                 
+                # Calculate volume analysis for liquidity features (matching training pipeline)
+                volume_analysis = None
+                if history_data and history_data.get('data') and len(history_data['data']) >= 20:
+                    try:
+                        hist_df = pd.DataFrame(history_data['data'])
+                        # Ensure column names are lowercase
+                        hist_df.columns = [col.lower() if isinstance(col, str) else col for col in hist_df.columns]
+                        
+                        if 'close' in hist_df.columns and 'volume' in hist_df.columns:
+                            avg_volume = hist_df['volume'].tail(20).mean()
+                            avg_price = hist_df['close'].tail(20).mean()
+                            avg_dollar_volume = avg_volume * avg_price
+                            current_volume = hist_df['volume'].iloc[-1] if len(hist_df) > 0 else 0
+                            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
+                            
+                            # Calculate volume trend (last vs 10 days ago)
+                            if len(hist_df) >= 10:
+                                volume_trend = "increasing" if hist_df['volume'].iloc[-1] > hist_df['volume'].iloc[-10] else "decreasing"
+                            else:
+                                volume_trend = "neutral"
+                                
+                            is_high_volume = volume_ratio > 1.5
+                            
+                            # Liquidity grade based on daily dollar volume
+                            if avg_dollar_volume >= 50_000_000:
+                                liquidity_grade = 'high'
+                            elif avg_dollar_volume >= 10_000_000:
+                                liquidity_grade = 'medium'
+                            elif avg_dollar_volume >= 1_000_000:
+                                liquidity_grade = 'low'
+                            else:
+                                liquidity_grade = 'very_low'
+                            
+                            volume_analysis = {
+                                'volume_ratio': float(volume_ratio),
+                                'avg_dollar_volume': float(avg_dollar_volume),
+                                'liquidity_grade': liquidity_grade,
+                                'volume_trend': volume_trend,
+                                'is_high_volume': is_high_volume
+                            }
+                    except Exception as vol_error:
+                        pass  # Use default if calculation fails
+
                 features = self.feature_extractor.extract_features(
                     stock_data, history_data, financials_data, indicators,
-                    market_regime, timeframe_analysis, relative_strength, support_resistance
+                    market_regime, timeframe_analysis, relative_strength, support_resistance,
+                    None, None, None, volume_analysis
                 )
+                
+                # DEBUG: Log all input features to diagnose SELL bias
+                if features is not None:
+                    is_empty = False
+                    if isinstance(features, pd.DataFrame):
+                        if features.empty:
+                            is_empty = True
+                    elif isinstance(features, np.ndarray):
+                        if features.size == 0:
+                            is_empty = True
+                    elif len(features) == 0:
+                         is_empty = True
+                         
+                    if not is_empty:
+                        # Safe logging for DataFrame or other types
+                        log_features = features.iloc[0].to_dict() if isinstance(features, pd.DataFrame) else "Numpy Array/List"
+                        logger.info(f"🔍 ML Input Features for {symbol} (Full): {log_features}")
                 # Pass stock_data and history_data for regime-specific model detection
                 ml_prediction = self.ml_predictor.predict(features, stock_data, history_data)
                 # Check if prediction has an error (e.g., LabelEncoder not fitted)

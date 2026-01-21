@@ -12,7 +12,20 @@ logger = logging.getLogger(__name__)
 class InvestingAnalyzer:
     """Analyzes stocks using fundamental/investing analysis approach"""
     
-    def analyze(self, stock_data: dict, financials_data: dict, history_data: dict) -> dict:
+    def __init__(self):
+        # Initialize Market Intelligence components
+        try:
+            from sentiment_analyzer import SentimentAnalyzer
+            from algorithm_improvements import MarketRegimeDetector
+            self.sentiment_analyzer = SentimentAnalyzer()
+            self.macro_detector = MarketRegimeDetector()
+            self.has_market_intel = True
+        except ImportError:
+            logger.warning("Could not import Market Intelligence components in InvestingAnalyzer")
+            self.has_market_intel = False
+    
+    def analyze(self, stock_data: dict, financials_data: dict, history_data: dict, 
+               sentiment_info: dict = None, macro_info: dict = None) -> dict:
         """
         Perform fundamental analysis on stock data
         Returns buy/sell recommendation with reasoning
@@ -33,6 +46,22 @@ class InvestingAnalyzer:
             # Analyze risk factors
             risk_analysis = self._analyze_risks(stock_data, financials_data)
             
+            # Perform Market Intelligence analysis if not provided
+            if self.has_market_intel:
+                if sentiment_info is None:
+                    try:
+                        sentiment_info = self.sentiment_analyzer.analyze_sentiment(stock_data.get('symbol', ''))
+                    except Exception as e:
+                        logger.debug(f"Error in sentiment analysis: {e}")
+                
+                if macro_info is None:
+                    try:
+                        # Use SPY as proxy for macro analysis if available in history_data
+                        # Or let the detector fetch it
+                        macro_info = self.macro_detector.detect_regime(None)
+                    except Exception as e:
+                        logger.debug(f"Error in macro analysis: {e}")
+            
             # Make recommendation
             recommendation = self._make_recommendation(
                 fundamentals, financial_health, valuation, growth, risk_analysis, stock_data
@@ -49,7 +78,9 @@ class InvestingAnalyzer:
                 "reasoning": self._generate_reasoning(
                     recommendation, fundamentals, financial_health,
                     valuation, growth, risk_analysis
-                )
+                ),
+                "sentiment_info": sentiment_info,
+                "macro_info": macro_info
             }
         
         except Exception as e:

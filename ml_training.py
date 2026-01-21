@@ -932,28 +932,36 @@ class FeatureExtractor:
                 break
         
         # Create interactions (only if both features exist)
-        if rsi_idx >= 0 and volume_ratio_idx >= 0 and rsi_idx < X.shape[1] and volume_ratio_idx < X.shape[1]:
-            interactions.append(X[:, rsi_idx] * X[:, volume_ratio_idx])
-            interaction_names.append('rsi_x_volume_ratio')
-        
-        if macd_idx >= 0 and momentum_idx >= 0 and macd_idx < X.shape[1] and momentum_idx < X.shape[1]:
-            interactions.append(X[:, macd_idx] * X[:, momentum_idx])
-            interaction_names.append('macd_x_momentum')
-        
-        if price_pos_idx >= 0 and volatility_idx >= 0 and price_pos_idx < X.shape[1] and volatility_idx < X.shape[1]:
-            interactions.append(X[:, price_pos_idx] * X[:, volatility_idx])
-            interaction_names.append('price_pos_x_volatility')
-        
-        if rsi_idx >= 0 and price_pos_idx >= 0 and rsi_idx < X.shape[1] and price_pos_idx < X.shape[1]:
-            interactions.append(X[:, rsi_idx] * X[:, price_pos_idx])
-            interaction_names.append('rsi_x_price_pos')
-        
-        if volume_ratio_idx >= 0 and momentum_idx >= 0 and volume_ratio_idx < X.shape[1] and momentum_idx < X.shape[1]:
-            interactions.append(X[:, volume_ratio_idx] * X[:, momentum_idx])
-            interaction_names.append('volume_ratio_x_momentum')
+        # Create interactions (only if both features exist)
+        if len(X) > 0:
+            # Helper to safely multiply features
+            def safe_multiply(f1_idx, f2_idx, name):
+                if f1_idx >= 0 and f2_idx >= 0 and f1_idx < X.shape[1] and f2_idx < X.shape[1]:
+                    # Use float64 to prevent overflow during multiplication
+                    f1 = X[:, f1_idx].astype(np.float64)
+                    f2 = X[:, f2_idx].astype(np.float64)
+                    
+                    # Multiply
+                    product = f1 * f2
+                    
+                    # Replace Inf/NaN with 0 to prevent downstream errors
+                    if not np.isfinite(product).all():
+                        product = np.nan_to_num(product, nan=0.0, posinf=0.0, neginf=0.0)
+                        
+                    interactions.append(product)
+                    interaction_names.append(name)
+
+            safe_multiply(rsi_idx, volume_ratio_idx, 'rsi_x_volume_ratio')
+            safe_multiply(macd_idx, momentum_idx, 'macd_x_momentum')
+            safe_multiply(price_pos_idx, volatility_idx, 'price_pos_x_volatility')
+            safe_multiply(rsi_idx, price_pos_idx, 'rsi_x_price_pos')
+            safe_multiply(volume_ratio_idx, momentum_idx, 'volume_ratio_x_momentum')
         
         if len(interactions) > 0:
             X_with_interactions = np.column_stack([X, np.array(interactions).T])
+            # Final safety check
+            if not np.isfinite(X_with_interactions).all():
+                X_with_interactions = np.nan_to_num(X_with_interactions, nan=0.0, posinf=0.0, neginf=0.0)
             return X_with_interactions, interaction_names
         else:
             return X, []
@@ -3008,27 +3016,27 @@ class StockPredictionML:
             
             if HAS_LIGHTGBM:
                 params['lgb'] = {
-                    'n_estimators': trial.suggest_int('lgb_n_estimators', 80, 400),  # Expanded range
-                    'max_depth': trial.suggest_int('lgb_max_depth', 3, 6),  # Allow slightly deeper trees
-                    'learning_rate': trial.suggest_float('lgb_learning_rate', 0.01, 0.1, log=True),
-                    'subsample': trial.suggest_float('lgb_subsample', 0.5, 0.8),  # Reduced max for regularization
-                    'colsample_bytree': trial.suggest_float('lgb_colsample_bytree', 0.5, 0.8),
-                    'min_child_samples': trial.suggest_int('lgb_min_child_samples', 20, 60),  # Increased range
-                    'reg_alpha': trial.suggest_float('lgb_reg_alpha', 0.1, 2.0),  # Increased reg for balance
-                    'reg_lambda': trial.suggest_float('lgb_reg_lambda', 1.0, 5.0),  # Increased reg for balance
+                    'n_estimators': trial.suggest_int('lgb_n_estimators', 30, 120),  # Reduced from 80-400
+                    'max_depth': trial.suggest_int('lgb_max_depth', 2, 5),  # Reduced from 3-6 to prevent overfitting
+                    'learning_rate': trial.suggest_float('lgb_learning_rate', 0.01, 0.05, log=True), # Reduced max learning rate
+                    'subsample': trial.suggest_float('lgb_subsample', 0.4, 0.7),  # Reduced for regularization
+                    'colsample_bytree': trial.suggest_float('lgb_colsample_bytree', 0.4, 0.7),
+                    'min_child_samples': trial.suggest_int('lgb_min_child_samples', 40, 100),  # Increased min samples
+                    'reg_alpha': trial.suggest_float('lgb_reg_alpha', 1.0, 5.0),  # Increased regularization
+                    'reg_lambda': trial.suggest_float('lgb_reg_lambda', 2.0, 10.0),  # Increased regularization
                 }
             
             if HAS_XGBOOST:
                 params['xgb'] = {
-                    'n_estimators': trial.suggest_int('xgb_n_estimators', 80, 400),  # Expanded range
-                    'max_depth': trial.suggest_int('xgb_max_depth', 3, 6),  # Allow slightly deeper trees
-                    'learning_rate': trial.suggest_float('xgb_learning_rate', 0.01, 0.1, log=True),
-                    'subsample': trial.suggest_float('xgb_subsample', 0.5, 0.8),
-                    'colsample_bytree': trial.suggest_float('xgb_colsample_bytree', 0.5, 0.8),
-                    'min_child_weight': trial.suggest_int('xgb_min_child_weight', 2, 12),  # Slightly expanded
-                    'gamma': trial.suggest_float('xgb_gamma', 0.1, 0.6),  # Slightly expanded
-                    'reg_alpha': trial.suggest_float('xgb_reg_alpha', 0.1, 2.0),  # Increased reg
-                    'reg_lambda': trial.suggest_float('xgb_reg_lambda', 1.0, 5.0),  # Increased reg
+                    'n_estimators': trial.suggest_int('xgb_n_estimators', 30, 120),  # Reduced from 80-400
+                    'max_depth': trial.suggest_int('xgb_max_depth', 2, 5),  # Reduced from 3-6
+                    'learning_rate': trial.suggest_float('xgb_learning_rate', 0.01, 0.05, log=True),
+                    'subsample': trial.suggest_float('xgb_subsample', 0.4, 0.7),
+                    'colsample_bytree': trial.suggest_float('xgb_colsample_bytree', 0.4, 0.7),
+                    'min_child_weight': trial.suggest_int('xgb_min_child_weight', 5, 15),  # Increased min weight
+                    'gamma': trial.suggest_float('xgb_gamma', 0.2, 1.0),  # Increased gamma
+                    'reg_alpha': trial.suggest_float('xgb_reg_alpha', 1.0, 5.0),  # Increased reg
+                    'reg_lambda': trial.suggest_float('xgb_reg_lambda', 2.0, 10.0),  # Increased reg
                 }
             
             # Create model with suggested parameters
@@ -3090,9 +3098,8 @@ class StockPredictionML:
             regime_scaler_file = f"scaler_{self.strategy}_{regime}.pkl"
             regime_encoder_file = f"label_encoder_{self.strategy}_{regime}.pkl"
             
-            if (self.storage.model_exists(regime_model_file) and 
-                self.storage.model_exists(regime_scaler_file) and
-                self.storage.model_exists(regime_encoder_file)):
+            # Only strictly require the model file - scaler and encoder can be recovered/defaulted
+            if self.storage.model_exists(regime_model_file):
                 try:
                     # Create a minimal regime model object without calling __init__ (which would try to load again)
                     # Use object.__new__ to create instance without calling __init__
@@ -3130,9 +3137,27 @@ class StockPredictionML:
                     regime_ml.version_manager = None
                     
                     # Load the actual model components
-                    regime_ml.model = self.storage.load_model(regime_model_file)
-                    regime_ml.scaler = self.storage.load_model(regime_scaler_file)
-                    regime_ml.label_encoder = self.storage.load_model(regime_encoder_file)
+                    # Load the actual model components
+                    if self.storage.model_exists(regime_model_file):
+                        regime_ml.model = self.storage.load_model(regime_model_file)
+                    else:
+                        logger.warning(f"Regime model file missing: {regime_model_file}")
+                        continue
+
+                    if self.storage.model_exists(regime_scaler_file):
+                        regime_ml.scaler = self.storage.load_model(regime_scaler_file)
+                    else:
+                        logger.warning(f"Regime scaler missing for {regime}. Using unfitted StandardScaler (may fail).")
+                        regime_ml.scaler = StandardScaler()
+
+                    # Load or recover label encoder
+                    if self.storage.model_exists(regime_encoder_file):
+                        regime_ml.label_encoder = self.storage.load_model(regime_encoder_file)
+                    else:
+                        logger.warning(f"Regime label encoder missing for {regime}. Creating default.")
+                        regime_ml.label_encoder = LabelEncoder()
+                        # Default classes - simplified recovery
+                        regime_ml.label_encoder.fit(['BUY', 'HOLD', 'SELL'])
                     
                     # Load metadata for this regime if available
                     # Try multiple sources: main metadata -> regime's own metadata file
@@ -3232,15 +3257,16 @@ class StockPredictionML:
                 regime_model_file = f"ml_model_{self.strategy}_{regime}.pkl"
                 regime_scaler_file = f"scaler_{self.strategy}_{regime}.pkl"
                 regime_encoder_file = f"label_encoder_{self.strategy}_{regime}.pkl"
-                if (self.storage.model_exists(regime_model_file) and 
-                    self.storage.model_exists(regime_scaler_file) and
-                    self.storage.model_exists(regime_encoder_file)):
+                if self.storage.model_exists(regime_model_file):
                     regime_files_exist = True
                     break
+                # Log usage for debugging once (checking 'bull' regime)
+                if regime == 'bull':
+                     logger.debug(f"Checking regime model path: {self.storage.data_dir / regime_model_file}")
             
             # Check if single model files exist
-            single_model_exists = (self.storage.model_exists(self.model_file) and 
-                                  self.storage.model_exists(self.scaler_file))
+            single_model_exists = self.storage.model_exists(self.model_file)
+            logger.debug(f"Checking single model path: {self.storage.data_dir / self.model_file}")
             
             # If model files exist but model isn't loaded, try to reload
             if regime_files_exist or single_model_exists:
@@ -3258,13 +3284,19 @@ class StockPredictionML:
                     hasattr(regime_ml.label_encoder, 'classes_') and 
                     len(regime_ml.label_encoder.classes_) > 0):
                     return True
+                else:
+                    logger.warning(f"DIAGNOSTIC - Regime {regime} not ready: model={regime_ml.model is not None}, "
+                               f"has_classes={hasattr(regime_ml.label_encoder, 'classes_')}")
+            logger.warning(f"DIAGNOSTIC - No ready regime models found out of {len(self.regime_models)}")
             return False
         
         # Check single model
         if self.model is None:
+            logger.warning("DIAGNOSTIC - Single model is None")
             return False
         # Also check if LabelEncoder is fitted (needed for predictions)
         if not hasattr(self.label_encoder, 'classes_') or len(self.label_encoder.classes_) == 0:
+            logger.warning(f"DIAGNOSTIC - Single model label encoder not fitted: {hasattr(self.label_encoder, 'classes_')}")
             return False
         return True
 

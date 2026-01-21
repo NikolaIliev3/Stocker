@@ -12,6 +12,8 @@ import json
 import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
+import time
+import random
 
 # Import new modules
 try:
@@ -85,6 +87,59 @@ class StockDataFetcher:
         # Return cached value if check interval hasn't passed
         return self._backend_available is True
     
+    # Class-level verification timestamp to prevent multiple threads hammering API when rate limited
+    _global_rate_limit_cooldown = 0
+    
+    def _retry_operation(self, operation, max_retries=5, base_delay=3.0):
+        """Execute operation with retry logic for rate limits"""
+        last_exception = None
+        
+        # Check global cooldown first
+        current_time = time.time()
+        if current_time < self._global_rate_limit_cooldown:
+            wait_time = self._global_rate_limit_cooldown - current_time
+            logger.warning(f"Global rate limit cooldown active. Waiting {wait_time:.1f}s...")
+            time.sleep(wait_time)
+        
+        for attempt in range(max_retries):
+            try:
+                # Provide a small randomized delay between any request to be polite
+                if attempt > 0:
+                    time.sleep(random.random() * 0.5)
+                    
+                return operation()
+            except Exception as e:
+                last_exception = e
+                error_msg = str(e).lower()
+                
+                # Check for rate limit indicators
+                is_rate_limit = (
+                    "rate limited" in error_msg or 
+                    "too many requests" in error_msg or 
+                    "429" in error_msg or
+                    "connection refused" in error_msg or
+                    "read timed out" in error_msg
+                )
+                
+                if is_rate_limit:
+                    # Set global cooldown on the first sign of trouble to protect other threads
+                    # Cooldown increases with attempts
+                    cooldown_duration = (base_delay * (2 ** attempt)) 
+                    StockDataFetcher._global_rate_limit_cooldown = time.time() + cooldown_duration
+                    
+                    if attempt < max_retries - 1:
+                        # Exponential backoff: 3s, 6s, 12s, 24s... + jitter
+                        sleep_time = cooldown_duration + (random.random() * 2.0)
+                        logger.warning(f"Rate limited (attempt {attempt+1}/{max_retries}). Global cooldown set for {cooldown_duration:.1f}s. Retrying in {sleep_time:.2f}s...")
+                        time.sleep(sleep_time)
+                        continue
+                
+                # If valid error but not rate limit, or max retries reached, raise it
+                raise e
+                
+        if last_exception:
+            raise last_exception
+    
     def _fetch_direct_yfinance(self, symbol: str) -> dict:
         """Fetch stock data directly using yfinance (fallback method)"""
         try:
@@ -101,12 +156,16 @@ class StockDataFetcher:
                 info = {}
             
             # Get history
-            hist = ticker.history(period="1y", timeout=30)
-            if hist is None or hist.empty:
-                # Try shorter period
-                hist = ticker.history(period="6mo", timeout=30)
-            if hist is None or hist.empty:
-                hist = ticker.history(period="3mo", timeout=30)
+            def fetch_history_op():
+                h = ticker.history(period="1y", timeout=30)
+                if h is None or h.empty:
+                    # Try shorter period
+                    h = ticker.history(period="6mo", timeout=30)
+                if h is None or h.empty:
+                    h = ticker.history(period="3mo", timeout=30)
+                return h
+                
+            hist = self._retry_operation(fetch_history_op)
             
             if hist is None or hist.empty:
                 raise Exception("No historical data available")
@@ -264,11 +323,13 @@ class StockDataFetcher:
         # If start_date and end_date are provided, use them directly with yfinance
         if start_date and end_date:
             try:
-                import yfinance as yf
-                # pd is already imported at the top of the file
+                def fetch_op():
+                    import yfinance as yf
+                    ticker = yf.Ticker(symbol.upper())
+                    return ticker.history(start=start_date, end=end_date, interval=interval, timeout=30)
                 
-                ticker = yf.Ticker(symbol.upper())
-                hist = ticker.history(start=start_date, end=end_date, interval=interval, timeout=30)
+                # Use retry logic
+                hist = self._retry_operation(fetch_op)
                 
                 if hist is None or hist.empty:
                     return {"error": "No historical data available", "data": []}
@@ -322,11 +383,13 @@ class StockDataFetcher:
         
         # Fallback to direct yfinance
         try:
-            import yfinance as yf
-            # pd is already imported at the top of the file
+            def fetch_op():
+                import yfinance as yf
+                ticker = yf.Ticker(symbol.upper())
+                return ticker.history(period=period, interval=interval, timeout=30)
             
-            ticker = yf.Ticker(symbol.upper())
-            hist = ticker.history(period=period, interval=interval, timeout=30)
+            # Use retry logic
+            hist = self._retry_operation(fetch_op)
             
             if hist is None or hist.empty:
                 raise Exception("No historical data available")

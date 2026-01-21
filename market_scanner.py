@@ -33,19 +33,23 @@ class MarketScanner:
         # Energy
         'XOM', 'CVX', 'COP',
         # Other
-        'DIS', 'V', 'MA', 'PG', 'NKE'
+        'DIS', 'V', 'MA', 'PG', 'NKE',
+        # Semiconductors
+        'AMD', 'INTC', 'TXN',
+        # Additional Diverse
+        'SBUX', 'BLK'
     ]
     
     # Extended list for broad market dip scanning
     BROAD_MARKET_STOCKS = POPULAR_STOCKS + [
         # More Tech
-        'AMD', 'INTC', 'CRM', 'ADBE', 'ORCL', 'IBM', 'CSCO', 'QCOM', 'TXN', 'AVGO',
+        'CRM', 'ADBE', 'ORCL', 'IBM', 'CSCO', 'QCOM', 'AVGO',
         'NOW', 'SHOP', 'SQ', 'PYPL', 'UBER', 'ABNB', 'SNAP', 'PINS', 'ZM', 'DOCU',
         'PLTR', 'CRWD', 'DDOG', 'NET', 'MDB', 'SNOW', 'U', 'RBLX', 'COIN', 'HOOD',
         # More Finance
-        'C', 'BLK', 'SCHW', 'AXP', 'USB', 'PNC', 'TFC', 'COF', 'CME', 'ICE',
+        'C', 'SCHW', 'AXP', 'USB', 'PNC', 'TFC', 'COF', 'CME', 'ICE',
         # More Consumer
-        'COST', 'LOW', 'SBUX', 'YUM', 'CMG', 'DG', 'DLTR', 'ROST', 'TJX', 'LULU',
+        'COST', 'LOW', 'YUM', 'CMG', 'DG', 'DLTR', 'ROST', 'TJX', 'LULU',
         # More Healthcare
         'MRK', 'LLY', 'BMY', 'GILD', 'AMGN', 'BIIB', 'VRTX', 'REGN', 'MRNA', 'ZTS',
         # More Industrial
