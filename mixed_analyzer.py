@@ -29,8 +29,20 @@ class MixedAnalyzer:
     def __init__(self):
         self.holding_period_min = 7  # 1 week
         self.holding_period_max = 30  # 1 month
+        
+        # Initialize Market Intelligence components
+        try:
+            from sentiment_analyzer import SentimentAnalyzer
+            from algorithm_improvements import MarketRegimeDetector
+            self.sentiment_analyzer = SentimentAnalyzer()
+            self.macro_detector = MarketRegimeDetector()
+            self.has_market_intel = True
+        except ImportError:
+            logger.warning("Could not import Market Intelligence components in MixedAnalyzer")
+            self.has_market_intel = False
     
-    def analyze(self, stock_data: dict, financials_data: dict, history_data: dict) -> Dict:
+    def analyze(self, stock_data: dict, financials_data: dict, history_data: dict,
+               sentiment_info: dict = None, macro_info: dict = None) -> Dict:
         """
         Perform mixed analysis combining technical and fundamental factors
         for medium-term holding (1 week to 1 month)
@@ -57,6 +69,21 @@ class MixedAnalyzer:
             # Combine scores (60% technical, 40% fundamental for medium-term)
             combined_score = (technical_score * 0.6) + (fundamental_score * 0.4)
             
+            # Perform Market Intelligence analysis if not provided
+            if self.has_market_intel:
+                if sentiment_info is None:
+                    try:
+                        sentiment_info = self.sentiment_analyzer.analyze_sentiment(stock_data.get('symbol', ''))
+                    except Exception as e:
+                        logger.debug(f"Error in sentiment analysis: {e}")
+                
+                if macro_info is None:
+                    try:
+                        # Use SPY as proxy if available, or fetch
+                        macro_info = self.macro_detector.detect_regime(None)
+                    except Exception as e:
+                        logger.debug(f"Error in macro analysis: {e}")
+            
             # Determine recommendation
             recommendation = self._get_recommendation(combined_score, current_price, data)
             
@@ -76,7 +103,9 @@ class MixedAnalyzer:
                     'holding_period': f"{self.holding_period_min}-{self.holding_period_max} days"
                 },
                 'strategy': 'mixed',
-                'timeframe': '1 week - 1 month'
+                'timeframe': '1 week - 1 month',
+                'sentiment_info': sentiment_info,
+                'macro_info': macro_info
             }
         
         except Exception as e:

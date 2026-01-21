@@ -1,0 +1,14 @@
+{
+  "backtesting": {
+    "enabled": true,
+    "interval_hours": 24,
+    "last_run": null,
+    "next_run": "2026-01-21T20:35:12.495712"
+  },
+  "ml_training": {
+    "enabled": true,
+    "interval_days": 30,
+    "last_run": null,
+    "next_run": "2026-02-19T20:35:12.495712"
+  }
+}

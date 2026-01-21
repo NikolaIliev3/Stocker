@@ -468,6 +468,7 @@ class ContinuousBacktester:
                 correct = 0
                 incorrect = 0
                 skipped = 0
+                consecutive_skips = 0
                 
                 lookforward = self.lookforward_days[strategy]
                 logger.info(f"Testing {strategy} strategy (lookforward: {lookforward} days, need dates at least {lookforward + 30} days ago)")
@@ -516,11 +517,28 @@ class ContinuousBacktester:
                         else:
                             incorrect += 1
                         if tests_run <= 3 or tests_run % 5 == 0:  # Log first 3 and every 5th
-                            logger.info(f"✅ Test {tests_run}/{self.tests_per_run}: {symbol} at {test_date.strftime('%Y-%m-%d')} - {'✓' if result['was_correct'] else '✗'}")
+                            logger.info(f"✅ Test {tests_run}/{tests_to_run}: {symbol} at {test_date.strftime('%Y-%m-%d')} - {'✓' if result['was_correct'] else '✗'}")
+                        
+                        # Reset consecutive skip counter if successful
+                        consecutive_skips = 0
+                            
                     else:
                         skipped += 1
+                        # Track consecutive skips to increase backoff
+                        consecutive_skips = locals().get('consecutive_skips', 0) + 1
+                        
+                        # Add delay when skipping to prevent tight looping on errors
+                        # Increase delay if we are hitting many errors (likely rate limits)
+                        delay = 0.5
+                        if consecutive_skips > 10:
+                            delay = 2.0
+                        elif consecutive_skips > 5:
+                            delay = 1.0
+                            
+                        time.sleep(delay)
+                        
                         if skipped == 1 or skipped % 20 == 0:  # Log first skip and every 20th (less spam)
-                            logger.info(f"Skipped {skipped} tests so far for {strategy} (attempting to find valid points...)")
+                            logger.info(f"Skipped {skipped} tests so far for {strategy} (attempting to find valid points...) - consecutive skips: {consecutive_skips}")
                         # After many skips, log a sample of why it's failing
                         if skipped == 50:
                             logger.warning(f"Many skips for {strategy} - checking data availability. This might indicate data fetching issues.")

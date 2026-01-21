@@ -19,6 +19,22 @@ class EnhancedFeatureExtractor:
         self.sector_cache = {}
         self.industry_cache = {}
     
+    def _safe_correlation(self, s1: pd.Series, s2: pd.Series) -> float:
+        """Calculate correlation safely, handling NaNs and constants"""
+        try:
+            # Drop NaNs
+            valid = pd.concat([s1, s2], axis=1).dropna()
+            if len(valid) < 2:
+                return 0.0
+            
+            # Check for constants (std dev near 0)
+            if valid.iloc[:, 0].std() < 1e-8 or valid.iloc[:, 1].std() < 1e-8:
+                return 0.0
+                
+            return float(valid.iloc[:, 0].corr(valid.iloc[:, 1]))
+        except Exception:
+            return 0.0
+
     def extract_market_microstructure_features(self, df: pd.DataFrame, 
                                                stock_data: dict) -> Dict:
         """
@@ -47,11 +63,9 @@ class EnhancedFeatureExtractor:
         
         if len(price_changes) > 0 and len(volume_changes) > 0:
             # Correlation between price and volume changes
-            aligned = pd.concat([price_changes, volume_changes], axis=1).dropna()
-            if len(aligned) > 1:
-                features['price_volume_correlation'] = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
-            else:
-                features['price_volume_correlation'] = 0
+            features['price_volume_correlation'] = self._safe_correlation(price_changes, volume_changes)
+        else:
+            features['price_volume_correlation'] = 0
         
         # Liquidity proxy (volume / price volatility)
         if df['close'].std() > 0:
@@ -124,7 +138,7 @@ class EnhancedFeatureExtractor:
                         
                         # Relative strength
                         features['sector_relative_strength'] = (stock_ret.mean() - sector_ret.mean()) * 100
-                        features['sector_correlation'] = stock_ret.corr(sector_ret) if len(stock_ret) > 1 else 0
+                        features['sector_correlation'] = self._safe_correlation(stock_ret, sector_ret)
                         
             except Exception as e:
                 logger.debug(f"Could not fetch sector data: {e}")
@@ -283,4 +297,5 @@ class EnhancedFeatureExtractor:
         if older.mean() > 0:
             return (recent.mean() - older.mean()) / older.mean()
         return 0
+
 

@@ -112,20 +112,20 @@ def factory_reset_ml(data_dir: Path = None, confirm: bool = False):
     for file_path in files_to_delete:
         try:
             file_path.unlink()
-            print(f"  ✓ Deleted: {file_path.name}")
+            print(f"  [OK] Deleted: {file_path.name}")
             deleted_count += 1
         except Exception as e:
-            print(f"  ✗ Error deleting {file_path.name}: {e}")
+            print(f"  [ERR] Error deleting {file_path.name}: {e}")
             error_count += 1
     
     # Delete model versions directory
     if versions_dir.exists():
         try:
             shutil.rmtree(versions_dir)
-            print(f"  ✓ Deleted directory: model_versions/")
+            print(f"  [OK] Deleted directory: model_versions/")
             deleted_count += 1
         except Exception as e:
-            print(f"  ✗ Error deleting model_versions/: {e}")
+            print(f"  [ERR] Error deleting model_versions/: {e}")
             error_count += 1
     
     print()
@@ -135,7 +135,7 @@ def factory_reset_ml(data_dir: Path = None, confirm: bool = False):
     print(f"  • Errors: {error_count}")
     print("=" * 60)
     print()
-    print("📋 NEXT STEPS:")
+    print("NEXT STEPS:")
     print("  1. Restart the Stocker application")
     print("  2. Go to 'Machine Learning' tab")
     print("  3. Click 'Train Megamind' to train fresh models")

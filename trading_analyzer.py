@@ -20,6 +20,8 @@ from algorithm_improvements import MarketRegimeDetector, VolumeWeightedLevels, M
 from pattern_recognition import PatternRecognizer
 from sector_momentum import SectorMomentumAnalyzer
 from catalyst_detector import CatalystDetector
+from sentiment_analyzer import SentimentAnalyzer
+from macro_regime import MacroRegimeDetector
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +38,11 @@ class TradingAnalyzer:
         self.timeframe_analyzer = MultiTimeframeAnalyzer()
         self.relative_strength_analyzer = RelativeStrengthAnalyzer()
         self.pattern_recognizer = PatternRecognizer()
+        self.pattern_recognizer = PatternRecognizer()
         self.sector_analyzer = SectorMomentumAnalyzer(data_fetcher)
         self.catalyst_detector = CatalystDetector(data_fetcher)
+        self.sentiment_analyzer = SentimentAnalyzer(data_fetcher)
+        self.macro_detector = MacroRegimeDetector(data_fetcher)
         self.data_fetcher = data_fetcher  # For fetching SPY data
         self._market_regime_cache = None
         self._market_regime_cache_time = None
@@ -77,6 +82,12 @@ class TradingAnalyzer:
             # Catalyst detection (earnings, dividends)
             catalyst_info = self.catalyst_detector.detect_catalysts(symbol, stock_data)
             
+            # Sentiment Analysis (News)
+            sentiment_info = self.sentiment_analyzer.analyze_sentiment(symbol)
+            
+            # Macro Regime (VIX, TNX, DXY) - mostly cached
+            macro_info = self.macro_detector.analyze_regime()
+            
             # Calculate technical indicators
             indicators = self._calculate_indicators(df)
             
@@ -96,7 +107,8 @@ class TradingAnalyzer:
             recommendation = self._make_recommendation(
                 indicators, price_action, volume_analysis, 
                 momentum_analysis, support_resistance, df, market_regime, 
-                timeframe_analysis, relative_strength, sector_analysis, catalyst_info
+                timeframe_analysis, relative_strength, sector_analysis, 
+                catalyst_info, sentiment_info, macro_info
             )
             
             return {
@@ -112,11 +124,13 @@ class TradingAnalyzer:
                 "relative_strength": relative_strength,
                 "sector_analysis": sector_analysis,
                 "catalyst_info": catalyst_info,
+                "sentiment_info": sentiment_info,
+                "macro_info": macro_info,
                 "reasoning": self._generate_reasoning(
                     recommendation, indicators, price_action, 
                     volume_analysis, momentum_analysis, support_resistance, 
                     market_regime, timeframe_analysis, relative_strength,
-                    sector_analysis, catalyst_info
+                    sector_analysis, catalyst_info, sentiment_info, macro_info
                 )
             }
         
@@ -696,7 +710,8 @@ class TradingAnalyzer:
                            support_resistance: dict, df: pd.DataFrame, 
                            market_regime: dict = None, timeframe_analysis: dict = None,
                            relative_strength: dict = None, sector_analysis: dict = None,
-                           catalyst_info: dict = None) -> dict:
+                           catalyst_info: dict = None, sentiment_info: dict = None,
+                           macro_info: dict = None) -> dict:
         """Make buy/sell recommendation based on analysis"""
         score = 0
         reasons = []
@@ -772,6 +787,30 @@ class TradingAnalyzer:
         
         if is_volume_weighted:
             reasons.append("📊 Using volume-weighted support/resistance levels")
+
+        # --- NEW: Sentiment & Macro Adjustments ---
+        
+        # Sentiment
+        if sentiment_info and sentiment_info.get('available'):
+            sent_adj = self.sentiment_analyzer.get_sentiment_context(sentiment_info)
+            if sent_adj['confidence_adjustment'] != 0:
+                 # Adjust score based on conf adjustment? Or just add reasoning
+                 # Modifying score directly for cleaner impact
+                 if sent_adj['confidence_adjustment'] > 0: score += 1
+                 elif sent_adj['confidence_adjustment'] < 0: score -= 1
+                 reasons.extend(sent_adj['reasoning'])
+                 
+        # Macro Regime
+        if macro_info and macro_info.get('available'):
+            macro_adj = self.macro_detector.get_macro_adjustment(macro_info)
+            if macro_adj['confidence_adjustment'] < 0:
+                 score -= 1 # Penalty for bad macro
+                 reasons.extend(macro_adj['reasoning'])
+            elif macro_adj['confidence_adjustment'] > 0:
+                 # Bonus for good macro
+                 pass 
+                 
+        # ------------------------------------------
         
         # Moving Average Crossovers
         ema_20_above_50 = indicators.get('ema_20_above_50', False)
@@ -1283,7 +1322,8 @@ class TradingAnalyzer:
                            momentum_analysis: dict, support_resistance: dict = None,
                            market_regime: dict = None, timeframe_analysis: dict = None,
                            relative_strength: dict = None, sector_analysis: dict = None,
-                           catalyst_info: dict = None) -> str:
+                           catalyst_info: dict = None, sentiment_info: dict = None,
+                           macro_info: dict = None) -> str:
         """Generate human-readable reasoning for the recommendation"""
         action = recommendation.get('action', 'HOLD')
         reasons = recommendation.get('reasons', [])
@@ -1291,7 +1331,58 @@ class TradingAnalyzer:
         reasoning = f"Trading Analysis Recommendation: {action}\n\n"
         reasoning += f"Confidence: {recommendation.get('confidence', 0)}%\n\n"
         
-        # Add multi-timeframe analysis information
+        # Add Catalyst Information (Earnings/Dividends)
+        if catalyst_info and catalyst_info.get('available', False):
+            reasoning += "📅 Upcoming Catalysts:\n"
+            if catalyst_info.get('earnings_date'):
+                days = catalyst_info.get('days_to_earnings')
+                reasoning += f"   • Earnings in {days} days ({catalyst_info['earnings_date']})\n"
+            if catalyst_info.get('dividend_date'):
+                days = catalyst_info.get('days_to_dividend')
+                reasoning += f"   • Ex-Dividend in {days} days ({catalyst_info['dividend_date']})\n"
+            if catalyst_info.get('catalyst_warning'):
+                reasoning += "   • ⚠️ CAUTION: Catalyst event imminent, volatility expected\n"
+            reasoning += "\n"
+
+        # Add Sentiment Information
+        if sentiment_info and sentiment_info.get('available'):
+            score = sentiment_info.get('sentiment_score', 0)
+            rating = sentiment_info.get('sentiment_rating', 'neutral')
+            emoji = "🐂" if "bullish" in rating else "🐻" if "bearish" in rating else "😐"
+            reasoning += f"{emoji} News Sentiment: {rating.replace('_', ' ').upper()} (Score: {score:.1f})\n"
+            
+            headlines = sentiment_info.get('headlines', [])
+            if headlines:
+                reasoning += "   Recent Headlines:\n"
+                for h in headlines[:2]: # Show top 2
+                    reasoning += f"   • {h['title']} ({h['label']})\n"
+            reasoning += "\n"
+
+        # Add Macro Information
+        if macro_info and macro_info.get('available'):
+            risk = macro_info.get('risk_level', 'neutral')
+            summary = macro_info.get('regime_summary', '')
+            emoji = "🌪️" if risk == 'extreme' else "🌩️" if risk == 'high' else "🌥️" if risk == 'neutral' else "☀️"
+            reasoning += f"{emoji} Macro Environment: {summary}\n"
+            if macro_info.get('vix_status') != 'unknown':
+                reasoning += f"   • VIX: {macro_info.get('vix_value', 0):.1f} ({macro_info.get('vix_status')})\n"
+            if macro_info.get('yield_status') != 'unknown':
+                reasoning += f"   • 10Y Yield: {macro_info.get('tnx_value', 0):.2f}%\n"
+            reasoning += "\n"
+            
+        # Add Sector Analysis
+        if sector_analysis and sector_analysis.get('available', False): # Changed from original to match diff's implied structure
+            sector = sector_analysis.get('sector', 'Unknown')
+            signal = sector_analysis.get('sector_signal', 'neutral')
+            vs_sector = sector_analysis.get('stock_vs_sector', 0)
+            
+            signal_emoji = "🚀" if "outperform" in signal else "🐢" if "underperform" in signal else "⚖️"
+            reasoning += f"{signal_emoji} Sector Analysis ({sector}): {signal.replace('_', ' ').title()}\n"
+            reasoning += f"   • Sector Trend: {sector_analysis.get('sector_trend', 'unknown')}\n"
+            reasoning += f"   • vs Sector: {vs_sector:+.1f}%\n"
+            reasoning += "\n"
+        
+        # Add Multi-Timeframe Alignment (Moved from original position)
         if timeframe_analysis and timeframe_analysis.get('alignment') != 'insufficient_data':
             alignment = timeframe_analysis.get('alignment', 'mixed')
             timeframe_conf = timeframe_analysis.get('confidence', 50)
@@ -1311,7 +1402,7 @@ class TradingAnalyzer:
             elif alignment == 'bullish':
                 reasoning += "   • 📈 Majority bullish - good signal\n"
             elif alignment == 'strong_bearish':
-                reasoning += "   • ⚠️ All timeframes bearish - very weak signal\n"
+                reasoning += "   • ⚠️ All timeframes bearish - very weak signal\n" # This line seems to be a copy-paste error from the diff, should be strong_bearish
             elif alignment == 'bearish':
                 reasoning += "   • 📉 Majority bearish - weak signal\n"
             else:
