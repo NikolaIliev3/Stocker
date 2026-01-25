@@ -281,6 +281,10 @@ class MixedAnalyzer:
         try:
             score = 50.0  # Start neutral
             
+            # Handle missing financials data gracefully
+            if financials_data is None:
+                financials_data = {}
+            
             # Market cap (larger is generally more stable)
             market_cap = stock_data.get('market_cap', 0)
             if market_cap > 10_000_000_000:  # > $10B

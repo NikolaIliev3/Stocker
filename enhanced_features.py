@@ -18,6 +18,8 @@ class EnhancedFeatureExtractor:
         self.data_fetcher = data_fetcher
         self.sector_cache = {}
         self.industry_cache = {}
+        # Cache for sector ETF data to avoid N+1 queries
+        self._sector_data_cache = {}
     
     def _safe_correlation(self, s1: pd.Series, s2: pd.Series) -> float:
         """Calculate correlation safely, handling NaNs and constants"""
@@ -120,9 +122,18 @@ class EnhancedFeatureExtractor:
             
             sector_etf = sector_etf_map.get(sector, 'SPY')  # Default to SPY
             
-            # Fetch sector ETF data
+            # Fetch sector ETF data (with caching)
             try:
-                sector_data = self.data_fetcher.fetch_stock_data(sector_etf)
+                # Check cache first
+                if sector_etf in self._sector_data_cache:
+                    sector_data = self._sector_data_cache[sector_etf]
+                    # Check if cache is stale (optional, but good practice - for now we assume 
+                    # one run is short enough to not need expiry)
+                else:
+                    sector_data = self.data_fetcher.fetch_stock_data(sector_etf)
+                    if sector_data:
+                        self._sector_data_cache[sector_etf] = sector_data
+                
                 if sector_data and 'history' in sector_data:
                     sector_history = sector_data['history']
                     

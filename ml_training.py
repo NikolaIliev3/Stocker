@@ -17,6 +17,14 @@ from sklearn.feature_selection import RFE, SelectKBest, mutual_info_classif
 
 # Suppress harmless feature name warnings from LightGBM/XGBoost
 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.utils.validation')
+# Suppress yfinance deprecation warnings
+warnings.filterwarnings('ignore', message='.*Timestamp.utcnow is deprecated.*')
+warnings.filterwarnings('ignore', category=FutureWarning)
+try:
+    from pandas.errors import Pandas4Warning
+    warnings.filterwarnings('ignore', category=Pandas4Warning)
+except ImportError:
+    pass
 
 # Try to import advanced ML libraries
 try:
@@ -969,8 +977,8 @@ class FeatureExtractor:
     def get_feature_names(self) -> List[str]:
         """Get names of all features including time-series and pattern features"""
         base_features = [
-            'rsi', 'macd', 'macd_signal', 'macd_diff',
-            'ema_20', 'ema_50', 'ema_200',
+            'rsi', 'mfi', 'macd', 'macd_signal', 'macd_diff',
+            'ema_20', 'ema_50', 'ema_200', 'dist_ema_200',
             'bb_upper', 'bb_lower', 'bb_middle',
             'atr', 'atr_percent',
             'stoch_k', 'stoch_d', 'williams_r',
@@ -1029,7 +1037,29 @@ class FeatureExtractor:
             'double_top', 'double_bottom', 'triangle', 'resistance_break', 'support_break'
         ]
         
-        return base_features + time_series_features + pattern_features + momentum_enhanced_features
+        # Add volume analysis feature names (3 features) - corresponding to line 361
+        volume_analysis_features = [
+            'volume_ratio_score', 'volume_trend_binary', 'high_volume_binary'
+        ]
+        
+        # Add sector momentum feature names (5 features) - corresponding to line 521
+        sector_features = [
+            'sector_momentum', 'stock_vs_sector', 'sector_signal_score', 
+            'sector_trend_score', 'outperforming_sector_binary'
+        ]
+        
+        # Add catalyst feature names (4 features) - corresponding to line 561
+        catalyst_features = [
+            'earnings_proximity', 'dividend_proximity', 
+            'upcoming_catalyst_binary', 'catalyst_warning_binary'
+        ]
+        
+        # Add liquidity feature names (3 features) - corresponding to line 598
+        liquidity_features = [
+            'liquidity_score', 'log_dollar_volume', 'clipped_volume_ratio'
+        ]
+        
+        return base_features + time_series_features + pattern_features + volume_analysis_features + momentum_enhanced_features + sector_features + catalyst_features + liquidity_features
 
 
 class StockPredictionML:
@@ -1118,7 +1148,8 @@ class StockPredictionML:
                     if self.metadata.get('use_regime_models', False):
                         self.use_regime_models = True
                         self._load_regime_models()
-                        logger.info(f"Loaded regime-specific models for {self.strategy}")
+                        if len(self.regime_models) > 0:
+                            logger.info(f"Loaded regime-specific models for {self.strategy}")
                         if 'regime_metadata' in self.metadata:
                             regime_info = []
                             for regime, meta in self.metadata['regime_metadata'].items():
@@ -1728,21 +1759,23 @@ class StockPredictionML:
             # Create dummy importance dict for all features
             feature_importance_dict = {name: 1.0 / len(selected_feature_names) for name in selected_feature_names}
         else:
-            # Determine number of features to select (top 50-70 features to reduce overfitting)
-            # Reduced feature count to prevent overfitting while maintaining performance
-            total_features = len(X_train[0])
-            n_features_to_select = max(30, min(50, int(total_features * 0.4)))  # Reduced to 30-50 features to prevent overfitting
+            # Determine number of features to select (Strict RFE Mode)
+            # We enforce a hard limit of 15-20 features to eliminate noise
+            n_features_to_select = 20  # Hard cap for noise reduction (User Request)
             
-            if self.feature_selection_method == 'rfe' and len(X_train) > n_features_to_select:
+            # Always use RFE for accurate feature pruning unless explicitly disabled
+            if len(X_train) > n_features_to_select:
                 # Use RFE for feature selection
-                logger.info(f"Step 1: Using RFE to select top {n_features_to_select} features...")
-                estimator = RandomForestClassifier(n_estimators=50, random_state=random_seed, n_jobs=get_safe_n_jobs(ML_TRAINING_CPU_CORES))
-                rfe = RFE(estimator, n_features_to_select=n_features_to_select)
+                logger.info(f"Step 1: Using Strict RFE to select top {n_features_to_select} features (Noise Reduction)...")
+                # Use a lightweight estimator for RFE speed
+                estimator = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=random_seed, n_jobs=get_safe_n_jobs(ML_TRAINING_CPU_CORES))
+                # Step=1 means remove 1 feature at a time (most accurate)
+                rfe = RFE(estimator, n_features_to_select=n_features_to_select, step=0.05) # remove 5% at a time for speed
                 X_train_selected = rfe.fit_transform(X_train_scaled_initial, y_train)
                 X_test_selected = rfe.transform(X_test_scaled_initial)
                 self.selected_features = np.array(rfe.get_support(indices=True))
                 selected_feature_names = [self.feature_extractor.get_feature_names()[i] for i in self.selected_features]
-                logger.info(f"RFE selected {len(self.selected_features)} features")
+                logger.info(f"✅ RFE selected {len(self.selected_features)} features")
             elif self.feature_selection_method == 'mutual_info':
                 # Use mutual information
                 logger.info(f"Step 1: Using Mutual Information to select top {n_features_to_select} features...")
@@ -1814,6 +1847,10 @@ class StockPredictionML:
                 X_test_selected = X_test_scaled_initial[:, self.selected_features]
                 selected_feature_indices = list(self.selected_features)
         
+        # Ensure selected_feature_indices is defined for all paths
+        if 'selected_feature_indices' not in locals():
+            selected_feature_indices = list(self.selected_features)
+
         # Step 4: Add feature interactions (enabled by default for better accuracy)
         # Feature interactions capture non-linear relationships between features
         if use_interactions is None:
@@ -1838,10 +1875,16 @@ class StockPredictionML:
         X_test_scaled = self.scaler.transform(X_test_selected)
         
         # Store feature importance for selected features only
-        self.feature_importance = {
-            name: feature_importance_dict[name] 
-            for name in selected_feature_names
-        }
+        # Handle case where feature_importance_dict might be empty (RFE/MI)
+        if not feature_importance_dict:
+            # Assign equal importance if not available
+            default_imp = 1.0 / len(selected_feature_names) if selected_feature_names else 0.0
+            self.feature_importance = {name: default_imp for name in selected_feature_names}
+        else:
+            self.feature_importance = {
+                name: feature_importance_dict.get(name, 0.0) 
+                for name in selected_feature_names
+            }
         
         # ===== HYPERPARAMETER TUNING (Enabled by default) =====
         if self.use_hyperparameter_tuning and HAS_OPTUNA and len(X_train_scaled) > 500:
@@ -2690,12 +2733,21 @@ class StockPredictionML:
             logger.warning(f"Error detecting market regime: {e}. Defaulting to sideways.")
             return 'sideways'
     
+    def get_regime_accuracy(self, regime: str) -> float:
+        """Get the test accuracy for a specific regime"""
+        if not self.use_regime_models or 'regime_metadata' not in self.metadata:
+            return 0.0
+        
+        regime_meta = self.metadata['regime_metadata'].get(regime, {})
+        return regime_meta.get('test_accuracy', 0.0)
+    
     def predict(self, features: np.ndarray, stock_data: dict = None, history_data: dict = None) -> Dict:
         """Make prediction using trained model (or regime-specific model if enabled)"""
         # Check if we should use regime-specific models
         if self.use_regime_models and len(self.regime_models) > 0:
             # Detect current market regime
             current_regime = self._detect_current_regime(history_data, stock_data)
+            self.last_regime = current_regime
             
             if current_regime in self.regime_models:
                 regime_ml = self.regime_models[current_regime]
@@ -3285,18 +3337,18 @@ class StockPredictionML:
                     len(regime_ml.label_encoder.classes_) > 0):
                     return True
                 else:
-                    logger.warning(f"DIAGNOSTIC - Regime {regime} not ready: model={regime_ml.model is not None}, "
+                    logger.debug(f"DIAGNOSTIC - Regime {regime} not ready: model={regime_ml.model is not None}, "
                                f"has_classes={hasattr(regime_ml.label_encoder, 'classes_')}")
-            logger.warning(f"DIAGNOSTIC - No ready regime models found out of {len(self.regime_models)}")
+            logger.debug(f"DIAGNOSTIC - No ready regime models found out of {len(self.regime_models)}")
             return False
         
         # Check single model
         if self.model is None:
-            logger.warning("DIAGNOSTIC - Single model is None")
+            logger.debug("DIAGNOSTIC - Single model is None")
             return False
         # Also check if LabelEncoder is fitted (needed for predictions)
         if not hasattr(self.label_encoder, 'classes_') or len(self.label_encoder.classes_) == 0:
-            logger.warning(f"DIAGNOSTIC - Single model label encoder not fitted: {hasattr(self.label_encoder, 'classes_')}")
+            logger.debug(f"DIAGNOSTIC - Single model label encoder not fitted: {hasattr(self.label_encoder, 'classes_')}")
             return False
         return True
 

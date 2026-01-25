@@ -47,6 +47,7 @@ def find_data_files():
         "performance_history.json",      # Hybrid accuracy stats
         "performance_attribution.json",  # Detailed attribution stats
         "production_monitoring*.json",
+        "drift_history*.json",           # Data drift history
         "ab_tests*.json",
         "model_benchmarks*.json"
     ]
@@ -56,6 +57,7 @@ def find_data_files():
         "scaler*.pkl", 
         "label_encoder*.pkl",
         "selected_features*.json",
+        "reference_data*.parquet",       # Data drift reference data
         "model_checksums.json"
     ]
     

@@ -9,6 +9,15 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Callable, Tuple
 from collections import deque
 import logging
+import pandas as pd
+
+# Try to import drift detector
+try:
+    from data_drift_detector import DataDriftDetector
+    HAS_DRIFT_DETECTOR = True
+except ImportError:
+    HAS_DRIFT_DETECTOR = False
+    logging.getLogger(__name__).debug("Data drift detector not available")
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +40,12 @@ class ProductionMonitor:
         self.recent_predictions = deque(maxlen=self.window_size)
         self.performance_history = []
         self.alerts_history = []
+        
+        # Initialize drift detector if available
+        if HAS_DRIFT_DETECTOR:
+            self.drift_detector = DataDriftDetector(data_dir, strategy)
+        else:
+            self.drift_detector = None
         
         # Load existing data
         self._load_monitoring_data()
@@ -258,8 +273,36 @@ class ProductionMonitor:
         ]
     
     def detect_data_drift(self, current_features: np.ndarray, 
-                         reference_features: Optional[np.ndarray] = None) -> Dict:
+                         reference_features: Optional[np.ndarray] = None,
+                         feature_names: Optional[List[str]] = None) -> Dict:
         """Detect data drift by comparing feature distributions"""
+        # Use Evidently-based detection if available
+        if self.drift_detector is not None and HAS_DRIFT_DETECTOR:
+            try:
+                # Convert to DataFrame for Evidently
+                if isinstance(current_features, np.ndarray):
+                    if feature_names is not None:
+                        current_df = pd.DataFrame(current_features, columns=feature_names)
+                    else:
+                        # Generate generic column names
+                        n_features = current_features.shape[1] if len(current_features.shape) > 1 else len(current_features)
+                        current_df = pd.DataFrame(current_features, columns=[f'feature_{i}' for i in range(n_features)])
+                else:
+                    current_df = current_features  # Already a DataFrame
+                
+                # Check drift using Evidently
+                drift_result = self.drift_detector.check_drift(current_df)
+                
+                # Log if significant drift
+                if drift_result.get('drift_detected'):
+                    logger.warning(f"Data drift detected: {drift_result.get('recommendation')}")
+                
+                return drift_result
+            except Exception as e:
+                logger.error(f"Evidently drift detection failed: {e}, falling back to hash-based")
+                # Fall through to hash-based backup
+        
+        # Fallback: Hash-based drift detection (original implementation)
         if len(self.recent_predictions) < 20:
             return {'drift_detected': False, 'reason': 'insufficient_data'}
         
@@ -286,7 +329,8 @@ class ProductionMonitor:
             'drift_detected': drift_detected,
             'unique_hash_ratio': unique_ratio,
             'total_samples': len(recent_hashes),
-            'unique_hashes': len(hash_counts)
+            'unique_hashes': len(hash_counts),
+            'method': 'hash_based_fallback'
         }
     
     def should_trigger_retraining(self) -> Tuple[bool, str]:

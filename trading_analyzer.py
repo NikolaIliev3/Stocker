@@ -145,7 +145,9 @@ class TradingAnalyzer:
         try:
             # RSI
             rsi_indicator = RSIIndicator(close=df['close'], window=14)
-            indicators['rsi'] = float(rsi_indicator.rsi().iloc[-1])
+            rsi_series = rsi_indicator.rsi()
+            indicators['rsi'] = float(rsi_series.iloc[-1])
+            indicators['rsi_prev'] = float(rsi_series.iloc[-2]) if len(rsi_series) > 1 else 50.0
             
             # MACD
             macd_indicator = MACD(close=df['close'])
@@ -722,16 +724,32 @@ class TradingAnalyzer:
         trend = price_action.get('trend', 'sideways')
         volume_ratio = volume_analysis.get('volume_ratio', 1)
         
-        # RSI analysis (enhanced with stronger penalties for extreme overbought)
+        # RSI analysis (Smarter "Confirmation" Logic)
+        rsi_prev = indicators.get('rsi_prev', 50)
+        
         if rsi < self.rsi_oversold:
-            score += 2
-            reasons.append("RSI indicates oversold condition")
+            if rsi > rsi_prev:
+                # Rebounding from lows - Strong Signal
+                score += 2
+                reasons.append(f"RSI oversold and rebounding ({rsi:.1f}) - Confirmed Buy")
+            else:
+                # Still falling - Risky "Falling Knife"
+                score += 1 
+                reasons.append(f"RSI oversold but still falling ({rsi:.1f}) - Watch for reversal")
+                
         elif rsi > 80:  # Extremely overbought
             score -= 3
             reasons.append(f"RSI extremely overbought ({rsi:.2f}) - strong sell signal")
+            
         elif rsi > self.rsi_overbought:
-            score -= 2
-            reasons.append(f"RSI indicates overbought condition ({rsi:.2f})")
+            if rsi < rsi_prev:
+                # Cooling off from highs - Strong Sell
+                score -= 2
+                reasons.append(f"RSI overbought and correcting ({rsi:.1f})")
+            else:
+                # Still pumping - could go higher
+                score -= 1
+                reasons.append(f"RSI overbought but trending up ({rsi:.1f})")
         
         # MACD analysis
         if macd_diff > 0:

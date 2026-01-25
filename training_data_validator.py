@@ -8,16 +8,35 @@ from typing import Dict, List, Optional, Tuple
 from collections import Counter
 import logging
 
+# Try to import label quality analyzer
+try:
+    from label_quality_analyzer import LabelQualityAnalyzer
+    HAS_LABEL_QUALITY = True
+except ImportError:
+    HAS_LABEL_QUALITY = False
+    logging.getLogger(__name__).debug("Label quality analyzer not available")
+
 logger = logging.getLogger(__name__)
 
 
 class TrainingDataValidator:
     """Validates training data before model training"""
     
-    def __init__(self):
+    def __init__(self, data_dir=None):
         self.validation_results = {}
         self.issues_found = []
         self.warnings = []
+        
+        # Initialize label quality analyzer if available
+        if HAS_LABEL_QUALITY and data_dir is not None:
+            try:
+                from pathlib import Path
+                self.label_quality_analyzer = LabelQualityAnalyzer(Path(data_dir))
+            except Exception as e:
+                logger.debug(f"Could not initialize label quality analyzer: {e}")
+                self.label_quality_analyzer = None
+        else:
+            self.label_quality_analyzer = None
     
     def validate_training_samples(self, training_samples: List[Dict]) -> Dict:
         """Comprehensive validation of training samples
@@ -79,6 +98,42 @@ class TrainingDataValidator:
         if variance_validation['low_variance_features'] > 0:
             self.warnings.append(f"{variance_validation['low_variance_features']} features have low variance")
         
+        # Check 8: Label quality (using Cleanlab if available)
+        label_quality_info = {}
+        if self.label_quality_analyzer is not None:
+            try:
+                # Extract features and labels
+                X = np.array([s['features'] for s in training_samples if 'features' in s])
+                
+                # Convert labels to numeric
+                labels_raw = [s.get('label') for s in training_samples if 'label' in s]
+                label_map = {'SELL': 0, 'HOLD': 1, 'BUY': 2, 'DOWN': 0, 'UP': 2, 'AVOID': 0}
+                y = np.array([label_map.get(l, 1) for l in labels_raw])
+                
+                # Only run if we have enough samples
+                if len(X) >= 50 and len(y) >= 50:
+                    # Run label quality analysis
+                    logger.info("Running label quality analysis with Cleanlab...")
+                    label_quality_result = self.label_quality_analyzer.analyze_labels(
+                        X, y, pred_probs=None, model=None
+                    )
+                    
+                    if label_quality_result.get('issues_found'):
+                        num_issues = label_quality_result.get('num_high_confidence_issues', 0)
+                        if num_issues > 0:
+                            self.warnings.append(
+                                f"Label quality check: {num_issues} potentially mislabeled samples detected"
+                            )
+                    
+                    label_quality_info = {
+                        'analyzed': True,
+                        'num_issues': label_quality_result.get('num_high_confidence_issues', 0),
+                        'mean_quality_score': label_quality_result.get('quality_scores_summary', {}).get('mean', 0)
+                    }
+            except Exception as e:
+                logger.warning(f"Label quality analysis failed: {e}")
+                label_quality_info = {'analyzed': False, 'error': str(e)}
+        
         # Determine overall validity
         is_valid = len(self.issues_found) == 0
         
@@ -92,7 +147,8 @@ class TrainingDataValidator:
             'missing_percentage': missing_validation.get('missing_percentage', 0),
             'outlier_percentage': outlier_validation.get('outlier_percentage', 0),
             'class_balance_ratio': balance_validation.get('ratio', 1.0),
-            'low_variance_features': variance_validation.get('low_variance_features', 0)
+            'low_variance_features': variance_validation.get('low_variance_features', 0),
+            'label_quality': label_quality_info
         }
     
     def _validate_features(self, training_samples: List[Dict]) -> Dict:

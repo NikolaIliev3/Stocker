@@ -50,6 +50,8 @@ class HybridStockPredictor:
         self.weight_adjuster = AdaptiveWeightAdjuster(data_dir, strategy)
         self.ml_predictor = StockPredictionML(data_dir, strategy)
         self.feature_extractor = FeatureExtractor()
+        self._ml_warning_logged = False
+        self._ml_success_logged = False
         
         # Base analyzers
         self.trading_analyzer = trading_analyzer or TradingAnalyzer()
@@ -145,17 +147,39 @@ class HybridStockPredictor:
             logger.error(f"Error saving performance: {e}")
     
     def predict(self, stock_data: dict, history_data: dict, 
-                financials_data: dict = None) -> Dict:
+                financials_data: dict = None, is_backtest: bool = False) -> Dict:
         """Make prediction using hybrid approach"""
-        # Check cache first
+        # Check cache first (only if not backtesting)
         symbol = stock_data.get('symbol', '')
-        if symbol:
+        if symbol and not is_backtest:
             cache = get_cache()
             cached_prediction = cache.get(symbol, self.strategy)
             if cached_prediction:
                 logger.debug(f"⚡ Using cached prediction for {symbol} ({self.strategy})")
                 return cached_prediction
         
+        # 0. ENSURE FRESH DATA (Real-time Entry Price Realism)
+        # The user noted that entry prices can be stale. We force a fresh price check here.
+        # SKIP this if we are backtesting (prevent data leakage/time travel)
+        if not is_backtest and self.trading_analyzer and hasattr(self.trading_analyzer, 'data_fetcher') and self.trading_analyzer.data_fetcher:
+            try:
+                # Quick fetch of just the current price (force_refresh=True)
+                fresh_data = self.trading_analyzer.data_fetcher.fetch_stock_data(symbol, force_refresh=True)
+                if fresh_data and fresh_data.get('price'):
+                    current_real_time_price = fresh_data.get('price')
+                    old_price = stock_data.get('price', 0)
+                    
+                    # Log if there was a significant discrepancy (stale data detected)
+                    if abs(current_real_time_price - old_price) / old_price > 0.005: # > 0.5% diff
+                        logger.warning(f"⚠️ Stale price detected for {symbol}! Old: {old_price}, Fresh: {current_real_time_price}. Updating...")
+                    
+                    # Update stock_data with fresh price
+                    stock_data['price'] = current_real_time_price
+                    # Also update history last close if it's today (to avoid gap)
+                    # (Optional: logic to update history_data.iloc[-1] if needed, but price is most important)
+            except Exception as e:
+                logger.debug(f"Could not force refresh price for {symbol}: {e}")
+
         # 1. Get rule-based prediction
         if self.strategy == "trading":
             base_analysis = self.trading_analyzer.analyze(stock_data, history_data)
@@ -184,22 +208,23 @@ class HybridStockPredictor:
         
         # Diagnostic: Log ML model status (use INFO level for visibility)
         if not ml_available:
-            logger.warning(f"⚠️ ML model not available for {self.strategy} strategy")
-            # Try to diagnose why
-            if hasattr(self.ml_predictor, 'model'):
-                logger.warning(f"   - Main model is None: {self.ml_predictor.model is None}")
-            if hasattr(self.ml_predictor, 'regime_models'):
-                logger.warning(f"   - Regime models count: {len(self.ml_predictor.regime_models)}")
-                if self.ml_predictor.regime_models:
-                    for regime, regime_ml in self.ml_predictor.regime_models.items():
-                        logger.warning(f"     - {regime}: model={regime_ml.model is not None if hasattr(regime_ml, 'model') else 'N/A'}")
-            if hasattr(self.ml_predictor, 'label_encoder'):
-                has_classes = hasattr(self.ml_predictor.label_encoder, 'classes_')
-                logger.warning(f"   - Label encoder has classes: {has_classes}")
-                if has_classes:
-                    logger.warning(f"     - Classes: {list(self.ml_predictor.label_encoder.classes_)}")
+            # Only log warning once to avoid spamming
+            if not getattr(self, '_ml_warning_logged', False):
+                logger.warning(f"⚠️ ML model not available for {self.strategy} strategy")
+                # Try to diagnose why
+                if hasattr(self.ml_predictor, 'model'):
+                    logger.warning(f"   - Main model is None: {self.ml_predictor.model is None}")
+                if hasattr(self.ml_predictor, 'regime_models'):
+                    logger.warning(f"   - Regime models count: {len(self.ml_predictor.regime_models)}")
+                    if self.ml_predictor.regime_models:
+                        for regime, regime_ml in self.ml_predictor.regime_models.items():
+                            logger.warning(f"     - {regime}: model={regime_ml.model is not None if hasattr(regime_ml, 'model') else 'N/A'}")
+                self._ml_warning_logged = True
         else:
-            logger.info(f"✓ ML model available for {self.strategy} strategy")
+            # Only log success once
+            if not getattr(self, '_ml_success_logged', False):
+                logger.info(f"✓ ML model available for {self.strategy} strategy")
+                self._ml_success_logged = True
         
         # Check for Sector-specific model (sector-specialized ML)
         sector_result = None
@@ -337,7 +362,7 @@ class HybridStockPredictor:
                 else:
                     # Diagnostic logging for backtesting (use INFO for visibility)
                     if ml_prediction:
-                        logger.info(f"✓ ML prediction: action={ml_prediction.get('action')}, confidence={ml_prediction.get('confidence', 0):.1f}%, "
+                        logger.info(f"TRAIL_MARKER ML prediction: action={ml_prediction.get('action')}, confidence={ml_prediction.get('confidence', 0):.1f}%, "
                                    f"probabilities={ml_prediction.get('probabilities', {})}")
             except Exception as e:
                 logger.error(f"❌ ML prediction failed: {e}. Using rule-based only.")
@@ -345,6 +370,29 @@ class HybridStockPredictor:
                 logger.error(traceback.format_exc())
                 ml_available = False
                 ml_prediction = None
+        
+        
+        # CRITICAL FIX: Use Sector Model if it was determined to be better
+        if used_sector_model and sector_result:
+            try:
+                # Use the Sector Result as the ML Prediction
+                ml_prediction = {
+                    'action': sector_result.get('action', 'HOLD'),
+                    'confidence': sector_result.get('confidence', 0),
+                    'probabilities': sector_result.get('probabilities', {}),
+                    'source': 'sector_model',
+                    'sector': detected_sector
+                }
+                ml_available = True
+                
+                # Log the switch
+                general_acc_disp = f"{general_accuracy*100:.1f}%" if 'general_accuracy' in locals() else "Lower"
+                sector_acc_disp = f"{sector_result.get('sector_accuracy', 0)*100:.1f}%"
+                
+                logger.info(f"🔄 Switched to SECTOR MODEL for {symbol}: {ml_prediction['action']} "
+                           f"({sector_acc_disp} acc > {general_acc_disp} acc)")
+            except Exception as e:
+                logger.error(f"Error switching to sector model: {e}")
         
         # Consensus and AI updates removed
         
@@ -416,59 +464,89 @@ class HybridStockPredictor:
         if not has_ml:
             return {'rule': 1.0, 'ml': 0.0, 'ai': 0.0}
         
-        # Start with rules dominant (proven approach)
-        rule_weight = 0.65
-        ml_weight = 0.35
+        # 1. Start with a balanced 50/50 baseline (Safe)
+        rule_weight = 0.50
+        ml_weight = 0.50
+        
+        # 2. Check REGIME Accuracy (Smart)
+        regime_accuracy = 0
+        current_regime = 'unknown'
+        
+        # Check if we have regime info from the last prediction
+        if hasattr(self.ml_predictor, 'last_regime') and self.ml_predictor.last_regime:
+             current_regime = self.ml_predictor.last_regime
+             # Get accuracy for this specific regime
+             if hasattr(self.ml_predictor, 'get_regime_accuracy'):
+                 regime_accuracy = self.ml_predictor.get_regime_accuracy(current_regime) * 100
+                 if regime_accuracy > 0:
+                     logger.debug(f"🔍 Regime Context: {current_regime.upper()} (Acc: {regime_accuracy:.1f}%)")
         
         # Check PROVEN backtest performance first (most important)
         ml_perf = self._get_recent_performance('ml_based')
         rule_perf = self._get_recent_performance('weight_based')
         
-        proven_ml_accuracy = 50  # Default to random chance
+        # 1. Check Training Accuracy (Potential)
+        trained_accuracy = 0
+        if hasattr(self.ml_predictor, 'metadata') and self.ml_predictor.metadata:
+            trained_accuracy = self.ml_predictor.metadata.get('test_accuracy', 0) * 100
+            
+        # 2. Check Real Performance (Reality)
+        proven_ml_accuracy = 50
+        has_history = False
         if ml_perf and ml_perf.get('total', 0) >= 10:
             proven_ml_accuracy = ml_perf.get('accuracy', 50)
+            has_history = True
+
+        # DYNAMIC ADJUSTMENT
+        # Priority: Regime Accuracy > Proven History > Global Training Accuracy
+        
+        effective_accuracy = 50
+        source = "default"
+        
+        if regime_accuracy > 0:
+            effective_accuracy = regime_accuracy
+            source = f"regime_{current_regime}"
+        elif has_history:
+            effective_accuracy = proven_ml_accuracy
+            source = "backtest_history"
+        else:
+            effective_accuracy = trained_accuracy
+            source = "global_training"
             
-            # If ML has proven itself in backtests (> 55%), increase its weight
-            if proven_ml_accuracy > 60:
-                ml_weight = 0.70
-                rule_weight = 0.30
-                logger.debug(f"ML proven in backtest ({proven_ml_accuracy:.1f}%) - increasing weight")
-            elif proven_ml_accuracy > 55:
-                ml_weight = 0.55
-                rule_weight = 0.45
-            elif proven_ml_accuracy < 52:
-                # ML is basically random chance - heavily favor rules
-                ml_weight = 0.20
-                rule_weight = 0.80
-                logger.debug(f"ML poor in backtest ({proven_ml_accuracy:.1f}%) - favoring rules")
+        # Apply Logic based on Effective Accuracy
+        if effective_accuracy > 60:
+            ml_weight = 0.65 # High trust
+            rule_weight = 0.35
+            logger.debug(f"⚖️ Boosting ML Weight (0.65) due to strong {source} ({effective_accuracy:.1f}%)")
+        elif effective_accuracy > 55:
+            ml_weight = 0.60 # Moderate trust
+            rule_weight = 0.40
+        elif effective_accuracy < 50:
+            ml_weight = 0.35 # Penalize
+            rule_weight = 0.65
+            logger.debug(f"⚖️ Reducing ML Weight (0.35) due to weak {source} ({effective_accuracy:.1f}%)")
         
-        # If rules have proven better, always favor rules
-        if rule_perf and ml_perf:
-            if rule_perf.get('total', 0) >= 10 and ml_perf.get('total', 0) >= 10:
-                rule_acc = rule_perf.get('accuracy', 50)
-                ml_acc = ml_perf.get('accuracy', 50)
-                if rule_acc > ml_acc + 5:  # Rules are significantly better
-                    rule_weight = max(rule_weight, 0.70)
-                    ml_weight = 1.0 - rule_weight
+        # If no strong signal, stick to 50/50 default set above
+            # No history yet - trust training accuracy
+            if trained_accuracy > 53:
+                 ml_weight = 0.60
+                 rule_weight = 0.40
+            else:
+                 ml_weight = 0.35
+                 rule_weight = 0.65
         
-        # DISAGREEMENT PENALTY: When ML and rules disagree, favor rules
-        # (since rules have domain knowledge while ML may be overconfident)
+        # DISAGREEMENT PENALTY (Disabled for Strong Models)
+        # Only apply disagreement penalty if the model is NOT Strong (accuracy > 60%)
         rule_action = rule_pred.get('action', 'HOLD')
         ml_action = ml_pred.get('action', 'HOLD')
         
-        if rule_action != ml_action:
-            # They disagree - reduce ML weight since it hasn't proven reliable
-            if proven_ml_accuracy < 55:
-                ml_weight = min(ml_weight, 0.35)
-                rule_weight = 1.0 - ml_weight
-                logger.debug(f"ML/Rules disagree and ML unproven - favoring rules")
+        is_strong_model = effective_accuracy > 60
         
-        # Confidence calibration: reduce ML confidence impact if overconfident
-        ml_confidence = ml_pred.get('confidence', 50)
-        if ml_confidence > 65 and proven_ml_accuracy < 55:
-            # ML is overconfident - it claims high confidence but backtest is poor
-            ml_weight = min(ml_weight, 0.30)
-            rule_weight = 1.0 - ml_weight
+        if rule_action != ml_action and not is_strong_model:
+            # If model is weak/moderate and disagrees with rules, limit its influence
+            if effective_accuracy < 52:
+                ml_weight = min(ml_weight, 0.40)
+                rule_weight = 1.0 - ml_weight
         
         return {'rule': rule_weight, 'ml': ml_weight, 'ai': 0.0}
     
@@ -498,29 +576,102 @@ class HybridStockPredictor:
         rule_weight = weights.get('rule', 0)
         ml_weight = weights.get('ml', 0)
         
-        # Scenario 1: Rule says Action, ML says HOLD (or unsure)
-        if rule_action != 'HOLD' and (ml_action == 'HOLD' or ml_confidence < 60):
-             logger.debug(f"⚖️ Boosting Rule weight for Aggressive Signal (Rule: {rule_action}, ML: {ml_action})")
-             # Force Rule to have majority to pass the signal through
-             rule_weight = max(rule_weight, 0.75) 
-             ml_weight = 1.0 - rule_weight
+        # AGGRESSIVE LOGIC UPDATE: Action > Inaction
+        # If Rule Analyzer gives an Aggressive Signal (BUY/SELL) and ML gives HOLD,
+        # we normally trust the specific rule-based logic.
+        # EXCEPTION: If ML is dominant (> 0.90 weight), we respect its decision to HOLD.
+        is_ml_dominant = ml_weight > 0.90
+        
+        # Flag to force HOLD in stalemate situations
+        force_hold = False
+        
+        # Scenario 1: Consensus (Both agree)
+        if rule_action == ml_action:
+             if rule_action != 'HOLD':
+                 logger.debug(f"✅ Consensus Strong Signal: {rule_action}")
+             pass # Standard weights apply
              
-            
-         # Scenario 2: Rule says HOLD (Unsure), ML says Action
+        # Scenario 2: Major Conflict (BUY vs SELL)
+        elif (rule_action == 'BUY' and ml_action == 'SELL') or (rule_action == 'SELL' and ml_action == 'BUY'):
+             # If they fight, it's risky. Only allow if one is SUPER confident.
+             # Otherwise, force a STALEMATE (HOLD) to save capital.
+             if ml_confidence > 80 and is_ml_dominant:
+                 logger.debug(f"⚔️ Conflict (R:{rule_action} vs M:{ml_action}) -> ML Wins (High Conf {ml_confidence:.1f}%)")
+             elif rule_confidence > 80 and not is_ml_dominant:
+                 logger.debug(f"⚔️ Conflict (R:{rule_action} vs M:{ml_action}) -> Rule Wins (High Conf {rule_confidence:.1f}%)")
+             else:
+                 # Stalemate
+                 force_hold = True
+                 logger.debug(f"⚔️ Conflict (R:{rule_action} vs M:{ml_action}) -> FORCE HOLD (Stalemate)")
+                 
+        # Scenario 3: Action vs HOLD (One wants to move, one wants to wait)
+        elif rule_action != ml_action:
+             # Calculate Risk Environment
+             volatility = base_analysis.get('volatility', {})
+             rsi = base_analysis.get('indicators', {}).get('rsi_14', 50)
+             
+             # Determine Risk Level
+             is_high_risk = False
+             risk_reason = ""
+             
+             # Risk Factor 1: Extreme RSI (Overbought/Oversold Reversal Risk)
+             if ml_action == 'BUY' and rsi > 65:
+                 is_high_risk = True
+                 risk_reason = f"High RSI ({rsi:.1f})"
+             elif ml_action == 'SELL' and rsi < 35:
+                 is_high_risk = True
+                 risk_reason = f"Low RSI ({rsi:.1f})"
+                 
+             # Risk Factor 2: High Volatility (ATR Check)
+             atr_percent = volatility.get('atr_percent', 0)
+             if atr_percent > 4.0: # >4% daily move is very volatile
+                 is_high_risk = True
+                 risk_reason = f"High Volatility ({atr_percent:.1f}%)"
+                 
+             if is_high_risk:
+                 # Safety First: In high risk, if ANYONE says HOLD, we HOLD.
+                 if rule_action == 'HOLD' or ml_action == 'HOLD':
+                     logger.debug(f"🛑 Risk Veto: {risk_reason} -> Forcing HOLD despite signal")
+                     force_hold = True
+             else:
+                 # Low Risk Environment: Allow Action to override Hold ("Smart Aggression")
+                 # This resolves the "Stalemate" problem in safe markets
+                 if ml_action != 'HOLD' and ml_confidence > 55:
+                      logger.debug(f"🚀 Smart Aggression: Low Risk (RSI {rsi:.0f}) -> Trusting ML {ml_action}")
+                      # Allow ML to proceed (don't force hold)
+                 elif rule_action != 'HOLD' and rule_confidence > 60:
+                      logger.debug(f"🚀 Smart Aggression: Low Risk -> Trusting Rule {rule_action}")
+
+             if is_ml_dominant and ml_confidence > 85: # Require HIGH confidence to force HOLD
+                 # ML is the boss. If it says HOLD, we HOLD.
+                 logger.debug(f"🛡️ ML Dominant ({ml_weight:.2f}): FORCE HOLD - Zeroing Rule Weight")
+                 rule_weight = 0.0
+                 ml_weight = 1.0
+                 force_hold = True 
+             else:
+                 # ACTION BIAS: If Rules say Go and ML says Meh -> GO.
+                 logger.debug(f"🚀 ACTION BIAS: Rule says {rule_action}, ML says HOLD. Trusting Rule.")
+                 # Force Rule to have majority to pass the signal through
+                 rule_weight = max(rule_weight, 0.65) 
+                 ml_weight = 1.0 - rule_weight
+             
+         # Scenario 4: Safety Veto (Rule says HOLD, ML says Action)
         elif rule_action == 'HOLD' and ml_action != 'HOLD':
              # SAFETY VETO: Prevent ML from blindly buying into extreme overbought conditions
              rsi = base_analysis.get('indicators', {}).get('rsi', 50)
-             if ml_action == 'BUY' and rsi > 78 and ml_confidence < 85:
+             if ml_action == 'BUY' and rsi > 78 and ml_confidence < 90:
                  logger.info(f"🛡️ SAFETY VETO: Blocking ML BUY because RSI is {rsi:.2f} (Extreme Overbought). Forced HOLD.")
                  # Force Rule weight to dominate (1.0) to enforce the HOLD
                  rule_weight = 1.0
                  ml_weight = 0.0
+                 force_hold = True
              
-             elif ml_confidence > 60:  # Lowered from 70 to allow ML (56-62% acc) to act more often
+             elif ml_confidence > 70:  # Raised from 60 to verify ML conviction
                  # If ML is reasonably confident, let it swing the vote
                  pass 
              else:
                  # If ML is weak and Rule is Unsure, stay Safe (HOLD)
+                 pass
                  logger.debug(f"⚖️ Boosting Rule weight for Safety (Rule: HOLD, ML: Weak {ml_action})")
                  rule_weight = max(rule_weight, 0.6)
                  ml_weight = 1.0 - rule_weight
@@ -536,10 +687,15 @@ class HybridStockPredictor:
         action_counts[ml_action] = action_counts.get(ml_action, 0) + ml_weight
         
         # Get action with highest weighted count
-        final_action = max(action_counts.items(), key=lambda x: x[1])[0]
+        if force_hold:
+            final_action = 'HOLD'
+            # Ensure confidence reflects the safety decision (neutral but firm)
+            final_confidence = 50.0 
+        else:
+            final_action = max(action_counts.items(), key=lambda x: x[1])[0]
         
-        # Boost confidence if they agree
-        if rule_action == ml_action:
+        # Boost confidence if they agree and not forced hold
+        if rule_action == ml_action and not force_hold:
             final_confidence = min(95, final_confidence * 1.1)
         
         # Use rule-based prices (they're more detailed)

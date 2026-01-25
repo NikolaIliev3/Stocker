@@ -784,7 +784,7 @@ class ContinuousBacktester:
             
             # Get prediction using current algorithm state
             if strategy == 'trading':
-                analysis = hybrid_predictor.predict(stock_data, history_data, None)
+                analysis = hybrid_predictor.predict(stock_data, history_data, None, is_backtest=True)
             elif strategy == 'mixed':
                 # For backtesting, we might not have financials - use None
                 financials_data = None
@@ -792,14 +792,14 @@ class ContinuousBacktester:
                     financials_data = self.app.data_fetcher.fetch_financials(symbol)
                 except:
                     pass
-                analysis = hybrid_predictor.predict(stock_data, history_data, financials_data)
+                analysis = hybrid_predictor.predict(stock_data, history_data, financials_data, is_backtest=True)
             else:  # investing
                 financials_data = None
                 try:
                     financials_data = self.app.data_fetcher.fetch_financials(symbol)
                 except:
                     pass
-                analysis = hybrid_predictor.predict(stock_data, history_data, financials_data)
+                analysis = hybrid_predictor.predict(stock_data, history_data, financials_data, is_backtest=True)
             
             if 'error' in analysis:
                 return None

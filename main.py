@@ -65,6 +65,13 @@ except ImportError as e:
     logger.warning(f"New modules not available: {e}")
     HAS_NEW_MODULES = False
 
+# Import Smart Model Selector
+try:
+    from smart_model_selector import select_best_strategy
+    HAS_SMART_SELECTOR = True
+except ImportError:
+    HAS_SMART_SELECTOR = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -242,6 +249,27 @@ class StockerApp:
         self.saved_currency = self.preferences.get_currency()
         self.saved_theme = self.preferences.get_theme()
         self.saved_strategy = self.preferences.get_strategy()
+        
+        # Smart Model Selection (Robustness Check)
+        # Automatically switch to a more robust model if the saved one is potentially overfit (e.g., 'mixed' with few samples)
+        if HAS_SMART_SELECTOR:
+            try:
+                recommended_strategy = select_best_strategy(APP_DATA_DIR)
+                if self.saved_strategy == 'mixed' and recommended_strategy == 'trading':
+                    logger.info(f"🛡️ Smart Selection: Overriding saved strategy '{self.saved_strategy}' with more robust '{recommended_strategy}' model")
+                    self.saved_strategy = recommended_strategy
+                elif self.saved_strategy == 'trading' and recommended_strategy == 'mixed':
+                    logger.info(f"✅ Smart Selection: Upgrading saved strategy '{self.saved_strategy}' to high-performance '{recommended_strategy}' model")
+                    self.saved_strategy = recommended_strategy
+                    # Auto-save this upgrade preference so backtester picks it up
+                    self.preferences.set_strategy(recommended_strategy)
+                    # Also update backtest strategies to include the winner
+                    current_backtest_strats = self.preferences.get_backtest_strategies()
+                    if 'mixed' not in current_backtest_strats:
+                        current_backtest_strats.append('mixed')
+                        self.preferences.set_backtest_strategies(current_backtest_strats)
+            except Exception as e:
+                logger.error(f"Error in smart model selection: {e}")
         
         self.localization = Localization(language=self.saved_language, currency=self.saved_currency)
         
@@ -9062,7 +9090,15 @@ By using this application, you acknowledge that you understand and accept these 
         from secure_ml_storage import SecureMLStorage
         storage = SecureMLStorage(self.data_dir)
         ml_model_file = f"ml_model_{strategy}.pkl"
+        
+        # Check if main model exists OR if regime models exist
         ml_trained = storage.model_exists(ml_model_file)
+        if not ml_trained:
+            # Check for regime models
+            for regime in ['bull', 'bear', 'sideways']:
+                if storage.model_exists(f"ml_model_{strategy}_{regime}.pkl"):
+                    ml_trained = True
+                    break
         
         hybrid_predictor = self.hybrid_predictors.get(strategy)
         
@@ -10228,27 +10264,32 @@ By using this application, you acknowledge that you understand and accept these 
         btn_frame.pack(pady=10)
         
         def start_training():
-            symbols = [s.strip().upper() for s in symbols_entry.get().split(',')]
-            start_date = start_entry.get()
-            end_date = end_entry.get()
-            strategy = strategy_var.get()
-            retrain_from_verified = retrain_var.get()
-            
-            # Save symbols for next time
-            symbols_str = ','.join(symbols)
-            self.preferences.set_training_symbols(strategy, symbols_str)
-            
-            status_text.delete(1.0, tk.END)
-            status_text.delete(1.0, tk.END)
-            status_text.insert(tk.END, f"Starting training for {strategy} strategy...\n")
-            status_text.insert(tk.END, f"Symbols: {', '.join(symbols)}\n")
-            status_text.insert(tk.END, f"Period: {start_date} to {end_date}\n")
-            if retrain_from_verified:
-                status_text.insert(tk.END, f"🔄 Will also retrain from verified predictions\n")
-            status_text.insert(tk.END, "\n")
-            status_text.insert(tk.END, "💡 You can minimize this window and continue using the app!\n")
-            status_text.insert(tk.END, "Training runs in the background and won't block the UI.\n\n")
-            status_text.update()
+            try:
+                symbols = [s.strip().upper() for s in symbols_entry.get().split(',')]
+                start_date = start_entry.get()
+                end_date = end_entry.get()
+                strategy = strategy_var.get()
+                retrain_from_verified = retrain_var.get()
+                
+                # Save symbols for next time
+                symbols_str = ','.join(symbols)
+                self.preferences.set_training_symbols(strategy, symbols_str)
+                
+                status_text.delete(1.0, tk.END)
+                status_text.delete(1.0, tk.END)
+                status_text.insert(tk.END, f"Starting training for {strategy} strategy...\\n")
+                status_text.insert(tk.END, f"Symbols: {', '.join(symbols)}\\n")
+                status_text.insert(tk.END, f"Period: {start_date} to {end_date}\\n")
+                if retrain_from_verified:
+                    status_text.insert(tk.END, f"🔄 Will also retrain from verified predictions\\n")
+                status_text.insert(tk.END, "\\n")
+                status_text.insert(tk.END, "💡 You can minimize this window and continue using the app!\\n")
+                status_text.insert(tk.END, "Training runs in the background and won't block the UI.\\n\\n")
+                status_text.update()
+            except Exception as e:
+                messagebox.showerror("Error Starting Training", f"Could not start training: {e}")
+                logger.error(f"Error starting training: {e}", exc_info=True)
+                return
             
             # Helper function to safely update status text (handles destroyed widgets)
             def safe_insert(text):
@@ -10260,15 +10301,60 @@ By using this application, you acknowledge that you understand and accept these 
                 except (tk.TclError, AttributeError):
                     pass  # Widget was destroyed, ignore
             
+            if not hasattr(self, 'training_manager') or self.training_manager is None:
+                messagebox.showerror("Error", "Training manager not initialized!")
+                return
+
+            # Create a custom logging handler to redirect logs to the text widget
+            class GuiLogHandler(logging.Handler):
+                def __init__(self, text_widget, dialog_ref):
+                    super().__init__()
+                    self.text_widget = text_widget
+                    self.dialog_ref = dialog_ref
+                
+                def emit(self, record):
+                    msg = self.format(record)
+                    # Schedule update on main thread
+                    try:
+                        self.dialog_ref.after(0, lambda m=msg: self._safe_insert(m))
+                    except:
+                        pass
+                
+                def _safe_insert(self, text):
+                    try:
+                        if self.dialog_ref.winfo_exists():
+                            self.text_widget.insert(tk.END, text + "\n")
+                            self.text_widget.see(tk.END)
+                    except:
+                        pass
+
+            # Setup handler
+            gui_handler = GuiLogHandler(status_text, dialog)
+            gui_handler.setLevel(logging.INFO)
+            formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S')
+            gui_handler.setFormatter(formatter)
+            
+            # Attach to root logger
+            root_logger = logging.getLogger()
+            root_logger.addHandler(gui_handler)
+            
+            # Ensure handler is removed when dialog closes
+            def on_dialog_close():
+                root_logger.removeHandler(gui_handler)
+                dialog.destroy()
+            
+            dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
+
             # Run training in background
             def train():
                 try:
                     # First, train on historical data
+                    # progress_callback is redundant for INFO logs now, but kept for specific status/error messages
                     result = self.training_manager.train_on_symbols(
                         symbols, start_date, end_date, strategy,
-                        progress_callback=lambda msg: dialog.after(0, lambda: safe_insert(msg))
+                        progress_callback=lambda msg: dialog.after(0, lambda m=msg: safe_insert(m))
                     )
-                    
+                
                     if 'error' in result:
                         dialog.after(0, lambda: safe_insert(f"\n✗ Error: {result['error']}"))
                     else:
@@ -10311,8 +10397,8 @@ By using this application, you acknowledge that you understand and accept these 
                         
                         dialog.after(0, self._update_ml_status)
                 except Exception as e:
-                    error_msg = str(e)  # Capture error message in local variable
-                    dialog.after(0, lambda msg=error_msg: safe_insert(f"\n✗ Error: {msg}"))
+                    error_msg = str(e)
+                    dialog.after(0, lambda msg=error_msg: safe_insert(f"\n✗ Critical Error during training: {msg}"))
             
             thread = threading.Thread(target=train)
             thread.daemon = True

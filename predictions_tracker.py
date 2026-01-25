@@ -139,6 +139,18 @@ class PredictionsTracker:
         prediction = self.get_prediction_by_id(prediction_id)
         if not prediction or prediction['status'] != 'active':
             return None
+            
+        # GRACE PERIOD CHECK:
+        # Don't verify predictions made in the last 15 minutes.
+        # This prevents "instant" failures due to bid/ask spread, volatility, or slight data delays.
+        try:
+            pred_timestamp = datetime.fromisoformat(prediction['timestamp'])
+            minutes_since_creation = (datetime.now() - pred_timestamp).total_seconds() / 60
+            if minutes_since_creation < 15:
+                # Too new, skip verification
+                return None
+        except Exception as e:
+            logger.debug(f"Error checking grace period for prediction {prediction_id}: {e}")
         
         action = prediction['action']
         entry_price = prediction['entry_price']

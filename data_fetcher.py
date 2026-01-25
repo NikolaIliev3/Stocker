@@ -14,6 +14,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import time
 import random
+import warnings
+
+# Suppress warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', message='.*Timestamp.utcnow is deprecated.*')
+try:
+    from pandas.errors import Pandas4Warning
+    warnings.filterwarnings('ignore', category=Pandas4Warning)
+except ImportError:
+    pass
 
 # Import new modules
 try:
@@ -227,9 +237,56 @@ class StockDataFetcher:
             check_quality: If True, perform data quality checks
         """
         # Normalize symbol (e.g., BRK.B -> BRK-B)
+        original_symbol = symbol
         symbol = symbol.replace('.', '-')
         
-        # Try backend first if available (prioritized for better reliability/workarounds)
+        # Try to use data provider abstraction first (it now has robust direct API access)
+        if self.data_provider:
+            try:
+                # If backend is available, we might still want to try it first for caching benefits
+                # But if we have direct provider access, it's often faster and more reliable
+                provider_data = self.data_provider.fetch_stock_data(symbol)
+                
+                # If direct provider works, use it (it has its own internal fallback)
+                if provider_data:
+                    # Convert to expected format
+                    data = {
+                        "symbol": symbol.upper(),
+                        "price": provider_data.get('currentPrice', 0),
+                        "info": provider_data.get('info', {})
+                    }
+                    
+                    # Fill in other fields if available in provider_data
+                    for field in ['volume', 'high', 'low', 'open', 'previous_close', 'change', 'change_percent']:
+                        if field in provider_data:
+                            data[field] = provider_data[field]
+                    
+                    # Get history for quality check
+                    history = self.data_provider.fetch_history(symbol)
+                    if history and 'data' in history:
+                        data['history'] = history['data']
+                    
+                    # Perform quality check if requested
+                    if check_quality and self.quality_checker and history:
+                        quality_report = self.quality_checker.check_stock_data_quality(
+                            data, history
+                        )
+                        data['quality_report'] = quality_report
+                        
+                        # Auto-clean if quality is poor
+                        if quality_report.get('overall_score', 100) < 60:
+                            logger.warning(f"Data quality low ({quality_report['overall_score']:.1f}), cleaning...")
+                            cleaned = self.quality_checker.clean_data(history, quality_report)
+                            if cleaned.get('cleaned'):
+                                data['history'] = cleaned['data']
+                                logger.info(f"Cleaned {cleaned.get('rows_removed', 0)} invalid rows")
+                    
+                    return data
+            except Exception as e:
+                logger.debug(f"Data provider failed: {e}")
+
+        # Fallback to backend if data provider failed (or if not available)
+        # Try backend if available (prioritized for better reliability/workarounds)
         if self._check_backend_available():
             try:
                 url = f"{self.base_url}/stock/{symbol}"
@@ -262,49 +319,75 @@ class StockDataFetcher:
             except requests.exceptions.RequestException as e:
                 logger.warning(f"Backend request failed: {e}, falling back to other providers")
                 # Don't mark as unavailable here, just continue to other providers
-            except SecurityError as e:
-                logger.warning(f"Security error from backend: {e}, falling back to other providers")
             except Exception as e:
                 logger.warning(f"Backend error: {e}, falling back to other providers")
-
-        # Try using data provider abstraction if available
-        if self.data_provider:
-            try:
-                provider_data = self.data_provider.fetch_stock_data(symbol)
-                if provider_data:
-                    # Convert to expected format
-                    data = {
-                        "symbol": symbol.upper(),
-                        "price": provider_data.get('currentPrice', 0),
-                        "info": provider_data.get('info', {})
-                    }
-                    
-                    # Get history for quality check
-                    history = self.data_provider.fetch_history(symbol)
-                    if history and 'data' in history:
-                        data['history'] = history['data']
-                    
-                    # Perform quality check if requested
-                    if check_quality and self.quality_checker and history:
-                        quality_report = self.quality_checker.check_stock_data_quality(
-                            data, history
-                        )
-                        data['quality_report'] = quality_report
-                        
-                        # Auto-clean if quality is poor
-                        if quality_report.get('overall_score', 100) < 60:
-                            logger.warning(f"Data quality low ({quality_report['overall_score']:.1f}), cleaning...")
-                            cleaned = self.quality_checker.clean_data(history, quality_report)
-                            if cleaned.get('cleaned'):
-                                data['history'] = cleaned['data']
-                                logger.info(f"Cleaned {cleaned.get('rows_removed', 0)} invalid rows")
-                    
-                    return data
-            except Exception as e:
-                logger.debug(f"Data provider failed: {e}")
         
-        # Fallback to direct yfinance
-        return self._fetch_direct_yfinance(symbol)
+        # Fallback to direct yfinance (last resort)
+        try:
+            return self._fetch_direct_yfinance(symbol)
+        except Exception as e:
+            # If normalized symbol failed, try original symbol if it's different
+            if original_symbol != symbol:
+                logger.info(f"Retrying with original symbol: {original_symbol}")
+                try:
+                    return self._fetch_direct_yfinance(original_symbol)
+                except Exception as e2:
+                    logger.error(f"Both normalized ({symbol}) and original ({original_symbol}) symbols failed: {e2}")
+                    raise e2
+            raise e
+
+    def fetch_batch(self, symbols: list, max_workers: int = 10, 
+                   force_refresh: bool = False, check_quality: bool = True,
+                   progress_callback=None) -> dict:
+        """
+        Fetch data for multiple stocks in parallel
+        
+        Args:
+            symbols: List of stock symbols
+            max_workers: Maximum number of concurrent requests
+            force_refresh: Whether to force fresh data
+            check_quality: Whether to check data quality
+            progress_callback: Optional callback(current, total)
+        
+        Returns:
+            Dict mapping symbol -> data
+        """
+        results = {}
+        total = len(symbols)
+        
+        # Use ThreadPoolExecutor for parallel fetching
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        # Adjust workers based on list size but cap at reasonable limit
+        actual_workers = min(max_workers, total)
+        
+        logger.info(f"Fetching batch of {total} stocks with {actual_workers} workers...")
+        
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            # Create a future for each symbol
+            future_to_symbol = {
+                executor.submit(self.fetch_stock_data, symbol, force_refresh, check_quality): symbol 
+                for symbol in symbols
+            }
+            
+            completed = 0
+            for future in as_completed(future_to_symbol):
+                symbol = future_to_symbol[future]
+                completed += 1
+                
+                try:
+                    data = future.result()
+                    if data and 'error' not in data:
+                        results[symbol] = data
+                    else:
+                        logger.warning(f"Failed to fetch batch data for {symbol}")
+                except Exception as e:
+                    logger.warning(f"Error fetching {symbol} in batch: {e}")
+                
+                if progress_callback:
+                    progress_callback(completed, total)
+        
+        return results
     
     def fetch_stock_history(self, symbol: str, period: str = "1y", interval: str = "1d", 
                            start_date: str = None, end_date: str = None) -> dict:
@@ -354,8 +437,19 @@ class StockDataFetcher:
                 logger.error(f"Error fetching stock history with dates: {e}")
                 return {"error": str(e), "data": []}
         
-        # Original method using period
-        # Try backend first if available
+        # Try using data provider abstraction first (it has robust direct API access)
+        if self.data_provider:
+            try:
+                # If backend is available, we might still want to try it first for caching benefits
+                # But if we have direct provider access, it's often faster and more reliable
+                history = self.data_provider.fetch_history(symbol, period=period)
+                if history and 'data' in history:
+                    return history  # It's already in {"data": [...]} format
+            except Exception as e:
+                logger.debug(f"Data provider history fetch failed: {e}")
+
+        # Fallback to backend if data provider failed (or if not available)
+        # Try backend if available (prioritized for better reliability/workarounds)
         if self._check_backend_available():
             try:
                 url = f"{self.base_url}/stock/{symbol}/history"
@@ -376,10 +470,9 @@ class StockDataFetcher:
             
             except requests.exceptions.RequestException as e:
                 logger.warning(f"Backend history request failed: {e}, falling back to direct yfinance")
-                self._backend_available = False
+                # Don't mark as unavailable here, just continue to other providers
             except Exception as e:
                 logger.warning(f"Backend history error: {e}, falling back to direct yfinance")
-                self._backend_available = False
         
         # Fallback to direct yfinance
         try:

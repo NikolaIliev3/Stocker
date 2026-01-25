@@ -87,30 +87,30 @@ HYPERPARAMETER_TUNING_PARALLEL_TRIALS = None  # None = auto (uses all cores), or
 # Note: Setting to -1 uses all available CPU cores, which maximizes speed but uses more resources
 # If you want to leave some cores free for other tasks, set to a lower number (e.g., 4 or 6)
 
-# ML Model Configuration - ANTI-OVERFITTING MODE (RESTORED)
-# Conservative parameters to keep train-test gap under 15%
-ML_FEATURE_SELECTION_THRESHOLD = 0.005  # Threshold for feature selection importance
-ML_RF_N_ESTIMATORS = 50     # Low count prevents overfitting
-ML_RF_MAX_DEPTH = 4         # Shallow trees generalize better
-ML_RF_MIN_SAMPLES_SPLIT = 25  # Higher = more regularization
-ML_RF_MIN_SAMPLES_LEAF = 12   # Higher = simpler trees
-ML_GB_N_ESTIMATORS = 60     # Low count prevents overfitting  
-ML_GB_MAX_DEPTH = 3         # Shallow = less overfitting
-ML_GB_LEARNING_RATE = 0.02  # Lower = more regularization
+# ML Model Configuration - HIGH ACCURACY MODE (Robust)
+# Tuned for >60% accuracy while minimizing overfitting gap (<5%)
+ML_FEATURE_SELECTION_THRESHOLD = 0.005  # Keep strict threshold
+ML_RF_N_ESTIMATORS = 100    # Increased from 50 to capture more patterns (reducing variance)
+ML_RF_MAX_DEPTH = 6         # Increased from 4 to 6 (Nuance without memorization)
+ML_RF_MIN_SAMPLES_SPLIT = 20  # Slightly lower to allow learning specific patterns
+ML_RF_MIN_SAMPLES_LEAF = 8    # Strict leaf size (must have 8 samples to make a rule)
+ML_GB_N_ESTIMATORS = 100    # Matches RF for balance
+ML_GB_MAX_DEPTH = 4         # Keep GB shallow to prevent boosting noise
+ML_GB_LEARNING_RATE = 0.03  # Low rate = learns slowly/safely
 ML_HIGH_ACCURACY_THRESHOLD = 0.60  
-ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.62  
-ML_MIN_TRAINING_SAMPLES = 80  # Reduced from 100 to allow earlier learning
-ML_MIN_BINARY_SAMPLES = 30  
+ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.65  
+ML_MIN_TRAINING_SAMPLES = 100 # Ensure sufficient data before training
+ML_MIN_BINARY_SAMPLES = 50   # Higher minimum for binary classes
 ML_PERFORMANCE_HISTORY_LIMIT = 1000  
-ML_BINARY_HOLD_THRESHOLD = 0.60  
-ML_RECENT_PERFORMANCE_WINDOW = 50  # Window size for recent performance calculation
-ML_ENSEMBLE_WEIGHT_UPDATE_THRESHOLD = 5  # Minimum accuracy difference to update ensemble weights
-ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD = 10  # Accuracy difference threshold for weight adjustment
-ML_ENSEMBLE_WEIGHT_MAX = 0.8  # Maximum ensemble weight
-ML_ENSEMBLE_WEIGHT_MIN = 0.1  # Minimum ensemble weight for high-accuracy ML
-ML_CONFIDENCE_DIFF_THRESHOLD_HIGH = 30  # Confidence difference threshold for high-accuracy ML
-ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL = 20  # Confidence difference threshold for normal ML
-ML_RULE_CONFIDENCE_ADVANTAGE_THRESHOLD = 25  # Rule confidence advantage threshold over ML
+ML_BINARY_HOLD_THRESHOLD = 0.60  # Balanced hold threshold
+ML_RECENT_PERFORMANCE_WINDOW = 50  
+ML_ENSEMBLE_WEIGHT_UPDATE_THRESHOLD = 5  
+ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD = 10  
+ML_ENSEMBLE_WEIGHT_MAX = 0.70  # Cap ML dominance (Safety net)
+ML_ENSEMBLE_WEIGHT_MIN = 0.20  # Ensure ML always has a voice
+ML_CONFIDENCE_DIFF_THRESHOLD_HIGH = 25  
+ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL = 15  
+ML_RULE_CONFIDENCE_ADVANTAGE_THRESHOLD = 20  # Rules need 20% lead to override ML
 
 # AI Predictor Configuration
 AI_PREDICTOR_ENABLED = False  # Disable SeekerAI (not helpful per testing)

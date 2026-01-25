@@ -41,14 +41,68 @@ class DataProvider(ABC):
 
 
 class YahooFinanceProvider(DataProvider):
-    """Yahoo Finance data provider (current implementation)"""
+    """
+    Yahoo Finance data provider with direct requests fallback.
+    Bypasses yfinance library issues by using direct API calls when needed.
+    """
     
     def __init__(self):
         self.name = "Yahoo Finance"
         self.available = True
-    
+        self._session = None
+        
+    def _get_session(self):
+        """Get or create requests session with SSL verification disabled (workaround)"""
+        import requests
+        import urllib3
+        # Suppress SSL warnings
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        if self._session is None:
+            self._session = requests.Session()
+            self._session.verify = False
+            self._session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json',
+                'Referer': 'https://finance.yahoo.com/'
+            })
+        return self._session
+
     def fetch_stock_data(self, symbol: str) -> Optional[Dict]:
-        """Fetch stock data from Yahoo Finance"""
+        """Fetch stock data, trying direct API first then yfinance"""
+        # Try direct API first (faster, less error prone on Windows)
+        try:
+            import time
+            from datetime import datetime
+            
+            base_url = "https://query1.finance.yahoo.com/v8/finance/chart"
+            end_time = int(time.time())
+            start_time = end_time - 86400 * 5  # Last 5 days to ensure we get a quote
+            
+            url = f"{base_url}/{symbol.upper()}?period1={start_time}&period2={end_time}&interval=1d"
+            
+            response = self._get_session().get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                result = data.get('chart', {}).get('result', [])
+                if result:
+                    meta = result[0].get('meta', {})
+                    if meta:
+                        price = meta.get('regularMarketPrice') or meta.get('chartPreviousClose')
+                        return {
+                            'symbol': symbol.upper(),
+                            'currentPrice': price,
+                            'info': {
+                                'name': meta.get('longName') or meta.get('shortName'),
+                                'sector': meta.get('sector'),
+                                'industry': meta.get('industry'),
+                                'marketCap': meta.get('marketCap')
+                            }
+                        }
+        except Exception as e:
+            logger.debug(f"Direct API fetch failed for {symbol}: {e}")
+
+        # Fallback to yfinance library
         try:
             ticker = yf.Ticker(symbol)
             info = ticker.info
@@ -68,12 +122,20 @@ class YahooFinanceProvider(DataProvider):
             return None
     
     def fetch_history(self, symbol: str, period: str = "1y") -> Optional[Dict]:
-        """Fetch historical data from Yahoo Finance"""
+        """Fetch historical data"""
         try:
             ticker = yf.Ticker(symbol)
-            hist = ticker.history(period=period)
+            hist = ticker.history(period=period, timeout=20)
             
             if hist.empty:
+                # Try fallback download if ticker fails
+                import yfinance.utils as yf_utils
+                try:
+                    hist = yf_utils.download(symbol, period=period, progress=False, show_errors=False)
+                except:
+                    pass
+            
+            if hist is None or hist.empty:
                 return None
             
             # Convert to dict format
