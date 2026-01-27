@@ -151,7 +151,10 @@ class VolumeWeightedLevels:
         # Create price bins
         price_range = data['high'].max() - data['low'].min()
         num_bins = 20
-        bin_size = price_range / num_bins
+        if price_range <= 0:
+            bin_size = 0.01  # Minimum bin size
+        else:
+            bin_size = price_range / num_bins
         
         # Volume profile
         volume_profile = {}

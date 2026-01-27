@@ -102,7 +102,7 @@ ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.65
 ML_MIN_TRAINING_SAMPLES = 100 # Ensure sufficient data before training
 ML_MIN_BINARY_SAMPLES = 50   # Higher minimum for binary classes
 ML_PERFORMANCE_HISTORY_LIMIT = 1000  
-ML_BINARY_HOLD_THRESHOLD = 0.60  # Balanced hold threshold
+ML_BINARY_HOLD_THRESHOLD = 0.55  # Lowered from 0.60 to fix "Permabear" (too many HOLDs)
 ML_RECENT_PERFORMANCE_WINDOW = 50  
 ML_ENSEMBLE_WEIGHT_UPDATE_THRESHOLD = 5  
 ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD = 10  
@@ -111,6 +111,7 @@ ML_ENSEMBLE_WEIGHT_MIN = 0.20  # Ensure ML always has a voice
 ML_CONFIDENCE_DIFF_THRESHOLD_HIGH = 25  
 ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL = 15  
 ML_RULE_CONFIDENCE_ADVANTAGE_THRESHOLD = 20  # Rules need 20% lead to override ML
+ML_LABEL_THRESHOLD = 1.5  # Profit threshold for BUY label (1.5% in N days). Reduced to fix SELL bias.
 
 # AI Predictor Configuration
 AI_PREDICTOR_ENABLED = False  # Disable SeekerAI (not helpful per testing)

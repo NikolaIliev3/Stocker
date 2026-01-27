@@ -13,7 +13,9 @@ import time
 import subprocess
 import sys
 import socket
+import socket
 import os
+import webbrowser
 import matplotlib  # pyright: ignore[reportMissingImports]
 matplotlib.use('TkAgg')
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # pyright: ignore[reportMissingImports]
@@ -159,12 +161,15 @@ class StockerApp:
         self.hybrid_predictors = {
             'trading': HybridStockPredictor(APP_DATA_DIR, 'trading', 
                                             trading_analyzer=self.trading_analyzer,
+                                            data_fetcher=self.data_fetcher,
                                             seeker_ai=seeker_ai_instance),
             'mixed': HybridStockPredictor(APP_DATA_DIR, 'mixed',
                                          mixed_analyzer=self.mixed_analyzer,
+                                         data_fetcher=self.data_fetcher,
                                          seeker_ai=seeker_ai_instance),
             'investing': HybridStockPredictor(APP_DATA_DIR, 'investing',
                                             investing_analyzer=self.investing_analyzer,
+                                            data_fetcher=self.data_fetcher,
                                             seeker_ai=seeker_ai_instance)
         }
         self.training_manager = MLTrainingPipeline(self.data_fetcher, APP_DATA_DIR, app=self)
@@ -1814,6 +1819,21 @@ class StockerApp:
         settings_frame = tk.Frame(top_bar, bg=theme['secondary_bg'])
         settings_frame.pack(side=tk.RIGHT, padx=25, pady=15)
         
+        # Open Dashboard Button
+        dashboard_btn = tk.Button(settings_frame,
+                            text="🌐 Open Dashboard",
+                            command=self._open_dashboard,
+                            bg=theme['accent'],
+                            fg=theme['button_fg'],
+                            font=('Segoe UI', 9, 'bold'),
+                            relief=tk.FLAT,
+                            padx=15,
+                            pady=8,
+                            cursor='hand2',
+                            activebackground=theme['accent_hover'],
+                            activeforeground=theme['button_fg'])
+        dashboard_btn.pack(side=tk.LEFT, padx=(0, 10))
+
         # About button
         about_btn = tk.Button(settings_frame,
                             text="ℹ️ About",
@@ -8798,6 +8818,16 @@ Confidence: {prediction['confidence']:.0f}%
         self.potential_text.delete(1.0, tk.END)
         self.potential_text.insert(tk.END, output)
     
+    def _open_dashboard(self):
+        """Open the web dashboard in the default browser"""
+        try:
+            url = "http://127.0.0.1:5001"
+            logger.info(f"Opening dashboard at {url}")
+            webbrowser.open(url)
+        except Exception as e:
+            logger.error(f"Error opening dashboard: {e}")
+            messagebox.showerror("Error", f"Could not open dashboard: {e}")
+
     def _show_about(self):
         """Show About dialog with disclaimer"""
         theme = self.theme_manager.get_theme()

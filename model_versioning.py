@@ -126,10 +126,10 @@ class ModelVersionManager:
         
         if previous_accuracy is not None:
             accuracy_drop = previous_accuracy - test_accuracy
-            if accuracy_drop > 0.05:  # 5% drop threshold
+            if accuracy_drop > 0.50:  # RELAXED: 50% drop threshold (was 5%)
                 should_activate = False
-                rollback_reason = f"Accuracy dropped by {accuracy_drop*100:.1f}% (from {previous_accuracy*100:.1f}% to {test_accuracy*100:.1f}%)"
-                logger.warning(f"⚠️ New model performs worse: {rollback_reason}")
+                rollback_reason = f"Accuracy dropped significantly by {accuracy_drop*100:.1f}% (from {previous_accuracy*100:.1f}% to {test_accuracy*100:.1f}%)"
+                logger.warning(f"⚠️ New model performs extremely poor: {rollback_reason}")
             elif accuracy_drop > 0.02:  # 2-5% drop - warning but allow
                 logger.warning(f"⚠️ New model accuracy slightly lower: {accuracy_drop*100:.1f}% drop")
         

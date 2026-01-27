@@ -9,6 +9,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+from config import ML_LABEL_THRESHOLD
 import logging
 import threading
 import ssl
@@ -40,6 +41,51 @@ class TrainingDataGenerator:
         self.data_fetcher = data_fetcher
         self.feature_extractor = feature_extractor
         self._patch_yfinance_ssl()
+        
+        # Initialize analyzers
+        from algorithm_improvements import MarketRegimeDetector, RelativeStrengthAnalyzer
+        self.regime_detector = MarketRegimeDetector()
+        self.relative_strength_analyzer = RelativeStrengthAnalyzer()
+        
+        # Cache SPY data for market regime/relative strength
+        self.spy_history = None
+        self._fetch_spy_data()
+
+    def _fetch_spy_data(self):
+        """Fetch SPY data once for market regime calculations"""
+        try:
+            logger.info("Fetching SPY data for market regime analysis...")
+            # Fetch long history for SPY
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            start_date = (datetime.now() - timedelta(days=365*10)).strftime('%Y-%m-%d')
+            
+            # Use same logic as generate_training_samples to safely fetch
+            # Try 1: data_fetcher
+            spy_data = self.data_fetcher.fetch_stock_history('SPY', period='10y')
+            if spy_data and spy_data.get('data'):
+                self.spy_history = pd.DataFrame(spy_data['data'])
+            
+            # Try 2: yfinance direct
+            if self.spy_history is None or self.spy_history.empty:
+                import yfinance as yf
+                self.spy_history = yf.download('SPY', start=start_date, end=end_date, progress=False)
+            
+            # Process SPY data
+            if self.spy_history is not None and not self.spy_history.empty:
+                if 'date' in self.spy_history.columns:
+                    self.spy_history['date'] = pd.to_datetime(self.spy_history['date'])
+                    self.spy_history.set_index('date', inplace=True)
+                
+                # Normalize columns
+                self.spy_history.columns = [col.capitalize() for col in self.spy_history.columns]
+                if 'Close' not in self.spy_history.columns and 'close' in self.spy_history.columns:
+                     self.spy_history.rename(columns={'close': 'Close', 'volume': 'Volume'}, inplace=True)
+                
+                logger.info(f"✅ Cached {len(self.spy_history)} rows of SPY data")
+            else:
+                logger.warning("⚠️ Failed to fetch SPY data - Market Regime features will be neutral")
+        except Exception as e:
+            logger.error(f"Error fetching SPY data: {e}")
     
     def _patch_yfinance_ssl(self):
         """Patch yfinance to work around SSL certificate issues"""
@@ -245,10 +291,23 @@ class TrainingDataGenerator:
                 # Label based on strategy (Trend Following)
                 # - Price going UP → BUY (Signal to Enter/Long)
                 # - Price going DOWN → SELL (Signal to Exit/Short)
+                # Calculate volatility (20-day standard deviation of returns)
+                # This adapts the threshold to the stock's natural movement
+                daily_returns = hist_to_date['Close'].pct_change().tail(20)
+                volatility = daily_returns.std() if len(daily_returns) >= 20 else 0.02  # Default to 2%
+                
+                # Dynamic threshold: ~0.8 sigma move over lookforward period
+                # Volatility * sqrt(days) gives expected std dev over that period.
+                # We want a move that is statistically significant (e.g. 0.8 std devs).
+                # Clamp between ML_LABEL_THRESHOLD (e.g. 1.5%) and 8.0%
+                vol_threshold = volatility * np.sqrt(lookforward_days) * 0.8 * 100
+                dynamic_threshold = max(ML_LABEL_THRESHOLD, min(vol_threshold, 8.0))
+
                 if strategy == "trading":
-                    if price_change_pct >= 3:
+                    # Use dynamic threshold for trading
+                    if price_change_pct >= dynamic_threshold:
                         label = "BUY"
-                    elif price_change_pct <= -3:
+                    elif price_change_pct <= -dynamic_threshold:
                         label = "SELL"
                     else:
                         label = "HOLD"
@@ -278,11 +337,14 @@ class TrainingDataGenerator:
                     
                     temp_analyzer = self._cached_analyzer
                     
-                    # Initialize enhanced features variables (skip market regime/relative strength for training to avoid API calls)
+                    # Initialize enhanced features variables
                     market_regime = None
                     timeframe_analysis = None
                     relative_strength = None
                     support_resistance = None
+                    volume_analysis = None
+                    sector_analysis = None
+                    catalyst_info = None
                     
                     # Convert history_data to DataFrame for direct indicator calculation
                     if history_data and history_data.get('data') and len(history_data['data']) >= 20:
@@ -310,13 +372,70 @@ class TrainingDataGenerator:
                         else:
                             # Calculate indicators directly without full analysis (avoids SPY API calls)
                             try:
+                                
+                                # 1. Core Indicators
                                 indicators = temp_analyzer._calculate_indicators(hist_df)
-                                price_action = temp_analyzer._analyze_price_action(hist_df)
-                                timeframe_analysis = temp_analyzer.timeframe_analyzer.analyze_timeframes(hist_df)
+                                # price_action = temp_analyzer._analyze_price_action(hist_df) # Not directly used in features, but can be part of indicators
+
+                                # 2. Volume Analysis
+                                try:
+                                    volume_analysis = temp_analyzer._analyze_volume(hist_df)
+                                except Exception as e:
+                                    logger.debug(f"Volume analysis failed: {e}")
+                                    pass
+
+                                # 3. Market Regime (using cached SPY data)
+                                try:
+                                    if self.spy_history is not None and not self.spy_history.empty:
+                                        # Slice SPY data up to current date (prevent data leakage)
+                                        spy_slice = self.spy_history[self.spy_history.index <= current_date]
+                                        if len(spy_slice) >= 50:
+                                            # Create DataFrame for detector (needs lowercase 'close')
+                                            spy_for_detector = spy_slice.copy()
+                                            spy_for_detector.rename(columns={'Close': 'close'}, inplace=True)
+                                            market_regime = self.regime_detector.detect_regime(spy_for_detector[['close']])
+                                except Exception as e:
+                                    logger.debug(f"Market regime detection failed: {e}")
+                                    pass
+                                
+                                # 4. Timeframe Analysis
+                                try:
+                                    timeframe_analysis = temp_analyzer.timeframe_analyzer.analyze_timeframes(hist_df)
+                                except Exception as e:
+                                    logger.debug(f"Timeframe analysis failed: {e}")
+                                    pass
+                                
+                                # 5. Relative Strength (using cached SPY data)
+                                try:
+                                    if self.spy_history is not None and not self.spy_history.empty:
+                                        # Slice SPY data up to current date
+                                        spy_slice = self.spy_history[self.spy_history.index <= current_date]
+                                        
+                                        # Prepare inputs (needs lowercase 'close')
+                                        stock_close = hist_df['close']
+                                        spy_close = spy_slice['Close'] if 'Close' in spy_slice.columns else spy_slice['close']
+                                        
+                                        # Align dates
+                                        common_dates = stock_close.index.intersection(spy_close.index)
+                                        if len(common_dates) >= 20:
+                                            relative_strength = self.relative_strength_analyzer.calculate_relative_strength(
+                                                stock_close.loc[common_dates], spy_close.loc[common_dates]
+                                            )
+                                            relative_strength['available'] = True
+                                except Exception as e:
+                                    logger.debug(f"Relative strength analysis failed: {e}")
+                                    pass
+
+                                # 6. Support/Resistance
                                 support_resistance = temp_analyzer._identify_levels(hist_df)
-                            except Exception as calc_error:
+                                
+                                # 7. Sector/Catalyst (can't easily do historically without massive data, keep as default)
+                                sector_analysis = None 
+                                catalyst_info = None
+                                
+                            except Exception as e:
                                 if error_count < 3:
-                                    logger.debug(f"Indicator calculation failed for {symbol} at {current_date}: {calc_error}")
+                                    logger.debug(f"Indicator calculation failed for {symbol} at {current_date}: {e}")
                     else:
                         if error_count < 3:
                             logger.debug(f"Insufficient history data for {symbol} at {current_date}: {len(history_data.get('data', []))} days, using defaults")
@@ -331,18 +450,18 @@ class TrainingDataGenerator:
                     support_resistance = None
                 
                 # Calculate volume analysis for liquidity features (no API calls needed)
-                volume_analysis = None
-                if history_data and history_data.get('data') and len(history_data['data']) >= 20:
+                # Calculate volume analysis if not already done (fallback)
+                if volume_analysis is None and history_data and history_data.get('data') and len(history_data['data']) >= 20:
                     try:
                         hist_df = pd.DataFrame(history_data['data'])
                         if 'close' in hist_df.columns and 'volume' in hist_df.columns:
+                             # ... manual calc ...
                             avg_volume = hist_df['volume'].tail(20).mean()
                             avg_price = hist_df['close'].tail(20).mean()
                             avg_dollar_volume = avg_volume * avg_price
                             current_volume = hist_df['volume'].iloc[-1] if len(hist_df) > 0 else 0
                             volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
                             
-                            # Calculate volume trend (last vs 10 days ago)
                             if len(hist_df) >= 10:
                                 volume_trend = "increasing" if hist_df['volume'].iloc[-1] > hist_df['volume'].iloc[-10] else "decreasing"
                             else:
@@ -350,15 +469,10 @@ class TrainingDataGenerator:
                                 
                             is_high_volume = volume_ratio > 1.5
                             
-                            # Liquidity grade based on daily dollar volume
-                            if avg_dollar_volume >= 50_000_000:
-                                liquidity_grade = 'high'
-                            elif avg_dollar_volume >= 10_000_000:
-                                liquidity_grade = 'medium'
-                            elif avg_dollar_volume >= 1_000_000:
-                                liquidity_grade = 'low'
-                            else:
-                                liquidity_grade = 'very_low'
+                            if avg_dollar_volume >= 50_000_000: liquidity_grade = 'high'
+                            elif avg_dollar_volume >= 10_000_000: liquidity_grade = 'medium'
+                            elif avg_dollar_volume >= 1_000_000: liquidity_grade = 'low'
+                            else: liquidity_grade = 'very_low'
                             
                             volume_analysis = {
                                 'volume_ratio': float(volume_ratio),
@@ -367,18 +481,24 @@ class TrainingDataGenerator:
                                 'volume_trend': volume_trend,
                                 'is_high_volume': is_high_volume
                             }
-                    except Exception as vol_error:
-                        pass  # Use default if calculation fails
+                    except Exception:
+                        pass
                 
                 # Extract features with enhanced analysis data (will use defaults if not available)
                 try:
                     features = self.feature_extractor.extract_features(
-                        stock_data, history_data, None, indicators if indicators else None,
-                        market_regime, timeframe_analysis, relative_strength, support_resistance,
-                        None,  # news_data
-                        None,  # sector_analysis (requires API, skip during training)
-                        None,  # catalyst_info (requires API, skip during training)
-                        volume_analysis  # liquidity features (calculated from history)
+                        stock_data=stock_data, 
+                        history_data=history_data, 
+                        financials_data=None, 
+                        indicators=indicators if indicators else None,
+                        market_regime=market_regime, 
+                        timeframe_analysis=timeframe_analysis, 
+                        relative_strength=relative_strength, 
+                        support_resistance=support_resistance,
+                        news_data=None,
+                        sector_analysis=sector_analysis,
+                        catalyst_info=catalyst_info,
+                        volume_analysis=volume_analysis
                     )
                 except Exception as feat_error:
                     error_count += 1
@@ -536,7 +656,7 @@ class MLTrainingPipeline:
         # Binary mode removes ambiguous HOLD class and focuses on clear UP/DOWN signals
         # Apply saved config parameters if available, otherwise use defaults
         train_kwargs = {
-            'use_hyperparameter_tuning': training_params.get('use_hyperparameter_tuning', False),  # DISABLED: HP tuning can cause overfitting
+            'use_hyperparameter_tuning': training_params.get('use_hyperparameter_tuning', True),  # ENABLED: Dynamic tuning for better accuracy
             'use_binary_classification': training_params.get('use_binary_classification', True),
             'use_regime_models': training_params.get('use_regime_models', True),
             'feature_selection_method': training_params.get('feature_selection_method', 'importance'),

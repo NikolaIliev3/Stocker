@@ -159,32 +159,37 @@ class PredictionsTracker:
         
         was_correct = None
         
+        # Check for time-based expiry
+        estimated_date_str = prediction.get('estimated_target_date')
+        is_expired = False
+        if estimated_date_str:
+            try:
+                is_expired = datetime.now() >= datetime.fromisoformat(estimated_date_str)
+            except:
+                pass
+
         if action == "BUY":
             # BUY prediction is correct if price reached target before stop loss
             if current_price >= target_price:
                 was_correct = True
             elif current_price <= stop_loss:
                 was_correct = False
+            elif is_expired:
+                # Expired without hitting levels: correct if price went up from entry
+                was_correct = current_price > entry_price
         elif action == "SELL":
-            # SELL prediction (standard logic: bearish, expecting price to go DOWN)
-            # Correct if price reached target (went DOWN) before stop loss (went UP)
+            # SELL prediction is correct if price reached target before stop loss
             if current_price <= target_price:
                 was_correct = True
             elif current_price >= stop_loss:
                 was_correct = False
+            elif is_expired:
+                # Expired without hitting levels: correct if price went down from entry
+                was_correct = current_price < entry_price
         elif action in ["HOLD", "AVOID"]:
             # For HOLD/AVOID, we check if price moved in expected direction
             price_change = ((current_price - entry_price) / entry_price) * 100
             strategy = prediction.get('strategy', 'trading')
-            
-            # Check for time-based expiry for HOLD/AVOID since they don't have explicit targets
-            estimated_date_str = prediction.get('estimated_target_date')
-            is_expired = False
-            if estimated_date_str:
-                try:
-                    is_expired = datetime.now() >= datetime.fromisoformat(estimated_date_str)
-                except:
-                    pass
             
             if is_expired:
                 if action == "HOLD":

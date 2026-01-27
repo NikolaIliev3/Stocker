@@ -42,6 +42,7 @@ class HybridStockPredictor:
                  trading_analyzer: TradingAnalyzer = None,
                  investing_analyzer: InvestingAnalyzer = None,
                  mixed_analyzer: MixedAnalyzer = None,
+                 data_fetcher = None,
                  seeker_ai = None):
         self.data_dir = data_dir
         self.strategy = strategy
@@ -53,8 +54,8 @@ class HybridStockPredictor:
         self._ml_warning_logged = False
         self._ml_success_logged = False
         
-        # Base analyzers
-        self.trading_analyzer = trading_analyzer or TradingAnalyzer()
+        # Base analyzers with data fetcher injection for regime detection
+        self.trading_analyzer = trading_analyzer or TradingAnalyzer(data_fetcher=data_fetcher)
         self.investing_analyzer = investing_analyzer or InvestingAnalyzer()
         self.mixed_analyzer = mixed_analyzer or MixedAnalyzer()
         
@@ -147,7 +148,7 @@ class HybridStockPredictor:
             logger.error(f"Error saving performance: {e}")
     
     def predict(self, stock_data: dict, history_data: dict, 
-                financials_data: dict = None, is_backtest: bool = False) -> Dict:
+                financials_data: dict = None, is_backtest: bool = False, current_date=None) -> Dict:
         """Make prediction using hybrid approach"""
         # Check cache first (only if not backtesting)
         symbol = stock_data.get('symbol', '')
@@ -182,14 +183,14 @@ class HybridStockPredictor:
 
         # 1. Get rule-based prediction
         if self.strategy == "trading":
-            base_analysis = self.trading_analyzer.analyze(stock_data, history_data)
+            base_analysis = self.trading_analyzer.analyze(stock_data, history_data, current_date=current_date)
         elif self.strategy == "investing":
             base_analysis = self.investing_analyzer.analyze(
-                stock_data, financials_data, history_data
+                stock_data, financials_data, history_data, current_date=current_date
             )
         else:  # mixed
             base_analysis = self.mixed_analyzer.analyze(
-                stock_data, financials_data, history_data
+                stock_data, financials_data, history_data, current_date=current_date
             )
         
         if 'error' in base_analysis:
@@ -353,7 +354,7 @@ class HybridStockPredictor:
                         log_features = features.iloc[0].to_dict() if isinstance(features, pd.DataFrame) else "Numpy Array/List"
                         logger.info(f"🔍 ML Input Features for {symbol} (Full): {log_features}")
                 # Pass stock_data and history_data for regime-specific model detection
-                ml_prediction = self.ml_predictor.predict(features, stock_data, history_data)
+                ml_prediction = self.ml_predictor.predict(features, stock_data, history_data, is_backtest=is_backtest)
                 # Check if prediction has an error (e.g., LabelEncoder not fitted)
                 if ml_prediction and 'error' in ml_prediction:
                     logger.warning(f"⚠️ ML prediction unavailable: {ml_prediction.get('error')}. Using rule-based only.")
@@ -527,13 +528,19 @@ class HybridStockPredictor:
             logger.debug(f"⚖️ Reducing ML Weight (0.35) due to weak {source} ({effective_accuracy:.1f}%)")
         
         # If no strong signal, stick to 50/50 default set above
+        # If no strong signal, stick to 50/50 default set above
             # No history yet - trust training accuracy
-            if trained_accuracy > 53:
-                 ml_weight = 0.60
-                 rule_weight = 0.40
+            # CRITICAL ADJUSTMENT: Trust ML Training initially to break "Permabear" cycle
+            # CRITICAL ADJUSTMENT: Trust ML Training initially to break "Permabear" cycle
+            # Lowered threshold to 53% (better than random) and increased weight to 0.45 (near parity)
+            if trained_accuracy > 53: 
+                 logger.debug(f"⚖️ Trusting New Brain: No history, but Training Acc {trained_accuracy:.1f}% -> ML Weight 0.55")
+                 ml_weight = 0.55
+                 rule_weight = 0.45
             else:
-                 ml_weight = 0.35
-                 rule_weight = 0.65
+                 # Even if weak, don't crush it completely (0.35 -> 0.40)
+                 ml_weight = 0.40
+                 rule_weight = 0.60
         
         # DISAGREEMENT PENALTY (Disabled for Strong Models)
         # Only apply disagreement penalty if the model is NOT Strong (accuracy > 60%)
@@ -585,6 +592,20 @@ class HybridStockPredictor:
         # Flag to force HOLD in stalemate situations
         force_hold = False
         
+        # --- BULL MARKET SAFETY LOCK ---
+        # Prevent "Inversions" (Selling winners) by downgrading weak ML Sells in confirmed Uptrends.
+        market_regime = base_analysis.get('market_regime', {}).get('regime', 'unknown')
+        trend = base_analysis.get('price_action', {}).get('trend', 'sideways')
+        
+        if market_regime == 'bull' and trend == 'uptrend' and ml_action == 'SELL':
+             if ml_confidence < 85.0: # If ML is not SUPER sure (85%), don't sell a winner
+                 logger.info(f"🛡️ Safety Lock: Downgrading ML SELL ({ml_confidence:.1f}%) to HOLD in Bull Uptrend")
+                 ml_action = 'HOLD'
+                 ml_pred['action'] = 'HOLD'
+                 # If Rule Action is BUY, this allows the BUY to win (BUY vs HOLD = BUY)
+                 # If Rule Action is HOLD, this results in HOLD (HOLD vs HOLD = HOLD)
+                 # This effectively blocks the "Inversion" error.
+        
         # Scenario 1: Consensus (Both agree)
         if rule_action == ml_action:
              if rule_action != 'HOLD':
@@ -601,8 +622,35 @@ class HybridStockPredictor:
                  logger.debug(f"⚔️ Conflict (R:{rule_action} vs M:{ml_action}) -> Rule Wins (High Conf {rule_confidence:.1f}%)")
              else:
                  # Stalemate
-                 force_hold = True
-                 logger.debug(f"⚔️ Conflict (R:{rule_action} vs M:{ml_action}) -> FORCE HOLD (Stalemate)")
+                 # CRITICAL EXCEPTION: Reversal Detection
+                 # If Rule says SELL (Downtrend) but ML says BUY (Reversal),
+                 # check if we have technical confirmation for a bottom.
+                 is_reversal_setup = False
+                 reversal_reason = ""
+                 
+                 rsi = base_analysis.get('indicators', {}).get('rsi_14', 50)
+                 patterns = base_analysis.get('indicators', {}).get('pattern_analysis', {})
+                 candlestick = base_analysis.get('indicators', {}).get('candlestick_pattern') or 'unknown'
+                 
+                 # 1. RSI Oversold Check
+                 if ml_action == 'BUY' and rsi < 35: 
+                     is_reversal_setup = True
+                     reversal_reason = f"RSI Oversold ({rsi:.1f})"
+                     
+                 # 2. Pattern Check
+                 if ml_action == 'BUY' and ('engulfing' in candlestick or 'hammer' in candlestick or 'double_bottom' in str(patterns)):
+                     is_reversal_setup = True
+                     reversal_reason = f"Bullish Pattern ({candlestick})"
+                 
+                 if is_reversal_setup and ml_confidence > 60:
+                      logger.debug(f"🔄 Reversal Exception: Trusting ML BUY ({ml_confidence:.1f}%) due to {reversal_reason}")
+                      # Boost ML weight to override Rule
+                      ml_weight = max(ml_weight, 0.65)
+                      rule_weight = 1.0 - ml_weight
+                      force_hold = False
+                 else:
+                      force_hold = True
+                      logger.debug(f"⚔️ Conflict (R:{rule_action} vs M:{ml_action}) -> FORCE HOLD (Stalemate)")
                  
         # Scenario 3: Action vs HOLD (One wants to move, one wants to wait)
         elif rule_action != ml_action:
@@ -659,14 +707,15 @@ class HybridStockPredictor:
         elif rule_action == 'HOLD' and ml_action != 'HOLD':
              # SAFETY VETO: Prevent ML from blindly buying into extreme overbought conditions
              rsi = base_analysis.get('indicators', {}).get('rsi', 50)
-             if ml_action == 'BUY' and rsi > 78 and ml_confidence < 90:
+             # Relaxed threshold: Only block if RSI is > 82 (Extreme)
+             if ml_action == 'BUY' and rsi > 82 and ml_confidence < 90:
                  logger.info(f"🛡️ SAFETY VETO: Blocking ML BUY because RSI is {rsi:.2f} (Extreme Overbought). Forced HOLD.")
                  # Force Rule weight to dominate (1.0) to enforce the HOLD
                  rule_weight = 1.0
                  ml_weight = 0.0
                  force_hold = True
              
-             elif ml_confidence > 70:  # Raised from 60 to verify ML conviction
+             elif ml_confidence > 60:  # If ML is somewhat confident (>60%), let it speak
                  # If ML is reasonably confident, let it swing the vote
                  pass 
              else:
@@ -720,10 +769,40 @@ class HybridStockPredictor:
             reasoning += "⚠ Methods differ - using weighted consensus\n"
         
         result = base_analysis.copy()
+        
+        # --- CRITICAL FIX: RECALCULATE TARGET/STOP IF ACTION FLIPPED ---
+        # If the final_action (weighted consensus) differs from the rule-based action,
+        # we MUST flip the target and stop loss to avoid "Accuracy Fraud" (instant verification).
+        final_target = recommendation.get('target_price', 0)
+        final_stop = recommendation.get('stop_loss', 0)
+        current_price = base_analysis.get('price', 0)
+        
+        if final_action != rule_action:
+            # Detect ATR for dynamic offset
+            atr = base_analysis.get('indicators', {}).get('atr', 0)
+            if current_price > 0:
+                if final_action == 'BUY':
+                    # Flip to BUY levels
+                    offset = atr * 3 if atr > 0 else current_price * 0.05
+                    final_target = current_price + offset
+                    final_stop = current_price - (offset / 2)
+                    reasoning += f"🎯 Adjusted Target/Stop for BUY flip (ATR offset)\n"
+                elif final_action == 'SELL':
+                    # Flip to SELL levels
+                    offset = atr * 3 if atr > 0 else current_price * 0.05
+                    final_target = current_price - offset
+                    final_stop = current_price + (offset / 2)
+                    reasoning += f"🎯 Adjusted Target/Stop for SELL flip (ATR offset)\n"
+                elif final_action == 'HOLD':
+                    final_target = current_price
+                    final_stop = current_price
+
         result['recommendation'] = {
             **recommendation,
             'action': final_action,
-            'confidence': final_confidence
+            'confidence': final_confidence,
+            'target_price': final_target,
+            'stop_loss': final_stop
         }
         result['reasoning'] = reasoning
         result['method'] = 'hybrid_ensemble'

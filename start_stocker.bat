@@ -44,6 +44,10 @@ if errorlevel 1 (
     timeout /t 2 /nobreak >nul
 )
 
+echo [2.5/3] Starting Dashboard & Paper Trader...
+start "Stocker Dashboard" /min cmd /c "start_dashboard.bat"
+timeout /t 2 /nobreak >nul
+
 echo [3/3] Starting desktop application...
 echo.
 echo ========================================

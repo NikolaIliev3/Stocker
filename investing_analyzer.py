@@ -25,12 +25,16 @@ class InvestingAnalyzer:
             self.has_market_intel = False
     
     def analyze(self, stock_data: dict, financials_data: dict, history_data: dict, 
-               sentiment_info: dict = None, macro_info: dict = None) -> dict:
+               sentiment_info: dict = None, macro_info: dict = None, current_date=None) -> dict:
         """
         Perform fundamental analysis on stock data
         Returns buy/sell recommendation with reasoning
         """
         try:
+            # Filter financials to prevent future data leakage
+            if current_date:
+                financials_data = self._filter_financials(financials_data, current_date)
+            
             # Analyze company fundamentals
             fundamentals = self._analyze_fundamentals(stock_data)
             
@@ -86,6 +90,39 @@ class InvestingAnalyzer:
         except Exception as e:
             logger.error(f"Error in investing analysis: {e}")
             return {"error": str(e)}
+    
+    def _filter_financials(self, financials_data: dict, current_date) -> dict:
+        """Filter financials to only include data available relative to current_date"""
+        if not financials_data or not current_date:
+            return financials_data
+            
+        filtered = financials_data.copy()
+        try:
+            from datetime import datetime
+            # Handle string date if passed
+            if isinstance(current_date, str):
+                current_date = datetime.strptime(current_date, '%Y-%m-%d')
+            
+            for key in ['financials', 'balance_sheet', 'cashflow']:
+                if key in filtered and isinstance(filtered[key], dict):
+                    # Filter keys (which are dates)
+                    valid_data = {}
+                    for date_str, metrics in filtered[key].items():
+                        try:
+                            # Parse date string (format is usually YYYY-MM-DD or timestamp str)
+                            # Data fetcher converts timestamps to YYYY-MM-DD string
+                            report_date = datetime.strptime(str(date_str).split()[0], '%Y-%m-%d')
+                            if report_date <= current_date:
+                                valid_data[date_str] = metrics
+                        except (ValueError, TypeError):
+                            # Keep if we can't parse date (safer to keep or drop? drop is safer for backtest)
+                            pass
+                    filtered[key] = valid_data
+                    
+        except Exception as e:
+            logger.warning(f"Error filtering financials: {e}")
+            
+        return filtered
     
     def _analyze_fundamentals(self, stock_data: dict) -> dict:
         """Analyze company fundamentals and business model"""

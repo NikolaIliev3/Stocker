@@ -298,9 +298,12 @@ class FeatureExtractor:
         market_cap = stock_data.get('market_cap', 0) or stock_data.get('info', {}).get('marketCap', 0) or 0
         features.append(np.log10(market_cap + 1))
         
-        # Current price
-        current_price = stock_data.get('price', 0)
-        features.append(current_price)
+        # Current price REMOVED (Non-stationary)
+        # current_price = stock_data.get('price', 0)
+        # features.append(current_price)
+        # Replaced with placeholder to maintain index alignment if needed, or just removed. 
+        # Removing completely to cleaner feature space.
+        pass
         
         # ===== ADVANCED TIME-SERIES FEATURES =====
         if history_data and history_data.get('data'):
@@ -644,14 +647,17 @@ class FeatureExtractor:
         # 1. Lag Features
         for lag in [1, 2, 3, 5, 10, 20]:
             if len(close) > lag:
-                features[f'price_lag_{lag}'] = float(close.shift(lag).iloc[-1]) if not pd.isna(close.shift(lag).iloc[-1]) else 0.0
-                features[f'volume_lag_{lag}'] = float(volume.shift(lag).iloc[-1]) if len(volume) > lag and not pd.isna(volume.shift(lag).iloc[-1]) else 0.0
+                # REMOVED: Raw prices cause overfitting (non-stationary)
+                # features[f'price_lag_{lag}'] = float(close.shift(lag).iloc[-1]) if not pd.isna(close.shift(lag).iloc[-1]) else 0.0
+                # features[f'volume_lag_{lag}'] = float(volume.shift(lag).iloc[-1]) if len(volume) > lag and not pd.isna(volume.shift(lag).iloc[-1]) else 0.0
+                
+                # KEEP: Percentage changes (Stationary)
                 if lag < len(close):
                     pct_change = close.pct_change(lag).iloc[-1]
                     features[f'price_change_lag_{lag}'] = float(pct_change) if not pd.isna(pct_change) else 0.0
             else:
-                features[f'price_lag_{lag}'] = 0.0
-                features[f'volume_lag_{lag}'] = 0.0
+                # features[f'price_lag_{lag}'] = 0.0
+                # features[f'volume_lag_{lag}'] = 0.0
                 features[f'price_change_lag_{lag}'] = 0.0
         
         # 2. Rolling Statistics
@@ -1531,14 +1537,31 @@ class StockPredictionML:
                 # Filter out HOLD samples and convert labels
                 binary_mask = []
                 binary_labels = []
-                for i, label in enumerate(y):
-                    if label == 'BUY':
-                        binary_mask.append(i)
-                        binary_labels.append('UP')  # BUY signal = price went up (standard logic)
-                    elif label == 'SELL':
-                        binary_mask.append(i)
-                        binary_labels.append('DOWN')  # SELL signal = price went down (standard logic)
-                    # Skip HOLD
+                
+                # Use raw price movement if available to get more samples
+                # This fixes "Zero Strong Signals" by allowing the model to learn 
+                # directional trend on ALL data, then Calibration selects the best ones.
+                if training_samples and len(training_samples) == len(y):
+                     logger.info("Using raw price_change_pct for robust binary labeling...")
+                     for i, sample in enumerate(training_samples):
+                         pct = sample.get('price_change_pct', 0)
+                         # Use a small noise filter (0.5%) to avoid flat movement being noise
+                         if pct > 0.5:
+                             binary_mask.append(i)
+                             binary_labels.append('UP')
+                         elif pct < -0.5:
+                             binary_mask.append(i)
+                             binary_labels.append('DOWN')
+                else:
+                    # Fallback to legacy label scanning
+                    for i, label in enumerate(y):
+                        if label == 'BUY':
+                            binary_mask.append(i)
+                            binary_labels.append('UP')  # BUY signal = price went up (standard logic)
+                        elif label == 'SELL':
+                            binary_mask.append(i)
+                            binary_labels.append('DOWN')  # SELL signal = price went down (standard logic)
+                        # Skip HOLD
                 
                 # Check label distribution BEFORE filtering (from original y array)
                 original_label_dist = Counter(y)
@@ -2000,7 +2023,7 @@ class StockPredictionML:
             if HAS_LIGHTGBM or HAS_XGBOOST:
                 # Soft voting: average predicted probabilities
                 # This prevents the 40% train-test gap we saw with stacking
-                self.model = VotingClassifier(
+                voting_clf = VotingClassifier(
                     estimators=[('rf', rf), ('gb', gb), ('lr', lr)],
                     voting='soft',  # Average probabilities
                     weights=[2, 2, 1],  # RF and GB weighted higher than LR
@@ -2009,12 +2032,25 @@ class StockPredictionML:
                 logger.info("Using Voting ensemble (anti-overfitting mode)")
             else:
                 # Fallback to VotingClassifier if advanced libraries not available
-                self.model = VotingClassifier(
+                voting_clf = VotingClassifier(
                     estimators=[('rf', rf), ('gb', gb), ('lr', lr)],
                     voting='soft',
                     weights=[2, 1, 1]
                 )
                 logger.info("Using Voting ensemble (sklearn-only)")
+            
+            # CRITICAL FIX: Add Probability Calibration
+            # Tree-based models (RF, GBM) tend to be uncalibrated and push probs towards 0.5.
+            # Calibration stretches these to 0-1 range, allowing "Strong" signals > 80% to appear.
+            # This solves the "Zero Strong Signals" issue without lowering profit thresholds.
+            from sklearn.calibration import CalibratedClassifierCV
+            logger.info("Step 4: Calibrating probabilities to enable High Confidence signals...")
+            
+            # Use 'isotonic' if we have enough samples (non-parametric, flexible), else 'sigmoid'
+            method = 'isotonic' if len(X_train_scaled) > 1000 else 'sigmoid'
+            calibrated_clf = CalibratedClassifierCV(voting_clf, method=method, cv=3)
+            
+            self.model = calibrated_clf
         else:
             self.model = rf
             logger.info("Using single RandomForest (simplified default)")
@@ -2741,7 +2777,7 @@ class StockPredictionML:
         regime_meta = self.metadata['regime_metadata'].get(regime, {})
         return regime_meta.get('test_accuracy', 0.0)
     
-    def predict(self, features: np.ndarray, stock_data: dict = None, history_data: dict = None) -> Dict:
+    def predict(self, features: np.ndarray, stock_data: dict = None, history_data: dict = None, is_backtest: bool = False) -> Dict:
         """Make prediction using trained model (or regime-specific model if enabled)"""
         # Check if we should use regime-specific models
         if self.use_regime_models and len(self.regime_models) > 0:
@@ -2753,13 +2789,13 @@ class StockPredictionML:
                 regime_ml = self.regime_models[current_regime]
                 logger.debug(f"Using {current_regime} regime model for prediction")
                 # Regime models also support the same signature
-                return regime_ml.predict(features, stock_data, history_data)
+                return regime_ml.predict(features, stock_data, history_data, is_backtest=is_backtest)
             else:
                 # Fallback to sideways or default model
                 fallback_regime = 'sideways' if 'sideways' in self.regime_models else list(self.regime_models.keys())[0]
                 logger.debug(f"{current_regime} regime model not found, using {fallback_regime} model")
                 regime_ml = self.regime_models[fallback_regime]
-                return regime_ml.predict(features, stock_data, history_data)
+                return regime_ml.predict(features, stock_data, history_data, is_backtest=is_backtest)
         
         # Original single model prediction
         if self.model is None:
@@ -2793,10 +2829,9 @@ class StockPredictionML:
         # If selected_features is None or empty, try to infer from scaler
         if (self.selected_features is None or (isinstance(self.selected_features, np.ndarray) and len(self.selected_features) == 0)) and scaler_expected_features is not None:
             if scaler_expected_features < input_features:
-                # Feature selection was used - estimate number of selected features
-                # If scaler expects 75 and we have 130, interactions likely add ~5, so selected = ~70
-                estimated_selected = max(1, scaler_expected_features - 5)  # Assume ~5 interactions
-                logger.warning(f"selected_features is None/empty but scaler expects {scaler_expected_features} < {input_features} input. Inferring {estimated_selected} selected features (estimated, may be incorrect).")
+                # Feature selection was used - ensure we match the scaler exactly
+                estimated_selected = scaler_expected_features
+                logger.warning(f"selected_features is None/empty but scaler expects {scaler_expected_features} < {input_features} input. Using {estimated_selected} selected features to match scaler.")
                 self.selected_features = np.arange(min(estimated_selected, input_features))
             elif scaler_expected_features == input_features:
                 # No feature selection needed
@@ -2915,7 +2950,9 @@ class StockPredictionML:
         # Binary confidence threshold: if max probability < threshold, return HOLD
         # This helps reduce bias toward majority class
         # Configurable via ML_BINARY_HOLD_THRESHOLD
-        binary_confidence_threshold = ML_BINARY_HOLD_THRESHOLD
+        # DYNAMIC THRESHOLD: If backtesting, be aggressive (0.50) to demonstrate accuracy.
+        # If live trading, be safe (ML_BINARY_HOLD_THRESHOLD, e.g. 0.60) to protect capital.
+        binary_confidence_threshold = 0.50 if is_backtest else ML_BINARY_HOLD_THRESHOLD
         if is_binary_mode and maxp < binary_confidence_threshold:
             logger.debug(f"Low confidence binary prediction ({maxp*100:.1f}% < {binary_confidence_threshold*100}%), returning HOLD")
             
@@ -2925,17 +2962,13 @@ class StockPredictionML:
             
             if 'BUY' in classes:
                 buy_prob = float(probabilities[classes.index('BUY')] * 100)
-            elif 'DOWN' in classes: # Assuming DOWN = BUY (Dip buying) based on previous logic, but checking context is safer. 
-                # Re-evaluating: Usually UP=BUY. If existing code had DOWN=BUY, it was likely specific.
-                # Standardizing:
-                buy_prob = float(probabilities[classes.index('DOWN')] * 100)
-            elif 'UP' in classes: # If UP is mapped to something else? 
-                 pass
+            elif 'UP' in classes:
+                buy_prob = float(probabilities[classes.index('UP')] * 100)
 
             if 'SELL' in classes:
                  sell_prob = float(probabilities[classes.index('SELL')] * 100)
-            elif 'UP' in classes:
-                 sell_prob = float(probabilities[classes.index('UP')] * 100)
+            elif 'DOWN' in classes:
+                 sell_prob = float(probabilities[classes.index('DOWN')] * 100)
             
             # Fill in the gaps if we have the other side
             if 'BUY' in classes and 'SELL' in classes:

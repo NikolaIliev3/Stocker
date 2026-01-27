@@ -43,6 +43,44 @@ class StockDataFetcher:
     """Fetches stock data securely from backend proxy, with fallback to direct yfinance"""
     
     def __init__(self):
+        # PATCH: Fix for SSL Certificate Verify Failed errors in Windows/Custom environments
+        try:
+            import ssl
+            ssl._create_default_https_context = ssl._create_unverified_context
+            for env_var in ['CURL_CA_BUNDLE', 'REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE', 'CURL_CAINFO']:
+                 import os
+                 os.environ.pop(env_var, None)
+                 
+            # Patch curl_cffi if present (used by modern yfinance)
+            try:
+                import curl_cffi.requests as cr
+                msg = "Patched curl_cffi"
+                if not getattr(cr.Session, '_is_patched', False):
+                    original_request = cr.Session.request
+                    def patched_request(self, method, url, **kwargs):
+                        kwargs['verify'] = False
+                        return original_request(self, method, url, **kwargs)
+                    cr.Session.request = patched_request
+                    cr.Session._is_patched = True
+            except ImportError:
+                pass
+                
+            # Patch standard requests
+            try:
+                import requests
+                if not getattr(requests, '_is_patched', False):
+                    original_get = requests.get
+                    def patched_get(*args, **kwargs):
+                        kwargs['verify'] = False
+                        return original_get(*args, **kwargs)
+                    requests.get = patched_get
+                    requests._is_patched = True
+            except ImportError:
+                pass
+                
+        except Exception:
+            pass
+            
         self.session = get_secure_session()
         self.base_url = BACKEND_API_URL
         self._backend_available = None  # Cache backend availability check
@@ -100,6 +138,55 @@ class StockDataFetcher:
     # Class-level verification timestamp to prevent multiple threads hammering API when rate limited
     _global_rate_limit_cooldown = 0
     
+    def get_stock_info(self, symbol):
+        """Fetch basic stock info (price, name, etc)"""
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(symbol.upper())
+            # Fast fetch for just price if possible, but info is standard
+            return ticker.info
+        except Exception as e:
+            logger.warning(f"Failed to fetch stock info for {symbol}: {e}")
+            return {}
+
+    def get_current_data(self, symbol):
+        """
+        Get the latest price and simple metadata for a symbol.
+        Used by Paper Trader and Dashboard.
+        """
+        try:
+            # Try getting info, or fetch 1d history
+            # INFO endpoint is often faster for current price
+            info = self.get_stock_info(symbol)
+            if info and info.get('currentPrice'):
+                return {
+                    'symbol': symbol,
+                    'price': info['currentPrice'],
+                    'open': info.get('open'),
+                    'high': info.get('dayHigh'),
+                    'low': info.get('dayLow'),
+                    'volume': info.get('volume'),
+                    'prev_close': info.get('previousClose')
+                }
+                
+            # Fallback to history
+            hist = self.fetch_stock_history(symbol, period='1d')
+            if hist and hist.get('data'):
+                latest = hist['data'][-1]
+                return {
+                    'symbol': symbol,
+                    'price': latest['close'],
+                    'open': latest['open'],
+                    'high': latest['high'],
+                    'low': latest['low'],
+                    'volume': latest['volume'],
+                    'prev_close': latest['open'] # approx
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Error getting current data for {symbol}: {e}")
+            return None
+
     def _retry_operation(self, operation, max_retries=5, base_delay=3.0):
         """Execute operation with retry logic for rate limits"""
         last_exception = None

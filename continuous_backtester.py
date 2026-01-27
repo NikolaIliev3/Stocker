@@ -463,6 +463,34 @@ class ContinuousBacktester:
                     logger.warning(f"No hybrid predictor for {strategy}, skipping")
                     continue
                 
+                # Fetch global SPY history for Market Regime detection (Critical for accuracy)
+                # Fetch 5 years of history to cover all possible test dates
+                logger.info("Fetching SPY history for market regime context...")
+                spy_history_df = None
+                try:
+                    spy_data = self.app.data_fetcher.fetch_stock_history('SPY', period='5y')
+                    if spy_data and 'data' in spy_data and len(spy_data['data']) > 200:
+                        spy_history_df = pd.DataFrame(spy_data['data'])
+                        spy_history_df['date'] = pd.to_datetime(spy_history_df['date'])
+                        spy_history_df.set_index('date', inplace=True)
+                        spy_history_df = spy_history_df.sort_index()
+                        # Rename columns to lowercase for consistency
+                        spy_history_df.columns = [c.lower() for c in spy_history_df.columns]
+                        logger.info(f"✅ Loaded SPY history: {len(spy_history_df)} days")
+                    else:
+                        logger.warning("⚠️ Failed to load adequate SPY history")
+                except Exception as e:
+                    logger.error(f"Error fetching SPY history: {e}")
+
+                # Inject SPY history into TradingAnalyzer (if available)
+                if spy_history_df is not None:
+                    if hasattr(hybrid_predictor, 'trading_analyzer'):
+                        hybrid_predictor.trading_analyzer.backtest_spy_history = spy_history_df
+                        logger.info("Injected SPY history into TradingAnalyzer")
+                    if hasattr(hybrid_predictor, 'investing_analyzer'):
+                         # Investing analyzer might not use it directly but good to have
+                         pass
+                
                 # Test on random symbols and dates
                 tests_run = 0
                 correct = 0
@@ -784,7 +812,7 @@ class ContinuousBacktester:
             
             # Get prediction using current algorithm state
             if strategy == 'trading':
-                analysis = hybrid_predictor.predict(stock_data, history_data, None, is_backtest=True)
+                analysis = hybrid_predictor.predict(stock_data, history_data, None, is_backtest=True, current_date=test_date)
             elif strategy == 'mixed':
                 # For backtesting, we might not have financials - use None
                 financials_data = None
@@ -792,14 +820,14 @@ class ContinuousBacktester:
                     financials_data = self.app.data_fetcher.fetch_financials(symbol)
                 except:
                     pass
-                analysis = hybrid_predictor.predict(stock_data, history_data, financials_data, is_backtest=True)
+                analysis = hybrid_predictor.predict(stock_data, history_data, financials_data, is_backtest=True, current_date=test_date)
             else:  # investing
                 financials_data = None
                 try:
                     financials_data = self.app.data_fetcher.fetch_financials(symbol)
                 except:
                     pass
-                analysis = hybrid_predictor.predict(stock_data, history_data, financials_data, is_backtest=True)
+                analysis = hybrid_predictor.predict(stock_data, history_data, financials_data, is_backtest=True, current_date=test_date)
             
             if 'error' in analysis:
                 return None

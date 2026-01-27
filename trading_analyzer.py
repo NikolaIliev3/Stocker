@@ -49,7 +49,7 @@ class TradingAnalyzer:
         self._spy_data_cache = None
         self._spy_data_cache_time = None
     
-    def analyze(self, stock_data: dict, history_data: dict) -> dict:
+    def analyze(self, stock_data: dict, history_data: dict, current_date=None) -> dict:
         """
         Perform trading analysis on stock data
         Returns buy/sell recommendation with reasoning
@@ -68,7 +68,8 @@ class TradingAnalyzer:
             symbol = stock_data.get('symbol', stock_data.get('info', {}).get('symbol', ''))
             
             # Detect market regime (using SPY as market proxy)
-            market_regime = self._get_market_regime()
+            # Pass current_date to ensure we don't peek into the future during backtests
+            market_regime = self._get_market_regime(current_date)
             
             # Multi-timeframe analysis (daily, weekly, monthly trends)
             timeframe_analysis = self.timeframe_analyzer.analyze_timeframes(df)
@@ -596,10 +597,69 @@ class TradingAnalyzer:
             "volume_weighted": False
         }
     
-    def _get_market_regime(self) -> dict:
-        """Get current market regime by analyzing SPY (S&P 500)"""
-        # Cache regime for 1 hour to avoid excessive API calls
+    def _get_market_regime(self, current_date=None) -> dict:
+        """Get current market regime by analyzing SPY (S&P 500)
+        
+        Args:
+            current_date: Optional datetime object. If provided, checks regime AS OF this date.
+        """
+        # Cache logic needs to be date-aware or disabled for backtesting
         from datetime import datetime, timedelta
+        
+        # If backtesting (specific date provided), skip cache or use separate logic
+        if current_date:
+            # OPTIMIZATION: Check if we have pre-fetched SPY history for backtesting
+            if hasattr(self, 'backtest_spy_history') and self.backtest_spy_history is not None and not self.backtest_spy_history.empty:
+                try:
+                    # Filter for data up to current_date (and 1 year back)
+                     # Look back 1 year from that date
+                    start_date_obj = current_date - timedelta(days=365)
+                    mask = (self.backtest_spy_history.index >= start_date_obj) & (self.backtest_spy_history.index <= current_date)
+                    spy_slice = self.backtest_spy_history.loc[mask]
+                    
+                    if spy_slice.empty or len(spy_slice) < 50:
+                        return {'regime': 'unknown', 'strength': 50, 'reason': 'Insufficient SPY backtest data'}
+                    
+                    # Detect regime on this historical slice
+                    return self.regime_detector.detect_regime(spy_slice[['close']])
+                except Exception as e:
+                    return {'regime': 'unknown', 'strength': 50, 'reason': f'Backtest SPY error: {e}'}
+
+            # Format date for data fetching
+            end_date_str = current_date.strftime('%Y-%m-%d')
+            # Look back 1 year from that date
+            start_date_obj = current_date - timedelta(days=365)
+            start_date_str = start_date_obj.strftime('%Y-%m-%d')
+            
+            if not self.data_fetcher:
+                return {'regime': 'unknown', 'strength': 50, 'reason': 'No data fetcher available'}
+                
+            try:
+                # Fetch HISTORICAL SPY data ending at current_date
+                spy_history = self.data_fetcher.fetch_stock_history(
+                    'SPY', start_date=start_date_str, end_date=end_date_str
+                )
+                
+                if not spy_history or 'error' in spy_history:
+                    return {'regime': 'unknown', 'strength': 50, 'reason': 'SPY history unavailable'}
+                
+                spy_df = pd.DataFrame(spy_history.get('data', []))
+                
+                if spy_df.empty or len(spy_df) < 50:
+                    return {'regime': 'unknown', 'strength': 50, 'reason': 'Insufficient SPY data'}
+                
+                spy_df['date'] = pd.to_datetime(spy_df['date'])
+                spy_df.set_index('date', inplace=True)
+                spy_df = spy_df.sort_index()
+                
+                # Detect regime on this historical slice
+                regime_info = self.regime_detector.detect_regime(spy_df[['close']])
+                return regime_info
+                
+            except Exception as e:
+                return {'regime': 'unknown', 'strength': 50, 'reason': f'Error: {str(e)}'}
+
+        # --- NORMAL REAL-TIME LOGIC ---
         if (self._market_regime_cache and self._market_regime_cache_time and 
             (datetime.now() - self._market_regime_cache_time) < timedelta(hours=1)):
             return self._market_regime_cache
@@ -645,6 +705,10 @@ class TradingAnalyzer:
     
     def _get_spy_data(self) -> pd.DataFrame:
         """Get SPY (S&P 500) data for relative strength comparison"""
+        # OPTIMIZATION: Check if we have pre-fetched SPY history for backtesting
+        if hasattr(self, 'backtest_spy_history') and self.backtest_spy_history is not None:
+            return self.backtest_spy_history
+
         # Cache SPY data for 1 hour to avoid excessive API calls
         from datetime import datetime, timedelta
         if (self._spy_data_cache is not None and self._spy_data_cache_time and 
@@ -736,19 +800,28 @@ class TradingAnalyzer:
                 # Still falling - Risky "Falling Knife"
                 score += 1 
                 reasons.append(f"RSI oversold but still falling ({rsi:.1f}) - Watch for reversal")
-                
-        elif rsi > 80:  # Extremely overbought
+        
+        # --- DIP BUYING LOGIC (ADDED) ---
+        elif 30 <= rsi <= 55 and trend == "uptrend":
+             score += 1.5
+             reasons.append(f"Values Zone: Buying the dip in Uptrend (RSI {rsi:.1f})")
+             
+        elif rsi > 85:  # EXTREME overbought (Raised from 80)
             score -= 3
             reasons.append(f"RSI extremely overbought ({rsi:.2f}) - strong sell signal")
             
         elif rsi > self.rsi_overbought:
-            if rsi < rsi_prev:
+            if trend == "uptrend" and rsi > rsi_prev:
+                 # Momentum is strong, don't sell yet
+                 score += 0.5 
+                 reasons.append(f"Strong Momentum in Uptrend (RSI {rsi:.1f}) - Ride the wave")
+            elif rsi < rsi_prev:
                 # Cooling off from highs - Strong Sell
                 score -= 2
                 reasons.append(f"RSI overbought and correcting ({rsi:.1f})")
             else:
                 # Still pumping - could go higher
-                score -= 1
+                score -= 0.5 # Relaxed from -1
                 reasons.append(f"RSI overbought but trending up ({rsi:.1f})")
         
         # MACD analysis

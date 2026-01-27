@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stocket for dummies | Live Trading Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+        }
+
+        .glass {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .gradient-text {
+            background: linear-gradient(135deg, #60a5fa 0%, #a855f7 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .status-pulse {
+            animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.5;
+            }
+        }
+    </style>
+</head>
+
+<body class="min-h-screen p-4 md:p-8">
+    <!-- Header -->
+    <header class="max-w-7xl mx-auto mb-8 flex justify-between items-end">
+        <div>
+            <h1 class="text-3xl font-bold gradient-text">Stocket for dummies</h1>
+            <p class="text-slate-400">Live Paper Trading Session</p>
+        </div>
+        <div class="test-right">
+            <div class="flex items-center gap-2 text-sm text-slate-400">
+                <span id="sync-status" class="w-2 h-2 rounded-full bg-emerald-500 status-pulse"></span>
+                Last Sync: <span id="last-update">--:--:--</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <!-- Sidebar: Account Summary -->
+        <div class="lg:col-span-1 space-y-6">
+            <div class="glass p-6 rounded-2xl">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="font-semibold text-lg flex items-center gap-2">
+                        <i data-lucide="wallet" class="w-5 h-5 text-blue-400"></i> Portfolio Summary
+                    </h2>
+                </div>
+                <div class="space-y-4">
+                    <div>
+                        <p class="text-sm text-slate-400 lowercase">Available Cash</p>
+                        <p id="cash-balance" class="text-2xl font-bold">$0.00</p>
+                    </div>
+                    <div>
+                        <p class="text-sm text-slate-400 lowercase">Total Estimated Value</p>
+                        <p id="total-value" class="text-2xl font-bold text-emerald-400">$0.00</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="glass p-6 rounded-2xl">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="font-semibold text-lg flex items-center gap-2">
+                        <i data-lucide="brain" class="w-5 h-5 text-pink-400"></i> Cognitive Health
+                    </h2>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <p class="text-[10px] text-slate-400 lowercase">Live Accuracy</p>
+                        <p id="accuracy-score" class="text-xl font-bold text-blue-400">--%</p>
+                    </div>
+                    <div>
+                        <p class="text-[10px] text-slate-400 lowercase">Verified Signals</p>
+                        <p id="verified-count" class="text-xl font-bold">0</p>
+                    </div>
+                    <div>
+                        <p class="text-[10px] text-slate-400 lowercase">Active Alerts</p>
+                        <p id="active-count" class="text-xl font-bold">0</p>
+                    </div>
+                    <div>
+                        <p class="text-[10px] text-slate-400 lowercase">Learning Rate</p>
+                        <p id="learning-rate" class="text-xl font-bold text-purple-400">--%</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="glass p-6 rounded-2xl">
+                <h2 class="font-semibold text-lg mb-4 flex items-center gap-2">
+                    <i data-lucide="layout-list" class="w-5 h-5 text-purple-400"></i> Active Positions
+                </h2>
+                <div id="holdings-list" class="space-y-3">
+                    <p class="text-sm text-slate-500 italic">No active holdings</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Content: Brain Output -->
+        <div class="lg:col-span-2 space-y-6">
+            <div class="glass p-6 rounded-2xl overflow-hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="font-semibold text-lg flex items-center gap-2">
+                        <i data-lucide="zap" class="w-5 h-5 text-amber-400"></i> Real-Time Brain Signals
+                    </h2>
+                    <span class="text-xs bg-slate-800 px-3 py-1 rounded-full text-slate-300 lowercase">Live Scanning
+                        Loop</span>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left">
+                        <thead>
+                            <tr class="text-slate-400 border-b border-white/10 text-xs lowercase">
+                                <th class="pb-3 px-2">Symbol</th>
+                                <th class="pb-3 px-2">Verdict</th>
+                                <th class="pb-3 px-2">Detailed Prices</th>
+                                <th class="pb-3 px-2">Est. Date</th>
+                                <th class="pb-3 px-2">Confidence</th>
+                                <th class="pb-3 px-2">Safety Lock</th>
+                                <th class="pb-3 px-2">Trend</th>
+                            </tr>
+                        </thead>
+                        <tbody id="predictions-table">
+                            <!-- Rows injected by JS -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="glass p-6 rounded-2xl overflow-hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="font-semibold text-lg flex items-center gap-2">
+                        <i data-lucide="history" class="w-5 h-5 text-indigo-400"></i> Global Prediction History
+                    </h2>
+                    <span class="text-xs bg-slate-800 px-3 py-1 rounded-full text-slate-300 lowercase">GUI + Bot
+                        Integrated</span>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left">
+                        <thead>
+                            <tr class="text-slate-400 border-b border-white/10 text-xs lowercase">
+                                <th class="pb-3 px-2">Time</th>
+                                <th class="pb-3 px-2">Symbol</th>
+                                <th class="pb-3 px-2">Action</th>
+                                <th class="pb-3 px-2">Est. Date</th>
+                                <th class="pb-3 px-2">Status</th>
+                                <th class="pb-3 px-2">Result</th>
+                            </tr>
+                        </thead>
+                        <tbody id="history-table">
+                            <!-- Rows injected by JS from predictions.json -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Log Console -->
+            <div class="glass p-6 rounded-2xl h-48 flex flex-col">
+                <h2 class="font-semibold text-sm mb-2 text-slate-400 flex items-center gap-2">
+                    <i data-lucide="terminal" class="w-4 h-4"></i> Activity Log
+                </h2>
+                <div id="log-console" class="flex-1 overflow-y-auto font-mono text-xs text-slate-500 space-y-1">
+                    <div>Waiting for system pulses...</div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Reasoning Modal -->
+    <div id="reasoning-modal"
+        class="fixed inset-0 z-50 hidden flex items-center justify-center bg-black/80 backdrop-blur-sm opacity-0 transition-opacity duration-300">
+        <div
+            class="glass bg-slate-900 border border-white/10 rounded-2xl w-full max-w-2xl max-h-[80vh] overflow-hidden transform scale-95 transition-transform duration-300 shadow-2xl m-4 flex flex-col">
+            <!-- Modal Header -->
+            <div class="p-6 border-b border-white/10 flex justify-between items-start bg-slate-800/50">
+                <div>
+                    <h3 id="modal-symbol"
+                        class="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-400">
+                        AAPL</h3>
+                    <p id="modal-action" class="text-sm font-bold text-emerald-400 mt-1">BUY RECOMMENDATION</p>
+                </div>
+                <button onclick="closeModal()"
+                    class="text-slate-400 hover:text-white transition-colors bg-white/5 hover:bg-white/10 p-2 rounded-lg">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+
+            <!-- Modal Body -->
+            <div class="p-6 overflow-y-auto custom-scrollbar flex-1">
+                <div class="space-y-4">
+                    <div>
+                        <h4 class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">AI Analysis &
+                            Reasoning</h4>
+                        <div id="modal-reasoning"
+                            class="text-sm text-slate-300 leading-relaxed whitespace-pre-wrap font-sans bg-slate-800/30 p-4 rounded-xl border border-white/5">
+                            Loading reasoning...
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-4 mt-6">
+                        <div class="bg-slate-800/30 p-3 rounded-xl border border-white/5">
+                            <p class="text-[10px] text-slate-500 uppercase">Confidence</p>
+                            <p id="modal-confidence" class="text-lg font-bold text-blue-400">--%</p>
+                        </div>
+                        <div class="bg-slate-800/30 p-3 rounded-xl border border-white/5">
+                            <p class="text-[10px] text-slate-500 uppercase">Est. Completion</p>
+                            <p id="modal-date" class="text-lg font-bold text-purple-400">--</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Modal Footer -->
+            <div class="p-4 border-t border-white/10 bg-slate-800/50 text-center">
+                <p class="text-[10px] text-slate-500">Generated by Stocker AI Engine • <span id="modal-timestamp">Just
+                        now</span></p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Lucide Icons
+        lucide.createIcons();
+
+        async function updateDashboard() {
+            try {
+                const response = await fetch('/api/state');
+                if (!response.ok) throw new Error('API Offline');
+                const data = await response.json();
+
+                // 1. Portfolio 
+                const cash = data.summary.cash;
+                document.getElementById('cash-balance').textContent = `$${cash.toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
+
+                // Estimate value (Cash + holdings cost basis)
+                let totalVal = cash;
+                const holdingsEl = document.getElementById('holdings-list');
+                holdingsEl.innerHTML = '';
+
+                const positionKeys = Object.keys(data.holdings);
+                if (positionKeys.length === 0) {
+                    holdingsEl.innerHTML = '<p class="text-sm text-slate-500 italic">No active holdings</p>';
+                } else {
+                    positionKeys.forEach(sym => {
+                        const h = data.holdings[sym];
+                        totalVal += h.qty * h.avg_price;
+
+                        holdingsEl.innerHTML += `
+                            <div class="flex justify-between items-center p-3 bg-slate-800/40 rounded-xl border border-white/5">
+                                <div>
+                                    <p class="font-bold text-sm">${sym}</p>
+                                    <p class="text-xs text-slate-400 lowercase">${h.qty} shares @ $${h.avg_price.toFixed(2)}</p>
+                                </div>
+                                <div class="text-right">
+                                    <p class="text-xs text-emerald-400">+$0.00</p>
+                                </div>
+                            </div>
+                        `;
+                    });
+                }
+                document.getElementById('total-value').textContent = `$${totalVal.toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
+
+                // 1.1 Cognitive Health 
+                if (data.stats) {
+                    const stats = data.stats;
+                    document.getElementById('accuracy-score').textContent = `${Math.round(stats.accuracy)}%`;
+                    document.getElementById('verified-count').textContent = stats.verified;
+                    document.getElementById('active-count').textContent = stats.active;
+                    document.getElementById('learning-rate').textContent = `${Math.round(stats.recent_accuracy || stats.accuracy)}%`;
+
+                    // Style accuracy based on value
+                    const accEl = document.getElementById('accuracy-score');
+                    if (stats.accuracy >= 65) accEl.className = 'text-xl font-bold text-emerald-400';
+                    else if (stats.accuracy >= 50) accEl.className = 'text-xl font-bold text-blue-400';
+                    else accEl.className = 'text-xl font-bold text-rose-400';
+                }
+
+                // 2. Predictions Table
+                const table = document.getElementById('predictions-table');
+                table.innerHTML = '';
+
+                // Update global data store for modal
+                currentPredictionsData = data.predictions;
+
+                // Update global data store for modal
+                currentPredictionsData = data.predictions;
+
+                // Convert to array and sort by confidence (High -> Low)
+                const sortedPredictions = Object.keys(data.predictions).map(sym => {
+                    return { symbol: sym, ...data.predictions[sym] };
+                }).sort((a, b) => {
+                    const confA = a.recommendation ? a.recommendation.confidence : 0;
+                    const confB = b.recommendation ? b.recommendation.confidence : 0;
+                    return confB - confA; // Descending
+                });
+
+                sortedPredictions.forEach(pred => {
+                    const sym = pred.symbol;
+                    const rec = pred.recommendation || { action: 'ERROR', confidence: 0 };
+                    const ensemble = pred.ensemble || {};
+
+                    // Style indicators
+                    const actionClass = rec.action === 'BUY' ? 'text-emerald-400' :
+                        rec.action === 'SELL' ? 'text-rose-400' : 'text-slate-300';
+
+                    const lockActive = pred.safety_lock && pred.safety_lock.lock_active;
+                    const lockReason = pred.safety_lock ? pred.safety_lock.reason : '';
+
+                    // Handle regime as string or object
+                    let regimeText = 'bull';
+                    if (pred.market_regime) {
+                        regimeText = typeof pred.market_regime === 'object' ?
+                            (pred.market_regime.regime || 'bull') : pred.market_regime;
+                    }
+
+                    // Format Estimated Date
+                    let dateHtml = '<span class="text-slate-500">-</span>';
+                    if (pred.estimated_target_date) {
+                        const dateObj = new Date(pred.estimated_target_date);
+                        const month = dateObj.toLocaleString('default', { month: 'short' });
+                        const day = dateObj.getDate();
+                        dateHtml = `<div class="text-xs text-slate-300">${month} ${day}</div>`;
+
+                        // Add relative days if available
+                        if (pred.estimated_days) {
+                            dateHtml += `<div class="text-[10px] text-slate-500 lowercase">${pred.estimated_days} days</div>`;
+                        }
+                    }
+
+                    // Calculate distance to target/stop loss for BUY signals
+                    let distanceInfo = '';
+                    try {
+                        if (rec.action === 'BUY') {
+                            const currentPrice = pred.price || 0;
+                            const targetPrice = rec.target_price || 0;
+                            const stopLoss = rec.stop_loss || 0;
+                            const entryPrice = rec.entry_price || currentPrice;
+
+                            if (currentPrice > 0) {
+                                const distToTarget = ((targetPrice - currentPrice) / currentPrice) * 100;
+                                distanceInfo = `<div class="text-[10px] text-slate-400 mt-0.5 lowercase">target: ${distToTarget > 0 ? '+' : ''}${distToTarget.toFixed(1)}%</div>`;
+
+                                if (currentPrice < entryPrice && stopLoss > 0) {
+                                    const distToStop = ((currentPrice - stopLoss) / currentPrice) * 100;
+                                    distanceInfo += `<div class="text-[10px] text-rose-400 lowercase">sl risk: -${Math.abs(distToStop).toFixed(1)}%</div>`;
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.error("Error calculating distance:", e);
+                    }
+
+                    // Format Prices Column
+                    let priceHtml = '<span class="text-slate-600">-</span>';
+                    if (rec.action === 'BUY' && rec.entry_price && rec.target_price) {
+                        priceHtml = `
+                            <div class="flex flex-col gap-0.5">
+                                <div class="flex justify-between gap-3 text-xs">
+                                    <span class="text-slate-400">Entry:</span>
+                                    <span class="font-mono text-slate-200">$${rec.entry_price.toFixed(2)}</span>
+                                </div>
+                                <div class="flex justify-between gap-3 text-xs">
+                                    <span class="text-slate-400">Target:</span>
+                                    <span class="font-mono text-emerald-300">$${rec.target_price.toFixed(2)}</span>
+                                </div>
+                            </div>
+                         `;
+                    }
+
+                    // Star Indicator Logic (Dual Stars)
+                    let starsHtml = '';
+                    const reasoning = (pred.reasoning || '').toLowerCase();
+
+                    // 1. YELLOW STAR: High Confidence (>80%)
+                    if (rec.confidence > 80) {
+                        starsHtml += `<i data-lucide="star" class="w-4 h-4 text-yellow-400 fill-yellow-400 inline-block ml-1" title="High Confidence (>80%)"></i>`;
+                    }
+
+                    // 2. ORANGE STAR: Consensus (Both methods agree)
+                    // We check the reasoning text for the "agree" keyword inserted by hybrid_predictor.py
+                    // CRITICAL FIX: Strict phrase match only. "Agree" is too common.
+                    const isConsensus = reasoning.includes('both methods agree');
+
+                    if (isConsensus) {
+                        starsHtml += `<i data-lucide="star" class="w-4 h-4 text-purple-500 fill-purple-500 inline-block ml-0.5" title="Consensus (ML + Rules Agree)"></i>`;
+                    }
+
+                    // 3. RED STAR: Reversal (Downtrend -> Uptrend)
+                    // Matches "buying the dip", "reversal", "oversold", "downtrend" in a BUY context
+                    if (rec.action === 'BUY') {
+                        const isReversal = reasoning.includes('reversal') ||
+                            reasoning.includes('downtrend') ||
+                            reasoning.includes('dip') ||
+                            reasoning.includes('oversold') ||
+                            reasoning.includes('rebound');
+
+                        if (isReversal) {
+                            starsHtml += `<i data-lucide="star" class="w-4 h-4 text-red-500 fill-red-500 inline-block ml-0.5" title="Reversal / Trend Change"></i>`;
+                        }
+                    }
+
+                    table.innerHTML += `
+                        <tr onclick="openModal('${sym}')" class="border-b border-white/5 hover:bg-white/10 transition-colors group cursor-pointer relative">
+                            <td class="py-4 px-2 font-bold flex items-center">
+                                ${sym} ${starsHtml}
+                            </td>
+                            <td class="py-4 px-2 font-bold ${actionClass}">
+                                <div>${rec.action}</div>
+                                ${distanceInfo}
+                            </td>
+                            <td class="py-4 px-2">
+                                ${priceHtml}
+                            </td>
+                            <td class="py-4 px-2">
+                                ${dateHtml}
+                            </td>
+                            <td class="py-4 px-2">
+                                <div class="flex items-center gap-2">
+                                    <div class="w-16 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                                        <div class="h-full bg-blue-500" style="width: ${rec.confidence}%"></div>
+                                    </div>
+                                    <span class="text-xs">${Math.round(rec.confidence)}%</span>
+                                </div>
+                            </td>
+                            <td class="py-4 px-2">
+                                ${lockActive ?
+                            `<span class="text-[10px] bg-rose-500/20 text-rose-300 px-2 py-0.5 rounded flex items-center gap-1 w-fit" title="${lockReason}">
+                                        <i data-lucide="lock" class="w-2.5 h-2.5"></i> LOCKED
+                                    </span>` :
+                            `<span class="text-[10px] bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded">CLEAR</span>`}
+                            </td>
+                            <td class="py-4 px-2 text-xs text-slate-400 lowercase">${regimeText}</td>
+                        </tr>
+                    `;
+                });
+
+                // 2.1 Global History Table
+                const historyTable = document.getElementById('history-table');
+                historyTable.innerHTML = '';
+
+                if (data.global_history && data.global_history.length > 0) {
+                    data.global_history.forEach(pred => {
+                        const time = new Date(pred.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                        const actionClass = pred.action === 'BUY' ? 'text-emerald-400' :
+                            pred.action === 'SELL' ? 'text-rose-400' : 'text-slate-300';
+
+                        const statusClass = pred.verified ? 'bg-slate-800 text-slate-300' : 'bg-blue-500/20 text-blue-400';
+                        const statusLabel = pred.verified ? 'verified' : 'active';
+
+                        let resultHtml = '-';
+                        if (pred.verified) {
+                            const correct = pred.was_correct;
+                            resultHtml = correct ?
+                                `<span class="text-emerald-400">correct</span>` :
+                                `<span class="text-rose-400">incorrect</span>`;
+                        }
+
+                        // Format Estimated Date for History
+                        let dateHtml = '<span class="text-slate-500">-</span>';
+                        if (pred.estimated_target_date) {
+                            const dateObj = new Date(pred.estimated_target_date);
+                            const month = dateObj.toLocaleString('default', { month: 'short' });
+                            const day = dateObj.getDate();
+                            dateHtml = `<span class="text-slate-400">${month} ${day}</span>`;
+                        }
+
+                        historyTable.innerHTML += `
+                            <tr class="border-b border-white/5 text-xs hover:bg-white/5 transition-colors">
+                                <td class="py-3 px-2 text-slate-500">${time}</td>
+                                <td class="py-3 px-2 font-bold">${pred.symbol}</td>
+                                <td class="py-3 px-2">
+                                    <div class="font-bold ${actionClass}">${pred.action}</div>
+                                    <div class="text-[10px] text-slate-500">@ $${pred.entry_price ? pred.entry_price.toFixed(2) : '0.00'}</div>
+                                </td>
+                                <td class="py-3 px-2">${dateHtml}</td>
+                                <td class="py-3 px-2">
+                                    <span class="px-2 py-0.5 rounded-full ${statusClass}">${statusLabel}</span>
+                                </td>
+                                <td class="py-3 px-2">${resultHtml}</td>
+                            </tr>
+                        `;
+                    });
+                } else {
+                    historyTable.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-slate-500 italic lowercase">Waiting for GUI/Bot signals...</td></tr>';
+                }
+
+                // Re-init icons for new table rows
+                lucide.createIcons();
+
+                // 3. Status
+                document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+                document.getElementById('sync-status').className = 'w-2 h-2 rounded-full bg-emerald-500 status-pulse';
+
+            } catch (err) {
+                console.error(err);
+                document.getElementById('sync-status').className = 'w-2 h-2 rounded-full bg-rose-500';
+                addLog(`Connection Error: ${err.message}`);
+            }
+        }
+
+        function addLog(msg) {
+            const console = document.getElementById('log-console');
+            const div = document.createElement('div');
+            div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            console.prepend(div);
+            if (console.children.length > 20) console.lastChild.remove();
+        }
+
+        // Poll every 5 seconds
+        setInterval(updateDashboard, 5000);
+        updateDashboard();
+        addLog("Dashboard initialized. Listening for brain activity...");
+
+        // Modal Logic
+        let currentPredictionsData = {}; // Store data for modal access
+
+        function openModal(symbol) {
+            const pred = currentPredictionsData[symbol];
+            if (!pred) return;
+
+            const modal = document.getElementById('reasoning-modal');
+            const content = modal.querySelector('.glass');
+
+            // Populate Data
+            document.getElementById('modal-symbol').textContent = symbol;
+
+            const rec = pred.recommendation;
+            const actionEl = document.getElementById('modal-action');
+            actionEl.textContent = `${rec.action} RECOMMENDATION`;
+            actionEl.className = `text-sm font-bold mt-1 ${rec.action === 'BUY' ? 'text-emerald-400' : rec.action === 'SELL' ? 'text-rose-400' : 'text-slate-400'}`;
+
+            document.getElementById('modal-confidence').textContent = `${Math.round(rec.confidence)}%`;
+
+            // Date
+            if (pred.estimated_target_date) {
+                const d = new Date(pred.estimated_target_date);
+                document.getElementById('modal-date').textContent = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+            } else {
+                document.getElementById('modal-date').textContent = 'TBD';
+            }
+
+            // Reasoning (Handle format)
+            const reasoningEl = document.getElementById('modal-reasoning');
+            // Clean up the text a bit if needed, or display as is
+            let text = pred.reasoning || "No detailed reasoning available.";
+            reasoningEl.textContent = text;
+
+            // Timestamp
+            if (pred.timestamp) {
+                document.getElementById('modal-timestamp').textContent = new Date(pred.timestamp).toLocaleString();
+            }
+
+            // Show Animation
+            modal.classList.remove('hidden');
+            // Small delay to allow display:block to apply before opacity transition
+            setTimeout(() => {
+                modal.classList.remove('opacity-0');
+                content.classList.remove('scale-95');
+                content.classList.add('scale-100');
+            }, 10);
+        }
+
+        function closeModal() {
+            const modal = document.getElementById('reasoning-modal');
+            const content = modal.querySelector('.glass');
+
+            modal.classList.add('opacity-0');
+            content.classList.remove('scale-100');
+            content.classList.add('scale-95');
+
+            setTimeout(() => {
+                modal.classList.add('hidden');
+            }, 300);
+        }
+
+        // Close on click outside
+        document.getElementById('reasoning-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'reasoning-modal') closeModal();
+        });
+
+        // Close on Escape key
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeModal();
+        });
+
+    </script>
+</body>
+
+</html>
