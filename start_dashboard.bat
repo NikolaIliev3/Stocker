@@ -1,5 +1,5 @@
 @echo off
-title Stocker - Dashboard & Paper Trader
+title Stocker - Dashboard ^& Paper Trader
 color 0B
 cls
 echo ========================================
