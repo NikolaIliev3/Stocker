@@ -3,10 +3,17 @@ Predictions tracking module for Stocker App
 Tracks predictions and verifies their accuracy
 """
 import json
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import logging
+
+try:
+    from safe_storage import LockingJSONStorage
+except ImportError:
+    # Fallback/Circular import handler (should not happen if safe_storage is base)
+    pass
 
 # Import production monitor if available
 try:
@@ -22,17 +29,23 @@ try:
 except ImportError:
     HAS_ATTRIBUTION = False
 
+from config import PREDICTIONS_FILE, STATE_FILE
+
 logger = logging.getLogger(__name__)
 
 
 class PredictionsTracker:
     """Tracks stock predictions and verifies their accuracy"""
     
-    
     def __init__(self, data_dir: Path, price_move_predictor=None):
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.predictions_file = self.data_dir / "predictions.json"
+        self.predictions_file = PREDICTIONS_FILE
+        
+        # Initialize Safe Storage
+        self.storage = LockingJSONStorage(self.predictions_file)
+        self.lock = threading.RLock() # Re-entrant lock for thread safety
+        
         self.predictions = []
         self.price_move_predictor = price_move_predictor
         
@@ -52,46 +65,37 @@ class PredictionsTracker:
             except Exception as e:
                 logger.warning(f"Could not initialize performance attribution: {e}")
                 self.performance_attribution = None
-        else:
-            self.performance_attribution = None
         
         self.load()
     
     def load(self):
-        """Load predictions from file"""
-        if self.predictions_file.exists():
-            try:
-                with open(self.predictions_file, 'r') as f:
-                    data = json.load(f)
-                    self.predictions = data.get('predictions', [])
-            except Exception as e:
-                logger.error(f"Error loading predictions: {e}")
-                self.predictions = []
-        else:
-            self.predictions = []
+        """Load predictions from file safely"""
+        with self.lock:
+            data = self.storage.load(default={})
+            self.predictions = data.get('predictions', [])
     
     def save(self):
-        """Save predictions to file"""
-        try:
+        """Save predictions to file safely"""
+        with self.lock:
             data = {
                 'predictions': self.predictions,
                 'last_updated': datetime.now().isoformat()
             }
-            with open(self.predictions_file, 'w') as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving predictions: {e}")
+            # Use explicit file locking for writes
+            self.storage.write_locked(data)
     
     def add_prediction(self, symbol: str, strategy: str, action: str, 
                       entry_price: float, target_price: float, 
                       stop_loss: float, confidence: float, reasoning: str,
-                      estimated_days: int = None, predicted_move_pct: float = None) -> Dict:
+                      estimated_days: int = None, predicted_move_pct: float = None,
+                      market_regime: str = "unknown") -> Dict:
         """Add a new prediction with estimated target date
         
         Args:
             estimated_days: Estimated number of days until target should be reached.
                           If None, calculated based on strategy.
             predicted_move_pct: Predicated magnitude of the move in percentage (absolute)
+            market_regime: Market regime at the time of prediction (bull, bear, etc.)
         """
         # Calculate estimated target date based on strategy if not provided
         if estimated_days is None:
@@ -115,6 +119,7 @@ class PredictionsTracker:
             "stop_loss": stop_loss,
             "confidence": confidence,
             "reasoning": reasoning,
+            "market_regime": market_regime,
             "status": "active",  # active, verified, expired
             "verified": False,
             "was_correct": None,
@@ -129,16 +134,222 @@ class PredictionsTracker:
         if predicted_move_pct is not None:
             prediction['predicted_move_pct'] = float(predicted_move_pct)
         
-        self.predictions.append(prediction)
-        self.save()
+        with self.lock:
+            self.predictions.append(prediction)
+            self.save()
+            
+            # Sync to paper_state.json for dashboard visibility
+            self._sync_to_paper_state(prediction)
+            
         return prediction
+
+    def _sync_to_paper_state(self, prediction: Dict):
+        """Sync a single prediction to paper_state.json for the dashboard"""
+        try:
+            if not STATE_FILE.exists():
+                return
+
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            symbol = prediction['symbol']
+            
+            # Convert internal prediction format to dashboard recommendation format
+            # This allows manual scans from the GUI to show up in "Live Recommendations"
+            recommendation = {
+                "action": prediction['action'],
+                "confidence": prediction['confidence'],
+                "entry_price": prediction['entry_price'],
+                "target_price": prediction['target_price'],
+                "stop_loss": prediction['stop_loss'],
+                "estimated_days": prediction['estimated_days'],
+                "rr_ratio": 0.0, # Placeholder
+                "reasoning": prediction['reasoning'].split('\n') if isinstance(prediction['reasoning'], str) else [],
+                "context": "Manual Scan",
+                "estimated_target_date": prediction['estimated_target_date']
+            }
+            
+            if 'predictions' not in data:
+                data['predictions'] = {}
+                
+            data['predictions'][symbol] = {
+                "strategy": prediction.get('strategy', 'trading'),
+                "recommendation": recommendation,
+                "timestamp": prediction['timestamp']
+            }
+            
+            with open(STATE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4)
+                
+            logger.info(f"Synced {symbol} prediction to paper_state.json")
+            
+        except Exception as e:
+            logger.error(f"Error syncing to paper_state: {e}")
     
 
     def verify_prediction(self, prediction_id: int, current_price: float) -> Optional[Dict]:
         """Verify if a prediction came true"""
-        prediction = self.get_prediction_by_id(prediction_id)
-        if not prediction or prediction['status'] != 'active':
-            return None
+        with self.lock:
+            prediction = self.get_prediction_by_id(prediction_id)
+            if not prediction or prediction['status'] != 'active':
+                return None
+                
+            # GRACE PERIOD CHECK:
+            # Don't verify predictions made in the last 15 minutes.
+            try:
+                pred_timestamp = datetime.fromisoformat(prediction['timestamp'])
+                minutes_since_creation = (datetime.now() - pred_timestamp).total_seconds() / 60
+                if minutes_since_creation < 15:
+                    # Too new, skip verification
+                    return None
+            except Exception as e:
+                logger.debug(f"Error checking grace period for prediction {prediction_id}: {e}")
+            
+            action = prediction['action']
+            entry_price = prediction['entry_price']
+            target_price = prediction['target_price']
+            stop_loss = prediction['stop_loss']
+            
+            was_correct = None
+            
+            # Check for time-based expiry
+            estimated_date_str = prediction.get('estimated_target_date')
+            is_expired = False
+            if estimated_date_str:
+                try:
+                    is_expired = datetime.now() >= datetime.fromisoformat(estimated_date_str)
+                except:
+                    pass
+
+            if action == "BUY":
+                # PATIENT SNIPER VERIFICATION:
+                # 1. Intra-period drops (e.g. -10%) are IGNORED.
+                # 2. Intra-period target hits are IGNORED (must hold until expiry/limit).
+                # 3. Success is defined ONLY at Expiry (Deadline).
+                
+                if is_expired:
+                    from config import MIN_PROFIT_TARGET_PCT
+                    price_change = ((current_price - entry_price) / entry_price) * 100
+                    
+                    # USER REQUEST: "at least we hit 3% in profits. if we did, then the prediction is considered TRUE"
+                    if price_change >= MIN_PROFIT_TARGET_PCT:
+                        was_correct = True
+                        logger.info(f"✅ Prediction {prediction_id} SUCCESS (Terminal Profit): {price_change:.2f}% >= {MIN_PROFIT_TARGET_PCT}%")
+                    else:
+                        was_correct = False 
+                        logger.info(f"❌ Prediction {prediction_id} FAILURE (Stagnant/Loss at Expiry): {price_change:.2f}% < {MIN_PROFIT_TARGET_PCT}%")
+                else:
+                    # Still within lifespan, wait for expiry
+                    return None
+                        
+            elif action == "SELL":
+                if current_price <= target_price:
+                    was_correct = True
+                elif current_price >= stop_loss:
+                    was_correct = False
+                elif is_expired:
+                    from config import MIN_PROFIT_TARGET_PCT
+                    price_change = ((current_price - entry_price) / entry_price) * 100
+                    # For SELL, price_change needs to be negative (drop)
+                    # Example: Entry 100, Current 90 -> -10%. We want <= -3.0%
+                    if price_change <= -MIN_PROFIT_TARGET_PCT:
+                         was_correct = True
+                    else:
+                         was_correct = False
+            elif action in ["HOLD", "AVOID"]:
+                # For HOLD/AVOID, we check if price moved in expected direction
+                price_change = ((current_price - entry_price) / entry_price) * 100
+                strategy = prediction.get('strategy', 'trading')
+                
+                if is_expired:
+                    if action == "HOLD":
+                        # Strategy-specific thresholds for HOLD (same as backtest evaluation)
+                        if strategy == "trading":
+                            was_correct = abs(price_change) < 3
+                        elif strategy == "mixed":
+                            was_correct = abs(price_change) < 5
+                        else:  # investing
+                            # For investing (1.5 year timeframe), allow up to 20% movement
+                            was_correct = abs(price_change) < 20
+                    elif action == "AVOID":
+                        # AVOID (legacy) is correct if price went down
+                        was_correct = price_change < -5
+                    else:
+                        was_correct = False
+                else:
+                    # Not expired yet, keep active
+                    return None
+            
+            # KEY CHANGE: If was_correct is still None (neither Target nor Stop hit), 
+            # do NOT verify. Keep it active until it hits a level.
+            if was_correct is None:
+                return None
+                
+            # Calculate price change
+            price_change = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+            
+            # Update prediction
+            prediction['verified'] = True
+            prediction['status'] = 'verified'
+            prediction['was_correct'] = was_correct
+            prediction['actual_price_at_target'] = current_price
+            prediction['verification_date'] = datetime.now().isoformat()
+            prediction['actual_price_change'] = price_change
+            
+            # Calculate days since prediction
+            pred_date = datetime.fromisoformat(prediction['timestamp'])
+            days_diff = (datetime.now() - pred_date).days
+            prediction['days_to_target'] = days_diff
+
+            # -------------------------------------------------------------------------
+            # MEGAMIND LEARNING INJECTION
+            # -------------------------------------------------------------------------
+            if getattr(self, 'price_move_predictor', None) and 'predicted_move_pct' in prediction:
+                try:
+                    predicted_pct = prediction['predicted_move_pct']
+                    actual_abs_pct = abs(price_change)
+                    # Learn from this specific outcome
+                    self.price_move_predictor.learn_from_outcome(
+                        predicted_pct=predicted_pct,
+                        actual_pct=actual_abs_pct,
+                        signal_type=action
+                    )
+                    logger.info(f"🧠 Fed prediction result to PriceMovePredictor: Pred {predicted_pct}%, Actual {actual_abs_pct}%")
+                except Exception as e:
+                    logger.error(f"Failed to feed data to PriceMovePredictor: {e}")
+            # -------------------------------------------------------------------------
+            
+            # Record outcome in production monitor
+            strategy = prediction.get('strategy', 'trading')
+            if strategy in self.production_monitors:
+                try:
+                    self.production_monitors[strategy].record_outcome(
+                        symbol=prediction['symbol'],
+                        action=action,
+                        was_correct=was_correct,
+                        actual_price_change=price_change
+                    )
+                except Exception as e:
+                    logger.debug(f"Error recording outcome in production monitor: {e}")
+            
+            # Record outcome in performance attribution
+            if self.performance_attribution:
+                try:
+                    outcome_dict = {
+                        'was_correct': was_correct,
+                        'actual_price_change': price_change
+                    }
+                    # Add market regime and sector if available
+                    prediction_with_metadata = prediction.copy()
+                    self.performance_attribution.record_prediction_outcome(
+                        prediction=prediction_with_metadata,
+                        outcome=outcome_dict
+                    )
+                except Exception as e:
+                    logger.debug(f"Error recording outcome in performance attribution: {e}")
+            
+            self.save()
+            return prediction
             
         # GRACE PERIOD CHECK:
         # Don't verify predictions made in the last 15 minutes.
@@ -175,8 +386,9 @@ class PredictionsTracker:
             elif current_price <= stop_loss:
                 was_correct = False
             elif is_expired:
-                # Expired without hitting levels: correct if price went up from entry
-                was_correct = current_price > entry_price
+                # Expired without hitting levels: correct if price reached significant move (3% threshold)
+                price_change = ((current_price - entry_price) / entry_price) * 100
+                was_correct = price_change >= 3.0
         elif action == "SELL":
             # SELL prediction is correct if price reached target before stop loss
             if current_price <= target_price:
@@ -184,8 +396,9 @@ class PredictionsTracker:
             elif current_price >= stop_loss:
                 was_correct = False
             elif is_expired:
-                # Expired without hitting levels: correct if price went down from entry
-                was_correct = current_price < entry_price
+                # Expired without hitting levels: correct if price reached significant move (-3% threshold)
+                price_change = ((current_price - entry_price) / entry_price) * 100
+                was_correct = price_change <= -3.0
         elif action in ["HOLD", "AVOID"]:
             # For HOLD/AVOID, we check if price moved in expected direction
             price_change = ((current_price - entry_price) / entry_price) * 100
@@ -296,8 +509,11 @@ class PredictionsTracker:
         newly_verified = []  # Track newly verified predictions
         now = datetime.now()
         
-        for prediction in self.predictions:
-            if prediction['status'] == 'active':
+        # Create a copy of active predictions to iterate safely without holding lock during network requests
+        with self.lock:
+            active_predictions = [p.copy() for p in self.predictions if p['status'] == 'active']
+        
+        for prediction in active_predictions:
                 # ALWAYS check price conditions for active predictions.
                 # We want to know if Target or Stop was hit immediately.
                 # We no longer wait for the 'date' to expire to check for success.
@@ -309,6 +525,7 @@ class PredictionsTracker:
                     current_price = stock_data.get('price', 0)
                     
                     if current_price > 0:
+                        # self.verify_prediction handles its own locking
                         result = self.verify_prediction(prediction['id'], current_price)
                         if result:
                             # If verify_prediction returns a result, it means it was verified (Target/Stop hit)
@@ -358,28 +575,36 @@ class PredictionsTracker:
             logger.warning(f"Prediction #{prediction_id} not found for update")
             return False
         
-        # Update prediction fields
-        prediction['action'] = new_action
-        prediction['entry_price'] = new_entry_price
-        prediction['target_price'] = new_target_price
-        prediction['stop_loss'] = new_stop_loss
-        prediction['confidence'] = new_confidence
-        prediction['reasoning'] = new_reasoning
-        prediction['timestamp'] = datetime.now().isoformat()
-        
-        # Recalculate estimated target date based on strategy
-        strategy = prediction.get('strategy', 'trading')
-        if strategy == "trading":
-            estimated_days = 10
-        elif strategy == "mixed":
-            estimated_days = 21
-        else:  # investing
-            estimated_days = 547
-        
-        prediction['estimated_days'] = estimated_days
-        prediction['estimated_target_date'] = (datetime.now() + timedelta(days=estimated_days)).isoformat()
-        
-        self.save()
+        with self.lock:
+            # Re-fetch prediction inside lock to ensure we have latest state (though get_prediction_by_id didn't lock?)
+            # Since get_prediction_by_id iterates self.predictions, we should lock it or rely on GIL/Reference.
+            # Best to lock entire block.
+            prediction = self.get_prediction_by_id(prediction_id)
+            if not prediction:
+                 return False
+
+            # Update prediction fields
+            prediction['action'] = new_action
+            prediction['entry_price'] = new_entry_price
+            prediction['target_price'] = new_target_price
+            prediction['stop_loss'] = new_stop_loss
+            prediction['confidence'] = new_confidence
+            prediction['reasoning'] = new_reasoning
+            prediction['timestamp'] = datetime.now().isoformat()
+            
+            # Recalculate estimated target date based on strategy
+            strategy = prediction.get('strategy', 'trading')
+            if strategy == "trading":
+                estimated_days = 10
+            elif strategy == "mixed":
+                estimated_days = 21
+            else:  # investing
+                estimated_days = 547
+            
+            prediction['estimated_days'] = estimated_days
+            prediction['estimated_target_date'] = (datetime.now() + timedelta(days=estimated_days)).isoformat()
+            
+            self.save()
         logger.info(f"Updated prediction #{prediction_id}: action changed to {new_action}")
         return True
     
@@ -392,23 +617,17 @@ class PredictionsTracker:
         return [p for p in self.predictions if p['status'] == 'verified']
     
     def delete_prediction(self, prediction_id: int) -> bool:
-        """Delete a prediction by ID
-        
-        Args:
-            prediction_id: ID of the prediction to delete
-            
-        Returns:
-            True if deleted, False if not found
-        """
-        for i, pred in enumerate(self.predictions):
-            if pred['id'] == prediction_id:
-                del self.predictions[i]
-                # Reassign IDs to maintain sequential order
-                for j, p in enumerate(self.predictions):
-                    p['id'] = j + 1
-                self.save()
-                logger.info(f"Deleted prediction #{prediction_id}")
-                return True
+        """Delete a prediction by ID"""
+        with self.lock:
+            for i, pred in enumerate(self.predictions):
+                if pred['id'] == prediction_id:
+                    del self.predictions[i]
+                    # Reassign IDs to maintain sequential order
+                    for j, p in enumerate(self.predictions):
+                        p['id'] = j + 1
+                    self.save()
+                    logger.info(f"Deleted prediction #{prediction_id}")
+                    return True
         logger.warning(f"Prediction #{prediction_id} not found for deletion")
         return False
     

@@ -10,6 +10,12 @@ APP_NAME = "Stocker"
 APP_VERSION = "1.0.0"
 APP_DATA_DIR = Path.home() / ".stocker"
 
+# Centralized File Paths (Decoupling)
+PREDICTIONS_FILE = APP_DATA_DIR / "predictions.json"
+STATE_FILE = APP_DATA_DIR / "paper_state.json"
+PORTFOLIO_FILE = APP_DATA_DIR / "paper_portfolio.json"
+BACKTEST_RESULTS_FILE = APP_DATA_DIR / "backtest_results.json"
+
 # Backend API Configuration
 # In production, this should point to your secure backend proxy
 BACKEND_API_URL = os.getenv("STOCKER_API_URL", "http://localhost:5000/api")
@@ -42,7 +48,7 @@ MACD_SLOW = 26
 MACD_SIGNAL = 9
 
 # Portfolio Configuration
-INITIAL_BALANCE = 10000.0
+INITIAL_BALANCE = 350.0
 
 # API Security Configuration
 API_REQUEST_TIMEOUT = 30  # seconds
@@ -87,31 +93,55 @@ HYPERPARAMETER_TUNING_PARALLEL_TRIALS = None  # None = auto (uses all cores), or
 # Note: Setting to -1 uses all available CPU cores, which maximizes speed but uses more resources
 # If you want to leave some cores free for other tasks, set to a lower number (e.g., 4 or 6)
 
-# ML Model Configuration - HIGH ACCURACY MODE (Robust)
-# Tuned for >60% accuracy while minimizing overfitting gap (<5%)
-ML_FEATURE_SELECTION_THRESHOLD = 0.005  # Keep strict threshold
-ML_RF_N_ESTIMATORS = 100    # Increased from 50 to capture more patterns (reducing variance)
-ML_RF_MAX_DEPTH = 6         # Increased from 4 to 6 (Nuance without memorization)
-ML_RF_MIN_SAMPLES_SPLIT = 20  # Slightly lower to allow learning specific patterns
-ML_RF_MIN_SAMPLES_LEAF = 8    # Strict leaf size (must have 8 samples to make a rule)
-ML_GB_N_ESTIMATORS = 100    # Matches RF for balance
-ML_GB_MAX_DEPTH = 4         # Keep GB shallow to prevent boosting noise
-ML_GB_LEARNING_RATE = 0.03  # Low rate = learns slowly/safely
+# ML Model Configuration - HIGH CONVICTION MODE (3.0% Target)
+# Tuned for >60% accuracy on significant price moves
+ML_FEATURE_SELECTION_THRESHOLD = 0.005  
+ML_RF_N_ESTIMATORS = 300    
+ML_RF_MAX_DEPTH = 5         # Low depth to prevent memorization/overfitting
+ML_RF_MIN_SAMPLES_SPLIT = 100 
+ML_RF_MIN_SAMPLES_LEAF = 50   
+ML_GB_N_ESTIMATORS = 150    
+ML_GB_MAX_DEPTH = 3         
+ML_GB_LEARNING_RATE = 0.05  
 ML_HIGH_ACCURACY_THRESHOLD = 0.60  
 ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.65  
-ML_MIN_TRAINING_SAMPLES = 100 # Ensure sufficient data before training
-ML_MIN_BINARY_SAMPLES = 50   # Higher minimum for binary classes
+ML_MIN_TRAINING_SAMPLES = 50 
+ML_MIN_BINARY_SAMPLES = 30   
 ML_PERFORMANCE_HISTORY_LIMIT = 1000  
-ML_BINARY_HOLD_THRESHOLD = 0.55  # Lowered from 0.60 to fix "Permabear" (too many HOLDs)
+ML_BINARY_HOLD_THRESHOLD = 0.60  
 ML_RECENT_PERFORMANCE_WINDOW = 50  
 ML_ENSEMBLE_WEIGHT_UPDATE_THRESHOLD = 5  
 ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD = 10  
-ML_ENSEMBLE_WEIGHT_MAX = 0.70  # Cap ML dominance (Safety net)
-ML_ENSEMBLE_WEIGHT_MIN = 0.20  # Ensure ML always has a voice
+ML_ENSEMBLE_WEIGHT_MAX = 0.80  
+ML_ENSEMBLE_WEIGHT_MIN = 0.20  
 ML_CONFIDENCE_DIFF_THRESHOLD_HIGH = 25  
 ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL = 15  
-ML_RULE_CONFIDENCE_ADVANTAGE_THRESHOLD = 20  # Rules need 20% lead to override ML
-ML_LABEL_THRESHOLD = 1.5  # Profit threshold for BUY label (1.5% in N days). Reduced to fix SELL bias.
+ML_RULE_CONFIDENCE_ADVANTAGE_THRESHOLD = 15  
+ML_LABEL_THRESHOLD = 3.0  # Strict 3% hurdle for Success
+MIN_PROFIT_TARGET_PCT = 3.0  # Minimum required profit for verification
+MIN_STOP_LOSS_PCT = 4.0      # Production stop loss aligned with Audit V4
+
+# Phase 4: Deployment Safeguards
+GLOBAL_STOP_LOSS_PCT = 4.0   # Hard stop at -4%
+MAX_CONCURRENT_POSITIONS = 8 # Max 8 active trades
+MAX_PORTFOLIO_ALLOCATION = 0.15 # Max 15% of total account value invested
+TIME_STOP_DAYS = 15          # Force exit after 15 days
+BASE_POSITION_SIZE_PCT = 0.02 # Base position size (2% of equity)
+
+# --- Tiered Risk Management (Config 2 Standard) ---
+# Elite: 80-90% Conf -> 3.0% risk (1.5x), Max 3
+ELITE_CONF_RANGE = (80.0, 90.0)
+ELITE_MAX_POS = 3
+ELITE_MULTIPLIER = 1.5
+
+# Standard: 70-80% Conf -> 2.0% risk (1.0x), Max 2 (Only if 0 Elite)
+STANDARD_CONF_RANGE = (70.0, 80.0)
+STANDARD_MAX_POS = 2
+STANDARD_MULTIPLIER = 1.0
+
+# Plateau: 90%+ Conf -> Skip
+PLATEAU_THRESHOLD = 90.0
+      
 
 # AI Predictor Configuration
 AI_PREDICTOR_ENABLED = False  # Disable SeekerAI (not helpful per testing)

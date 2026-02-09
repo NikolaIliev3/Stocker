@@ -16,7 +16,7 @@ if errorlevel 1 (
 )
 
 echo [1/2] Starting Paper Trader (Data Generator)...
-start "Stocker Paper Trader" cmd /c "python paper_trader.py"
+start "Stocker Paper Trader" cmd /c "python paper_trader.py --passive"
 timeout /t 3 /nobreak >nul
 
 echo [2/2] Starting Dashboard API Server...

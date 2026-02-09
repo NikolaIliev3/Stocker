@@ -21,6 +21,12 @@ matplotlib.use('TkAgg')
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # pyright: ignore[reportMissingImports]
 from matplotlib.figure import Figure  # pyright: ignore[reportMissingImports]
 import matplotlib.pyplot as plt  # pyright: ignore[reportMissingImports]
+import warnings
+
+# Suppress annoying sklearn warnings about feature names
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
+warnings.filterwarnings("ignore", message="`sklearn.utils.parallel.delayed` should be used")
 
 from config import APP_DATA_DIR, INITIAL_BALANCE
 from data_fetcher import StockDataFetcher
@@ -55,6 +61,8 @@ from price_move_predictor import PriceMovePredictor
 from holdings_tracker import HoldingsTracker
 from potentials_tracker import PotentialsTracker
 from market_dashboard import MarketDashboard
+from prediction_service import PredictionService
+from backend_manager import BackendManager
 
 # Import new modules
 try:
@@ -200,8 +208,8 @@ class StockerApp:
         try:
             from ml_scheduler import MLScheduler
             self.ml_scheduler = MLScheduler(self, APP_DATA_DIR)
-            self.ml_scheduler.start()
-            logger.info("ML Scheduler initialized and started")
+            # self.ml_scheduler.start()
+            logger.info("ML Scheduler initialized (AUTO-START DISABLED)")
         except Exception as e:
             logger.warning(f"Could not initialize ML Scheduler: {e}")
             self.ml_scheduler = None
@@ -243,11 +251,7 @@ class StockerApp:
         else:
             self.seeker_ai = None
         
-        # Backend server process
-        self.backend_process = None
-        
-        # Start backend server automatically
-        self._start_backend_server()
+        # Seeker AI (legacy config preservation)
         
         # Load preferences and store as instance variables
         self.saved_language = self.preferences.get_language()
@@ -297,6 +301,17 @@ class StockerApp:
         # Load portfolio balance
         self._update_portfolio_display()
         
+        # Initialize Prediction Service (Decoupled Logic) - MUST BE BEFORE VERIFICATION
+        self.prediction_service = PredictionService(
+            self.predictions_tracker,
+            self.data_fetcher,
+            self.learning_tracker
+        )
+        # Wire up callbacks (Use root.after for Thread Safety!)
+        self.prediction_service.on_verification_complete = lambda preds: self.root.after(0, self._on_verification_complete_ui, preds)
+        self.prediction_service.on_auto_train_trigger = lambda: self.root.after(0, self._trigger_auto_training)
+        self.prediction_service.on_status_update = lambda: self.root.after(0, lambda: (self._update_predictions_display(), self._update_ml_status()))
+
         # Verify predictions on startup
         self._verify_predictions_on_startup()
         
@@ -328,10 +343,10 @@ class StockerApp:
         self._schedule_auto_training()
         
         # Check for auto-training on startup (after delay)
-        self.root.after(5000, self.auto_training.check_and_train)
+        # self.root.after(5000, self.auto_training.check_and_train)
         
         # Start automatic self-learning (scans stocks and makes predictions automatically)
-        self.root.after(10000, self.auto_learner.start)  # Start after 10 seconds
+        # self.root.after(10000, self.auto_learner.start)  # Start after 10 seconds
         
         # Start continuous backtesting (tests algorithm on random historical points)
         # DISABLED: Backtesting now runs manually via "Run Backtest" button
@@ -359,122 +374,56 @@ class StockerApp:
         
         # Start periodic portfolio snapshot updates (daily)
         self._schedule_portfolio_snapshots()
+
+        # Initialize Prediction Service (Decoupled Logic)
+        self.prediction_service = PredictionService(
+            self.predictions_tracker,
+            self.data_fetcher,
+            self.learning_tracker
+        )
+        # Wire up callbacks (Use root.after for Thread Safety!)
+        self.prediction_service.on_verification_complete = lambda preds: self.root.after(0, self._on_verification_complete_ui, preds)
+        self.prediction_service.on_auto_train_trigger = lambda: self.root.after(0, self._trigger_auto_training)
+        self.prediction_service.on_status_update = lambda: self.root.after(0, lambda: (self._update_predictions_display(), self._update_ml_status()))
         
         # Handle cleanup on window close
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         
-        # Start periodic backend health check
-        self._start_backend_health_check()
+        # Initialize Backend Manager (Decoupled Logic)
+        self.backend_manager = BackendManager()
+        self.backend_manager.start()
+        
+        # Start periodic health status check for UI (just monitoring, logic is in manager)
+        self._schedule_backend_monitor()
     
-    def _is_backend_running(self) -> bool:
-        """Check if backend server is already running on port 5000"""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2)  # Increased timeout
-            result = sock.connect_ex(('127.0.0.1', 5000))  # Use 127.0.0.1 instead of localhost
-            sock.close()
-            return result == 0
-        except Exception as e:
-            logger.debug(f"Error checking backend status: {e}")
-            return False
-    
-    def _start_backend_health_check(self):
-        """Periodically check if backend is running and restart if needed"""
-        def check_backend():
+    def _schedule_backend_monitor(self):
+        """Periodically check backend status for the UI"""
+        def check_status():
             try:
-                if not self._is_backend_running():
-                    # Backend is not running, try to start it
-                    if self.backend_process is None or (self.backend_process.poll() is not None):
-                        logger.info("Backend server not running, attempting to start...")
-                        self._start_backend_server()
-                else:
-                    # Backend is running, check if our process is still alive
-                    if self.backend_process and self.backend_process.poll() is not None:
-                        # Process died but port is still open (maybe another instance?)
-                        logger.info("Backend process died but port is still open")
-                        self.backend_process = None
+                if not self.backend_manager.is_running():
+                    logger.warning("Backend server down, attempting restart via manager...")
+                    self.backend_manager.start()
             except Exception as e:
-                logger.error(f"Error in backend health check: {e}")
+                logger.error(f"Error in backend monitor: {e}")
+            self.root.after(30000, check_status)
             
-            # Schedule next check in 30 seconds
-            self.root.after(30000, check_backend)
-        
-        # Start first check after 10 seconds
-        self.root.after(10000, check_backend)
-    
-    def _start_backend_server(self):
-        """Start the backend server automatically if not already running"""
-        def start_in_background():
+        self.root.after(10000, check_status)
+
+    def _on_closing(self):
+        """Handle application shutdown"""
+        if messagebox.askokcancel("Quit", "Do you want to quit?"):
             try:
-                # Check if backend is already running
-                if self._is_backend_running():
-                    logger.info("Backend server is already running on port 5000")
-                    return
-                
-                logger.info("Starting backend server automatically...")
-                
-                # Check if Flask is installed
-                try:
-                    import flask
-                except ImportError:
-                    logger.warning("Flask is not installed. Backend server cannot start. Install with: pip install flask flask-cors")
-                    return
-                
-                # Get the path to backend_proxy.py
-                backend_script = Path(__file__).parent / "backend_proxy.py"
-                
-                if not backend_script.exists():
-                    logger.error(f"Backend script not found at {backend_script}")
-                    return
-                
-                # Start backend in a separate process
-                # Use CREATE_NO_WINDOW on Windows to hide the console window
-                # Don't pipe stdout/stderr so we can see errors, but redirect to devnull to suppress normal output
-                if sys.platform == 'win32':
-                    self.backend_process = subprocess.Popen(
-                        [sys.executable, str(backend_script)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                        creationflags=subprocess.CREATE_NO_WINDOW
-                    )
-                else:
-                    self.backend_process = subprocess.Popen(
-                        [sys.executable, str(backend_script)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE
-                    )
-                
-                # Wait a bit for server to start
-                time.sleep(5)  # Increased wait time
-                
-                # Check if process is still running
-                if self.backend_process.poll() is not None:
-                    # Process has terminated
-                    stderr_output = self.backend_process.stderr.read().decode('utf-8', errors='ignore')
-                    logger.error(f"Backend server process terminated immediately. Error: {stderr_output}")
-                    self.backend_process = None
-                    return
-                
-                # Verify it started by checking the port
-                if self._is_backend_running():
-                    logger.info("✅ Backend server started successfully on port 5000")
-                else:
-                    # Check for errors in stderr
-                    try:
-                        stderr_output = self.backend_process.stderr.read().decode('utf-8', errors='ignore')
-                        if stderr_output:
-                            logger.warning(f"Backend server may not have started properly. Error output: {stderr_output[:500]}")
-                    except (IOError, OSError, AttributeError) as e:
-                        logger.debug(f"Could not read backend stderr: {e}")
-                    logger.warning("Backend server may not have started properly - port 5000 not responding")
-                    
+                # Stop backend via manager
+                if hasattr(self, 'backend_manager'):
+                    self.backend_manager.stop()
             except Exception as e:
-                logger.error(f"Error starting backend server: {e}", exc_info=True)
-                logger.info("App will continue using direct yfinance fallback")
-        
-        # Start in background thread to avoid blocking UI
-        thread = threading.Thread(target=start_in_background)
-        thread.daemon = True
+                logger.error(f"Error checking backend status: {e}")
+            
+            # Stop recurring tasks
+            self.is_running = False
+            
+            # Close the main window
+            self.root.destroy()
         thread.start()
     
     def _on_closing(self):
@@ -497,76 +446,24 @@ class StockerApp:
         self.root.destroy()
     
     def _verify_predictions_on_startup(self):
-        """Verify all active predictions when app starts - only checks predictions that have reached their target date"""
-        def verify_in_background():
-            try:
-                logger.info("Verifying predictions that have reached their target date...")
-                # Only verify predictions that have reached their estimated target date
-                result = self.predictions_tracker.verify_all_active_predictions(self.data_fetcher, check_all=False)
-                if result['verified'] > 0:
-                    newly_verified = result.get('newly_verified', [])
-                    # Record learning events for verified predictions
-                    for pred in newly_verified:
-                        if pred.get('was_correct') is not None:
-                            self.learning_tracker.record_verified_prediction(
-                                pred.get('was_correct', False),
-                                pred.get('strategy', 'trading')
-                            )
-                    self.root.after(0, self._show_verification_results, result, newly_verified)
-                    # Trigger auto-training on verified predictions
-                    self.root.after(0, self._trigger_auto_training)
-            except Exception as e:
-                logger.error(f"Error verifying predictions: {e}")
-        
-        thread = threading.Thread(target=verify_in_background)
-        thread.daemon = True
-        thread.start()
+        """Verify all active predictions when app starts"""
+        # Run a single task immediately
+        self.prediction_service.run_verification_task()
     
     def _start_periodic_verification(self):
         """Start periodic automatic verification of predictions"""
         # Check every hour (3600000 milliseconds)
-        check_interval_ms = 3600000  # 1 hour
+        check_interval_ms = 3600000 
         
-        def periodic_check():
-            def verify_in_background():
-                try:
-                    logger.info("Periodic verification of predictions...")
-                    result = self.predictions_tracker.verify_all_active_predictions(self.data_fetcher)
-                    if result['verified'] > 0:
-                        newly_verified = result.get('newly_verified', [])
-                        # Record learning events for verified predictions
-                        for pred in newly_verified:
-                            if pred.get('was_correct') is not None:
-                                # Create outcome dict
-                                outcome = {
-                                    'was_correct': pred.get('was_correct', False),
-                                    'actual_price_change': pred.get('actual_price_change', 0.0),
-                                    'target_hit': pred.get('was_correct', False) and pred.get('action') in ['BUY', 'SELL'],
-                                }
-                                self.learning_tracker.record_verified_prediction(
-                                    pred.get('was_correct', False),
-                                    pred.get('strategy', 'trading'),
-                                    prediction_data=pred,
-                                    actual_outcome=outcome
-                                )
-                        self.root.after(0, self._show_verification_notifications, newly_verified)
-                        self.root.after(0, self._update_predictions_display)
-                        # Trigger auto-training
-                        self.root.after(0, self._trigger_auto_training)
-                        # Update ML status
-                        self.root.after(0, self._update_ml_status)
-                except Exception as e:
-                    logger.error(f"Error in periodic verification: {e}")
-            
-            thread = threading.Thread(target=verify_in_background)
-            thread.daemon = True
-            thread.start()
-            
-            # Schedule next check
-            self.root.after(check_interval_ms, periodic_check)
-        
-        # Start first check after 1 hour
-        self.root.after(check_interval_ms, periodic_check)
+        # Use the service's scheduler with Tkinter's root.after
+        self.prediction_service.start_periodic_verification(
+            interval_ms=check_interval_ms,
+            scheduler_func=self.root.after
+        )
+
+    def _on_verification_complete_ui(self, newly_verified):
+        """Callback for UI updates after verification"""
+        self._show_verification_notifications(newly_verified)
     
     def _start_trend_change_verification(self):
         """Start periodic automatic verification of trend change predictions"""
@@ -3815,8 +3712,10 @@ class StockerApp:
                     target_date_str = "N/A"
             
             # Format prices in USD
-            entry_usd = f"${pred['entry_price']:,.2f}"
-            target_usd = f"${pred['target_price']:,.2f}"
+            entry_price = pred.get('entry_price', 0)
+            target_price = pred.get('target_price', 0)
+            entry_usd = f"${entry_price:,.2f}"
+            target_usd = f"${target_price:,.2f}"
             
             values = (
                 pred['id'],
@@ -9070,14 +8969,20 @@ By using this application, you acknowledge that you understand and accept these 
                             fg=theme['text_secondary']
                         )
                 
-                self.root.after(0, update_ui)
+                try:
+                    self.root.after(0, update_ui)
+                except RuntimeError:
+                    pass # Ignore if main loop is not running (e.g. headless)
                 
             except Exception as e:
                 logger.error(f"Error updating S&P 500 comparison: {e}")
-                self.root.after(0, lambda: self.sp500_label.config(
-                    text="S&P 500: Error",
-                    fg=self.theme_manager.get_theme()['text_secondary']
-                ))
+                try:
+                    self.root.after(0, lambda: self.sp500_label.config(
+                        text="S&P 500: Error",
+                        fg=self.theme_manager.get_theme()['text_secondary']
+                    ))
+                except RuntimeError:
+                    pass
         
         # Run in background thread to avoid blocking UI
         thread = threading.Thread(target=update_in_background, daemon=True)
