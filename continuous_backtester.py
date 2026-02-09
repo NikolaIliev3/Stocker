@@ -17,6 +17,12 @@ import time
 from data_fetcher import StockDataFetcher
 from hybrid_predictor import HybridStockPredictor
 
+# Import Quant Settings
+try:
+    from quant_config import IS_QUANT_MODE
+except ImportError:
+    IS_QUANT_MODE = False
+
 # Import benchmarking if available
 try:
     from model_benchmarking import ModelBenchmarker
@@ -120,7 +126,9 @@ class ContinuousBacktester:
             'JNJ', 'PFE', 'UNH', 'ABT',
             'BA', 'CAT', 'GE', 'MMM',
             'XOM', 'CVX', 'COP',
-            'DIS', 'V', 'MA', 'PG', 'NKE'
+            'DIS', 'V', 'MA', 'PG', 'NKE',
+            # Regime Testers (Volatile, Down-trending, or Sideways)
+            'INTC', 'PYPL', 'PARA', 'SNAP', 'UPST', 'RIVN', 'BABA', 'PFE', 'UBER'
         ]
         
         logger.info("Continuous backtester initialized")
@@ -516,9 +524,9 @@ class ContinuousBacktester:
                     # Pick random date based on strategy requirements
                     # End date: at least (lookforward + buffer) days ago to ensure we have future data
                     # Increased buffer to 50 days to account for weekends/holidays and data availability
-                    end_date = datetime.now() - timedelta(days=lookforward + 50)  # Buffer for weekends/holidays
-                    # Start date: 3 years ago (reduced from 5 to focus on more recent, available data)
-                    start_date = datetime.now() - timedelta(days=1095)  # 3 years ago
+                    # OUT-OF-SAMPLE VERIFICATION (2025+)
+                    start_date = datetime(2025, 1, 2)
+                    end_date = datetime.now() - timedelta(days=lookforward + 15)
                     
                     # Ensure start_date < end_date
                     if start_date >= end_date:
@@ -539,13 +547,20 @@ class ContinuousBacktester:
                     )
                     
                     if result:
-                        tests_run += 1
-                        if result['was_correct']:
-                            correct += 1
+                        # User Request: "If the ML decides to hold... Just ignore it."
+                        # Only count Active Predictions (BUY/SELL) for scoring
+                        if result.get('predicted_action') != 'HOLD':
+                            tests_run += 1
+                            if result['was_correct']:
+                                correct += 1
+                            else:
+                                incorrect += 1
+                            if tests_run <= 3 or tests_run % 5 == 0:  # Log first 3 and every 5th
+                                logger.info(f"✅ Test {tests_run}/{tests_to_run}: {symbol} at {test_date.strftime('%Y-%m-%d')} - {'✓' if result['was_correct'] else '✗'}")
                         else:
-                            incorrect += 1
-                        if tests_run <= 3 or tests_run % 5 == 0:  # Log first 3 and every 5th
-                            logger.info(f"✅ Test {tests_run}/{tests_to_run}: {symbol} at {test_date.strftime('%Y-%m-%d')} - {'✓' if result['was_correct'] else '✗'}")
+                            # Log skipped HOLDs occasionally
+                            if skipped % 10 == 0:
+                                logger.debug(f"ℹ️ Ignoring HOLD signal for {symbol} (risk avoidance)")
                         
                         # Reset consecutive skip counter if successful
                         consecutive_skips = 0
@@ -642,13 +657,21 @@ class ContinuousBacktester:
                         logger.info(f"   • {strategy.title()}: {s['accuracy']:.1f}% ({s['correct']}/{s['total']})")
                         strategy_details.append(f"{strategy.title()}: {s['accuracy']:.1f}% ({s['correct']}/{s['total']})")
                 
-                # Show notification popup
-                self.app.root.after(0, self._show_backtest_complete_notification, 
-                                   new_tests, overall_accuracy, strategy_details)
+                # Show notification popup if UI is available
+                if self.app and hasattr(self.app, 'root') and self.app.root:
+                    try:
+                        self.app.root.after(0, self._show_backtest_complete_notification, 
+                                           new_tests, overall_accuracy, strategy_details)
+                    except Exception:
+                        pass
             else:
                 logger.warning("⚠️ Continuous backtest complete: No valid test points found. Check date ranges and data availability.")
                 # Show notification for no results
-                self.app.root.after(0, self._show_backtest_complete_notification, 0, 0, [])
+                if self.app and hasattr(self.app, 'root') and self.app.root:
+                    try:
+                        self.app.root.after(0, self._show_backtest_complete_notification, 0, 0, [])
+                    except Exception:
+                        pass
             
             # Store tested strategies for this run (for report filtering)
             self.last_tested_strategies = tested_strategies
@@ -747,6 +770,26 @@ class ContinuousBacktester:
                 logger.debug(f"Skipping {symbol} at {test_date.date()}: Insufficient history ({len(hist_list)} days, need {min_required})")
                 return None
             
+            # --- CONTAMINATION GUARDRAIL ---
+            # Check if we are testing on data the model was trained on
+            if hasattr(hybrid_predictor, 'ml_predictor') and hybrid_predictor.ml_predictor:
+                ml_metadata = hybrid_predictor.ml_predictor.metadata
+                if ml_metadata and 'training_data_end' in ml_metadata:
+                    try:
+                        train_end = pd.to_datetime(ml_metadata['training_data_end'])
+                        # If test_date is BEFORE training_end, we are inside training data = CONTAMINATION
+                        # We allow a small buffer (e.g. 1 day) but generally this invalidates the test
+                        if test_date <= train_end:
+                            # Log warning but allow test to proceed (so we can see the fake 100% accuracy), 
+                            # but mark it in logs prominently
+                            if test_number == 0: # Only log once per batch to avoid spam
+                                logger.critical(f"⚠️ DATA LEAKAGE DETECTED: Testing on {test_date.date()} which is BEFORE model training end date ({train_end.date()})")
+                                logger.critical(f"   Accuracy will be artificially high (100% is expected). This is INVALID for performance verification.")
+                    except:
+                        pass
+            # -------------------------------
+
+            
             # Convert to DataFrame for easier manipulation
             df_hist = pd.DataFrame(hist_list)
             df_hist['date'] = pd.to_datetime(df_hist['date'])
@@ -800,8 +843,20 @@ class ContinuousBacktester:
             future_price = float(df_future.iloc[-1]['close'])
             actual_change_pct = ((future_price - test_price) / test_price) * 100
             
-            # Convert history to format expected by analyzer (already in correct format from data_fetcher)
-            history_data = {'data': hist_list}
+            # CRITICAL LEAK FIX: Use the FILTERED DataFrame for history to ensure NO future data passes
+            # (Raw hist_list from data_fetcher might contain future data if end_date is ignored/cached)
+            clean_history_list = df_hist_filtered.reset_index(drop=True).apply(
+                lambda x: {
+                    "date": x['date'].strftime("%Y-%m-%d"),
+                    "open": float(x['open']), 
+                    "high": float(x['high']),
+                    "low": float(x['low']),
+                    "close": float(x['close']),
+                    "volume": int(x['volume'])
+                }, axis=1
+            ).tolist()
+            
+            history_data = {'data': clean_history_list}
             
             # Create stock_data dict (simulate what we'd have at test_date)
             stock_data = {
@@ -864,43 +919,114 @@ class ContinuousBacktester:
                             f"price_change={actual_change_pct:.2f}%")
             
             # Determine if prediction was correct
-            # STANDARD LOGIC (Fixed):
-            # - BUY = Bullish (expecting price to go UP)
-            # - SELL = Bearish (expecting price to go DOWN)
+            # QUANT MODE SYNC: Use dynamic targets instead of hardcoded 3%
+            # Determine if prediction was correct (PATH-AWARE EVALUATION)
+            # This scans every day in the window to see if levels were hit sequentially
             was_correct = None
-            if predicted_action == 'BUY':
-                # BUY is correct if price went UP
-                was_correct = actual_change_pct > 0
-                # Detailed logging for BUY predictions (first 20)
-                if test_number < 20:
-                    logger.debug(f"BUY prediction evaluation: price_change={actual_change_pct:.2f}%, "
-                               f"correct={was_correct}, ml_action={ml_pred.get('action', 'N/A')}, "
-                               f"rule_action={rule_pred.get('action', 'N/A')}")
-            elif predicted_action == 'SELL':
-                # SELL is correct if price went DOWN (avoided loss)
-                was_correct = actual_change_pct < 0
-                # Detailed logging for SELL predictions
-                if test_number < 20:
-                    logger.info(f"SELL prediction evaluation: price_change={actual_change_pct:.2f}%, "
-                              f"correct={was_correct}, ml_action={ml_pred.get('action', 'N/A')}, "
-                              f"rule_action={rule_pred.get('action', 'N/A')}, "
-                              f"ml_conf={ml_pred.get('confidence', 0):.1f}%, "
-                              f"rule_conf={rule_pred.get('confidence', 0):.1f}%")
-            elif predicted_action == 'HOLD':
-                # HOLD is correct if price didn't move much (strategy-specific thresholds)
-                if strategy == "trading":
-                    was_correct = abs(actual_change_pct) < 3
-                elif strategy == "mixed":
-                    was_correct = abs(actual_change_pct) < 5
-                else:  # investing
-                    # For investing (1.5 year lookforward), allow up to 20% movement for HOLD
-                    # Over 1.5 years, stocks typically move 15-25%, so 20% is reasonable
-                    was_correct = abs(actual_change_pct) < 20
-            elif predicted_action == 'AVOID':
-                # AVOID (legacy, now mapped to BUY in inverted logic) is correct if price went DOWN
-                was_correct = actual_change_pct < 0
+            stop_loss = recommendation.get('stop_loss', 0)
+            
+            # SLIPPAGE MODELING (Rule #13): Apply 0.20% penalty to entry/exit
+            slippage_factor = 0.0020
+            effective_test_price = test_price * (1 + slippage_factor if predicted_action == 'BUY' else 1 - slippage_factor)
+            
+            # CRITICAL FIX: Normalize target and stop_loss validation
+            # Sometimes target is a delta (e.g. 2.50) instead of price (e.g. 152.50)
+            # If target is unreasonably low (< 50% of price), assume it's a delta
+            if predicted_target < test_price * 0.5:
+                # It is likely a delta/change magnitude
+                # If negative and action is SELL, subtract it. If positive and BUY, add it.
+                # But typically ML predicts positive magnitude for target.
+                actual_target_level = test_price + predicted_target if predicted_action == 'BUY' else test_price - predicted_target
             else:
-                return None  # Unknown action
+                actual_target_level = predicted_target
+
+            # Normalize Stop Loss too
+            if stop_loss > 0 and stop_loss < test_price * 0.5:
+                 actual_stop_loss = test_price - stop_loss if predicted_action == 'BUY' else test_price + stop_loss
+            else:
+                 actual_stop_loss = stop_loss
+
+            # Scan path
+            for _, row in df_future.iterrows():
+                open_price = float(row.get('open', row['close']))
+                high = float(row.get('high', row['close']))
+                low = float(row.get('low', row['close']))
+                
+                if predicted_action == 'BUY':
+                    # 1. IMMEDIATE OPEN CHECK (Gaps)
+                    if actual_stop_loss > 0 and open_price <= actual_stop_loss:
+                        was_correct = False
+                        future_price = open_price # Exited at open gap
+                        break
+                    if high >= actual_target_level and open_price >= actual_target_level:
+                        was_correct = True
+                        future_price = open_price # Exited at open gap
+                        break
+                        
+                    # 2. Check Stop Loss (Worst case: hit low before target)
+                    if actual_stop_loss > 0 and low <= actual_stop_loss:
+                        was_correct = False
+                        future_price = actual_stop_loss  # Stopped out at SL
+                        break
+                    # 3. Check Target (Best case: hit high)
+                    if high >= actual_target_level and actual_target_level > effective_test_price:
+                        was_correct = True
+                        future_price = actual_target_level
+                        break
+                        
+                elif predicted_action == 'SELL':
+                    # 1. IMMEDIATE OPEN CHECK
+                    if actual_stop_loss > 0 and open_price >= actual_stop_loss:
+                        was_correct = False
+                        future_price = open_price
+                        break
+                    if low <= actual_target_level and open_price <= actual_target_level:
+                        was_correct = True
+                        future_price = open_price
+                        break
+                        
+                    # 2. Check Stop Loss
+                    if actual_stop_loss > 0 and high >= actual_stop_loss:
+                        was_correct = False
+                        future_price = actual_stop_loss
+                        break
+                    # 3. Check Target
+                    if low <= actual_target_level and actual_target_level < effective_test_price:
+                        was_correct = True
+                        future_price = actual_target_level
+                        break
+            
+            # Expiration Check: Fallback if no level hit within window
+            if was_correct is None:
+                # Use final horizon price with slippage
+                horizon_price = float(df_future.iloc[-1]['close'])
+                effective_horizon_price = horizon_price * (1 - slippage_factor if predicted_action == 'BUY' else 1 + slippage_factor)
+                actual_change_pct = ((effective_horizon_price - effective_test_price) / effective_test_price) * 100
+                future_price = horizon_price
+                
+                if predicted_action == 'BUY':
+                    if strategy == "trading":
+                        was_correct = actual_change_pct >= 3.0
+                    elif strategy == "mixed":
+                        was_correct = actual_change_pct >= 5.0
+                    else:  # investing
+                        was_correct = actual_change_pct >= 10.0
+                elif predicted_action == 'SELL':
+                    if strategy == "trading":
+                        was_correct = actual_change_pct <= -3.0
+                    elif strategy == "mixed":
+                        was_correct = actual_change_pct <= -5.0
+                    else:  # investing
+                        was_correct = actual_change_pct <= -10.0
+                elif predicted_action == 'HOLD':
+                    was_correct = abs(actual_change_pct) < 3
+                elif predicted_action == 'AVOID':
+                    was_correct = actual_change_pct < 0
+                else:
+                    return None
+            else:
+                # Recalculate change pct for the hit level
+                actual_change_pct = ((future_price - effective_test_price) / effective_test_price) * 100
             
             # Store test result
             test_result = {
@@ -914,6 +1040,8 @@ class ContinuousBacktester:
                 'predicted_target': predicted_target,
                 'was_correct': was_correct,
                 'confidence': recommendation.get('confidence', 0),
+                'market_regime': recommendation.get('market_regime', 'unknown'),
+                'reasoning': recommendation.get('reasoning', ''),
                 'timestamp': datetime.now().isoformat()
             }
             
@@ -996,7 +1124,32 @@ class ContinuousBacktester:
     def get_recent_results(self, limit: int = 20) -> List[Dict]:
         """Get recent backtest results"""
         return self.results['test_details'][-limit:]
-    
+
+    def calculate_precision_score(self, results: List[Dict]) -> Dict:
+        """
+        Calculate precision score (Accuracy excluding HOLD predictions).
+        This metric focuses on 'Actionable' accuracy - when we decide to move, are we right?
+        """
+        total_actions = 0
+        correct_actions = 0
+        
+        for r in results:
+            prediction = r.get('predicted_action', 'HOLD')
+            
+            # We ONLY care about BUY or SELL (User Veto: "I want it to count whenever Megamind says BUY or SELL")
+            if prediction in ['BUY', 'SELL']:
+                total_actions += 1
+                if r.get('was_correct', False):
+                    correct_actions += 1
+                    
+        precision = (correct_actions / total_actions * 100) if total_actions > 0 else 0.0
+        
+        return {
+            'precision': precision,
+            'total_actions': total_actions,
+            'correct_actions': correct_actions
+        }
+
     def _learn_from_backtest_results(self):
         """Analyze backtest results and use them to improve the algorithm"""
         try:
@@ -1020,14 +1173,19 @@ class ContinuousBacktester:
                 if len(results) < 10:
                     continue
                 
-                # Calculate accuracy
+                # Calculate accuracy (Original - includes HOLDs)
                 correct = sum(1 for r in results if r.get('was_correct'))
-                accuracy = correct / len(results) * 100
+                raw_accuracy = correct / len(results) * 100
+
+                # Calculate PRECISION (New - excludes HOLDs, Actionable Only)
+                score = self.calculate_precision_score(results)
+                precision = score['precision']
+                actionable_count = score['total_actions']
                 
-                # Get previous accuracy for comparison
-                previous_accuracy = 0
+                # Get previous metrics for comparison
+                previous_precision = 0
                 if 'insights' in self.results and strategy in self.results['insights']:
-                    previous_accuracy = self.results['insights'][strategy].get('recent_accuracy', 0)
+                    previous_precision = self.results['insights'][strategy].get('recent_precision', 0)
                 
                 # 1. ADJUST WEIGHTS BASED ON BACKTEST FAILURES
                 incorrect_results = [r for r in results if not r.get('was_correct')]
@@ -1038,37 +1196,40 @@ class ContinuousBacktester:
                 if len(results) >= 20:
                     self._use_backtest_results_as_training_data(strategy, results)
                 
-                # 3. AUTO-RETRAIN IF ACCURACY DROPS
-                accuracy_drop = previous_accuracy - accuracy if previous_accuracy > 0 else 0
-                if accuracy_drop > 15:  # Accuracy dropped by more than 15%
-                    logger.warning(
-                        f"⚠️ Accuracy Drop Detected ({strategy}): "
-                        f"{previous_accuracy:.1f}% → {accuracy:.1f}% (drop: {accuracy_drop:.1f}%)"
-                    )
-                    self._trigger_auto_retrain(strategy, results)
-                
-                # Log accuracy status
-                if accuracy < 40:
-                    logger.warning(
-                        f"⚠️ Backtest Alert ({strategy}): Low accuracy ({accuracy:.1f}%). "
-                        f"Auto-retraining triggered."
-                    )
-                    self._trigger_auto_retrain(strategy, results)
-                elif accuracy > 60:
-                    logger.info(
-                        f"✅ Backtest Success ({strategy}): Good accuracy ({accuracy:.1f}%)!"
-                    )
+                # 3. AUTO-RETRAIN IF PRECISION DROPS (Actionable Only)
+                # Only check if we have enough actionable signals (>= 5) to trust the precision
+                if actionable_count >= 5:
+                    precision_drop = previous_precision - precision if previous_precision > 0 else 0
+                    
+                    if precision_drop > 15:  # Precision dropped by more than 15%
+                        logger.warning(
+                            f"⚠️ Precision Drop Detected ({strategy}): "
+                            f"{previous_precision:.1f}% → {precision:.1f}% (drop: {precision_drop:.1f}%)"
+                        )
+                        self._trigger_auto_retrain(strategy, results)
+                    
+                    # Log precision status & Retrain if low
+                    if precision < 50:
+                        logger.warning(
+                            f"⚠️ Backtest Alert ({strategy}): Low precision ({precision:.1f}%). "
+                            f"Auto-retraining triggered."
+                        )
+                        self._trigger_auto_retrain(strategy, results)
+                    elif precision > 70:
+                        logger.info(
+                            f"✅ Backtest Success ({strategy}): Good precision ({precision:.1f}%)!"
+                        )
                 
                 # Store insights
                 if 'insights' not in self.results:
                     self.results['insights'] = {}
                 
                 self.results['insights'][strategy] = {
-                    'recent_accuracy': accuracy,
+                    'recent_accuracy': raw_accuracy,
+                    'recent_precision': precision,
+                    'actionable_count': actionable_count,
                     'total_tests': len(results),
                     'correct': correct,
-                    'previous_accuracy': previous_accuracy,
-                    'accuracy_drop': accuracy_drop,
                     'last_updated': datetime.now().isoformat()
                 }
             
@@ -1220,29 +1381,49 @@ class ContinuousBacktester:
                     # Calculate price change
                     price_change_pct = ((future_price - test_price) / test_price) * 100
                     
-                    # Corrected Logic: Trend Following
-                    # Future Price Higher → BUY (Signal to Enter/Long)
-                    # Future Price Lower → SELL (Signal to Exit/Short)
+                    # --- QUANT MODE LABELING --
+                    threshold_buy = 3.0
+                    threshold_sell = -3.0
+                    
+                    if IS_QUANT_MODE and 'data' in hist_data:
+                         try:
+                             # Calculate ATR for dynamic labeling
+                             df = pd.DataFrame(hist_data['data'])
+                             df['tr1'] = df['high'] - df['low']
+                             df['tr2'] = abs(df['high'] - df['close'].shift())
+                             df['tr3'] = abs(df['low'] - df['close'].shift())
+                             df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+                             atr = df['tr'].rolling(14).mean().iloc[-1]
+                             
+                             # Dynamic Threshold: 2.0 * ATR
+                             atr_pct = (atr / test_price) * 100
+                             threshold_buy = max(2.0 * atr_pct, 1.5) # Minimum 1.5% to avoid noise
+                             threshold_sell = min(-2.0 * atr_pct, -1.5)
+                         except:
+                             pass
+                             
+                    # Apply Labeling Logic
+                    # Apply Labeling Logic
+                    # CRITICAL FIX: Binary BUY/HOLD Logic
+                    # We treat negative returns as "HOLD" (Inaction), not "SELL".
+                    # This prevents the model from learning distinct SELL patterns, enforcing a pure Upside/Action model.
                     if strategy == "trading":
-                        if price_change_pct >= 3:
+                        if price_change_pct >= threshold_buy:
                             label = "BUY"
-                        elif price_change_pct <= -3:
-                            label = "SELL"
                         else:
                             label = "HOLD"
                     elif strategy == "investing":
+                        # Investing stays fixed for now
                         if price_change_pct >= 10:
                             label = "BUY"
-                        elif price_change_pct <= -10:
-                            label = "SELL"
                         else:
                             label = "HOLD"
                     else:  # mixed
-                        if price_change_pct >= 5:
+                         # Mixed uses slightly wider bounds than trading
+                         mixed_buy = threshold_buy * 1.5
+                         if price_change_pct >= mixed_buy:
                             label = "BUY"
-                        elif price_change_pct <= -5:
-                            label = "SELL"
-                        else:
+                         else:
                             label = "HOLD"
                     
                     # Fetch historical data at test date using data_fetcher
@@ -1328,10 +1509,13 @@ class ContinuousBacktester:
             
             # If we have samples, try to combine with verified predictions to meet minimum requirement
             # Reduced minimum to 30 to allow more frequent retraining from backtest results
-            if len(training_samples) >= 30:
-                logger.info(
-                    f"📚 Converting {len(training_samples)} backtest results to training data for {strategy}"
-                )
+                if len(training_samples) >= 1000:
+                    logger.info(
+                        f"📚 Converting {len(training_samples)} backtest results to training data for {strategy}"
+                    )
+                else:
+                    logger.info(f"⚠️ Collected {len(training_samples)} samples, but minimum for safe retraining is 1000. Skipping to protect model stability.")
+                    return
                 
                 # Try to combine with verified predictions if we don't have enough samples
                 combined_samples = training_samples.copy()
@@ -1408,7 +1592,7 @@ class ContinuousBacktester:
                 else:
                     logger.debug(
                         f"⚠️ Insufficient samples for retraining ({strategy}): "
-                        f"{len(combined_samples)} samples (need 100). "
+                        f"{len(combined_samples)} samples (need 15). "
                         f"Will retry when more backtest results or verified predictions are available."
                     )
             

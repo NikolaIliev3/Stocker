@@ -87,7 +87,6 @@ class StockDataFetcher:
         self._last_backend_check = 0  # Timestamp of last check
         self._backend_check_interval = 30  # Recheck every 30 seconds
         
-        # Initialize new modules if available
         if HAS_NEW_MODULES:
             try:
                 self.data_provider = MultiDataProvider([YahooFinanceProvider()])
@@ -100,6 +99,92 @@ class StockDataFetcher:
         else:
             self.data_provider = None
             self.quality_checker = None
+            
+        # Sector ETF Mapping (GICS Sectors)
+        self.SECTOR_ETF_MAPPING = {
+            # Technology -> XLK
+            'AAPL': 'XLK', 'MSFT': 'XLK', 'NVDA': 'XLK', 'AMD': 'XLK', 'CRM': 'XLK', 
+            'ADBE': 'XLK', 'CSCO': 'XLK', 'INTC': 'XLK', 'ORCL': 'XLK', 'QCOM': 'XLK',
+            'TXN': 'XLK', 'DELL': 'XLK',
+            
+            # Communication Services -> XLC
+            'GOOGL': 'XLC', 'GOOG': 'XLC', 'META': 'XLC', 'NFLX': 'XLC', 'DIS': 'XLC',
+            'TMUS': 'XLC', 'CMCSA': 'XLC', 'VZ': 'XLC', 'T': 'XLC',
+            
+            # Consumer Discretionary -> XLY
+            'AMZN': 'XLY', 'TSLA': 'XLY', 'HD': 'XLY', 'MCD': 'XLY', 'NKE': 'XLY',
+            'SBUX': 'XLY', 'LOW': 'XLY', 'TGT': 'XLY', 'BKNG': 'XLY', 'TJX': 'XLY',
+            
+            # Consumer Staples -> XLP
+            'WMT': 'XLP', 'PG': 'XLP', 'KO': 'XLP', 'PEP': 'XLP', 'COST': 'XLP',
+            'PM': 'XLP', 'MO': 'XLP', 'EL': 'XLP', 'CL': 'XLP', 'MDLZ': 'XLP',
+            
+            # Financials -> XLF
+            'JPM': 'XLF', 'BAC': 'XLF', 'WFC': 'XLF', 'C': 'XLF', 'GS': 'XLF',
+            'MS': 'XLF', 'BLK': 'XLF', 'AXP': 'XLF', 'V': 'XLF', 'MA': 'XLF',
+            
+            # Healthcare -> XLV
+            'UNH': 'XLV', 'JNJ': 'XLV', 'LLY': 'XLV', 'MRK': 'XLV', 'ABBV': 'XLV',
+            'PFE': 'XLV', 'TMO': 'XLV', 'ABT': 'XLV', 'BMY': 'XLV', 'CVS': 'XLV',
+            'AMGN': 'XLV', 'GILD': 'XLV',
+            
+            # Industrials -> XLI
+            'CAT': 'XLI', 'DE': 'XLI', 'HON': 'XLI', 'UNP': 'XLI', 'UPS': 'XLI',
+            'GE': 'XLI', 'BA': 'XLI', 'LMT': 'XLI', 'RTX': 'XLI', 'MMM': 'XLI',
+            'FDX': 'XLI',
+            
+            # Energy -> XLE
+            'XOM': 'XLE', 'CVX': 'XLE', 'COP': 'XLE', 'EOG': 'XLE', 'SLB': 'XLE',
+            'MPC': 'XLE', 'PSX': 'XLE', 'VLO': 'XLE', 'OXY': 'XLE',
+            
+            # Materials -> XLB
+            'LIN': 'XLB', 'SHW': 'XLB', 'FCX': 'XLB', 'APD': 'XLB', 'NEM': 'XLB',
+            
+            # Real Estate -> XLRE
+            'PLD': 'XLRE', 'AMT': 'XLRE', 'EQIX': 'XLRE', 'CCI': 'XLRE', 'PSA': 'XLRE',
+            
+            # Utilities -> XLU
+            'NEE': 'XLU', 'DUK': 'XLU', 'SO': 'XLU', 'D': 'XLU', 'AEP': 'XLU',
+            
+            # Broad Market (Fallback)
+            'SPY': 'SPY', 'QQQ': 'QQQ', 'IWM': 'IWM', 'DIA': 'DIA'
+        }
+
+    def get_sector_etf(self, symbol: str) -> str:
+        """Returns the corresponding Sector ETF for a symbol."""
+        return self.SECTOR_ETF_MAPPING.get(symbol, 'SPY')  # Default to SPY (Market)
+        
+    def fetch_sector_data(self, etf_symbol: str, start_date: str = None, days: int = 365*5) -> pd.DataFrame:
+        """Fetches historical data for a sector ETF."""
+        logger.info(f"Fetching sector data for {etf_symbol}...")
+        try:
+            # Use fetch_stock_history with caching
+            data = self.fetch_stock_history(etf_symbol, period=f"{days}d")
+            
+            if not data or 'data' not in data:
+                # Fallback to direct yfinance if fetch failed
+                import yfinance as yf
+                ticker = yf.Ticker(etf_symbol)
+                period = f"{int(days/365)+1}y"
+                hist = ticker.history(period=period)
+                if hist.empty:
+                    return None
+                
+                # Standardize columns
+                hist.reset_index(inplace=True)
+                hist.columns = [col.lower() for col in hist.columns]
+                if 'date' in hist.columns:
+                    hist['date'] = hist['date'].dt.strftime('%Y-%m-%d')
+                return hist
+            
+            # Convert dict result to DataFrame
+            df = pd.DataFrame(data['data'])
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error fetching sector data for {etf_symbol}: {e}")
+            return None
+
     
     def _check_backend_available(self) -> bool:
         """Check if backend server is available"""
@@ -140,6 +225,11 @@ class StockDataFetcher:
     
     def get_stock_info(self, symbol):
         """Fetch basic stock info (price, name, etc)"""
+        # [FIX] Bypass info for symbols known to cause repetitive yfinance warnings (ETFs/ETNs)
+        if symbol.upper() in ['XLI', 'XLY', 'PARA']:
+            logger.debug(f"Bypassing yfinance info lookup for {symbol} (ETN/ETF Warning Avoidance)")
+            return {}
+            
         try:
             import yfinance as yf
             ticker = yf.Ticker(symbol.upper())
@@ -496,7 +586,7 @@ class StockDataFetcher:
                 def fetch_op():
                     import yfinance as yf
                     ticker = yf.Ticker(symbol.upper())
-                    return ticker.history(start=start_date, end=end_date, interval=interval, timeout=30)
+                    return ticker.history(start=start_date, end=end_date, interval=interval, timeout=30, auto_adjust=True)
                 
                 # Use retry logic
                 hist = self._retry_operation(fetch_op)

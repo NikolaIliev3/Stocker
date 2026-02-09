@@ -27,7 +27,7 @@ class RiskManager:
     
     def calculate_position_size(self, entry_price: float, stop_loss: float, 
                                confidence: float, risk_per_trade: float = 0.02,
-                               method: str = 'fixed_fraction') -> Dict:
+                               method: str = 'fixed_fraction', target_price: float = 0.0) -> Dict:
         """
         Calculate optimal position size using various methods
         
@@ -44,6 +44,12 @@ class RiskManager:
         if entry_price <= 0 or stop_loss <= 0:
             return {"error": "Invalid prices"}
         
+        # HARD LIMIT: Enforce -2.0% Quant Safety Floor globally
+        max_allowed_stop = entry_price * 0.98
+        if stop_loss < max_allowed_stop:
+             # Stop is too loose, force 2%
+             stop_loss = max_allowed_stop
+             
         # Calculate risk per share
         risk_per_share = abs(entry_price - stop_loss)
         if risk_per_share == 0:
@@ -71,14 +77,26 @@ class RiskManager:
             risk_amount = shares * risk_per_share
             
         elif method == 'kelly':
-            # Kelly Criterion (simplified)
+            # Full Kelly Criterion (Fractional 0.5 for stability)
+            # win_loss_ratio (b) = avg_win / avg_loss
             win_probability = confidence / 100.0
-            win_loss_ratio = abs(entry_price - stop_loss) / risk_per_share if risk_per_share > 0 else 1
             
-            kelly_fraction = (win_probability * win_loss_ratio - (1 - win_probability)) / win_loss_ratio
-            kelly_fraction = max(0, min(kelly_fraction, self.max_position_size))  # Cap at max
+            # Reward-to-Risk ratio
+            potential_win = abs(target_price - entry_price) if target_price > 0 else risk_per_share * 2
+            b = potential_win / risk_per_share if risk_per_share > 0 else 1.0
             
-            position_value = self.portfolio_value * kelly_fraction
+            # Kelly Formula: f* = (bp - q) / b
+            # q = 1 - p
+            p = win_probability
+            q = 1.0 - p
+            
+            k_star = (b * p - q) / b if b > 0 else 0
+            
+            # Use Half-Kelly (conservative) and cap at max_position_size
+            fractional_kelly = k_star * 0.5
+            position_fraction = max(0, min(fractional_kelly, self.max_position_size))
+            
+            position_value = self.portfolio_value * position_fraction
             shares = position_value / entry_price
             risk_amount = shares * risk_per_share
             
@@ -99,19 +117,58 @@ class RiskManager:
             position_value = self.portfolio_value * f_value
             shares = position_value / entry_price
             risk_amount = shares * risk_per_share
+            position_value = self.portfolio_value * f_value
+            shares = position_value / entry_price
+            risk_amount = shares * risk_per_share
+
+        elif method == 'volatility_scaled':
+            # Inverse Volatility Scaling (Risk Parity approach)
+            # Target Volatility for the Position (e.g., impact on portfolio)
+            # Default target: 0.5% daily volatility impact (relatively conservative)
+            target_vol_impact = 0.005 
+            
+            # We need the asset's volatility (std dev of returns)
+            # Use 'risk_per_trade' as a proxy for Target Volatility % if provided, otherwise default
+            if risk_per_trade > 0:
+                target_vol_impact = risk_per_trade / 4.0 # Scale down aggressive risk settings
+            
+            # Asset volatility estimate
+            # If not provided explicitly, estimate from stop loss distance (assuming stop = 2*ATR)
+            # ATR ~ Volatility. Stop dist = 2*Vol -> Vol = StopDist / 2
+            # Vol % = (StopDist / Price) / 2
+            stop_dist_pct = abs(entry_price - stop_loss) / entry_price
+            estimated_volatility = stop_dist_pct / 2.0
+            
+            if estimated_volatility > 0:
+                # Formula: (Portfolio * TargetVol) / AssetVol
+                optimal_position_value = (self.portfolio_value * target_vol_impact) / estimated_volatility
+                
+                # Cap at max position size
+                optimal_position_value = min(optimal_position_value, self.portfolio_value * self.max_position_size)
+                
+                shares = optimal_position_value / entry_price
+                position_value = optimal_position_value
+                risk_amount = shares * abs(entry_price - stop_loss)
+            else:
+                # Fallback if volatility is zero (shouldn't happen)
+                shares = 0
+                position_value = 0
+                risk_amount = 0
+
         else:
             # Default to fixed fraction
             shares = risk_amount / risk_per_share
             position_value = shares * entry_price
         
         return {
-            'shares': round(shares, 4),
+            'shares': float(shares), # Ensure float for JSON serialization
             'position_value': round(position_value, 2),
             'risk_amount': round(risk_amount, 2),
+            'stop_loss': round(stop_loss, 2), # Return enforced stop loss
             'risk_percentage': round((risk_amount / self.portfolio_value) * 100, 2),
             'position_percentage': round((position_value / self.portfolio_value) * 100, 2),
             'method': method,
-            'risk_reward_ratio': round(risk_per_share / risk_per_share, 2) if risk_per_share > 0 else 0
+            'risk_reward_ratio': round(abs(target_price - entry_price) / risk_per_share, 2) if risk_per_share > 0 and target_price > 0 else 1.0
         }
     
     def recommend_stop_loss(self, entry_price: float, current_price: float,
@@ -161,11 +218,15 @@ class RiskManager:
             stop_loss = entry_price * 0.95
             reasoning.append("Default: 5% below entry")
         
-        # Ensure stop loss is reasonable (not more than 10% below entry)
-        max_loss = entry_price * 0.90
-        if stop_loss < max_loss:
-            stop_loss = max_loss
-            reasoning.append("Adjusted: Capped at 10% maximum loss")
+        # HARD LIMIT: Never allow more than -2% risk per share on entry for Quant Mode
+        max_allowed_stop = entry_price * 0.98
+        if stop_loss > max_allowed_stop:
+            # If the user-calculated stop is tighter than 2% (e.g. -1%), keep it.
+            # We only intervene if it's too loose.
+            pass
+        elif stop_loss < max_allowed_stop:
+             stop_loss = max_allowed_stop
+             reasoning.append("Quant Safety: Capped at -2.0% Hard Stop Loss")
         
         risk_amount = entry_price - stop_loss
         risk_percentage = (risk_amount / entry_price) * 100

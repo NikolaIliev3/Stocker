@@ -63,7 +63,7 @@ class MockBroker:
             total += data["qty"] * data["avg_price"] 
         return total
 
-    def execute_order(self, symbol, action, quantity, current_price, timestamp=None):
+    def execute_order(self, symbol, action, quantity, current_price, timestamp=None, target_price=None, stop_loss=None):
         """
         Execute a buy/sell order.
         action: 'BUY' or 'SELL'
@@ -90,7 +90,7 @@ class MockBroker:
                 self.portfolio["cash"] -= total_cost
                 
                 # Update Holdings
-                holding = self.portfolio["holdings"].get(symbol, {"qty": 0, "avg_price": 0.0})
+                holding = self.portfolio["holdings"].get(symbol, {"qty": 0.0, "avg_price": 0.0})
                 old_qty = holding["qty"]
                 new_qty = old_qty + quantity
                 # Recalculate average price
@@ -99,12 +99,14 @@ class MockBroker:
                 
                 self.portfolio["holdings"][symbol] = {
                     "qty": new_qty,
-                    "avg_price": new_avg
+                    "avg_price": new_avg,
+                    "target_price": target_price,
+                    "stop_loss": stop_loss
                 }
                 
                 self._record_transaction("BUY", symbol, quantity, executed_price, timestamp)
                 self._save_portfolio()
-                logger.info(f"✅ BOUGHT {quantity} {symbol} @ ${executed_price:.2f} (Total: ${total_cost:.2f})")
+                logger.info(f"✅ BOUGHT {quantity:.4f} {symbol} @ ${executed_price:.2f} (Total: ${total_cost:.2f})")
                 return True
             else:
                 logger.warning(f"❌ Insufficient Funds for {symbol}. Needed: ${total_cost:.2f}, Have: ${self.portfolio['cash']:.2f}")
@@ -125,7 +127,7 @@ class MockBroker:
                 
                 self._record_transaction("SELL", symbol, quantity, executed_price, timestamp)
                 self._save_portfolio()
-                logger.info(f"✅ SOLD {quantity} {symbol} @ ${executed_price:.2f} (Total: ${total_cost:.2f})")
+                logger.info(f"✅ SOLD {quantity:.4f} {symbol} @ ${executed_price:.2f} (Total: ${total_cost:.2f})")
                 return True
             else:
                 logger.warning(f"❌ Insufficient share count to SELL {symbol}. Have: {holding['qty'] if holding else 0}")

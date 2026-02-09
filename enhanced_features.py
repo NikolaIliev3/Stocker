@@ -85,13 +85,15 @@ class EnhancedFeatureExtractor:
         return features
     
     def extract_sector_relative_strength(self, stock_data: dict, 
-                                        history_data: dict) -> Dict:
+                                        history_data: dict,
+                                        as_of_date: Optional[datetime] = None) -> Dict:
         """
-        Calculate sector and industry relative strength
+        Calculate sector and industry relative strength (Date-aware)
         
         Args:
             stock_data: Stock info dict
             history_data: Historical price data
+            as_of_date: Optional timestamp for point-in-time analysis
             
         Returns:
             Dict with sector/industry relative strength
@@ -124,15 +126,22 @@ class EnhancedFeatureExtractor:
             
             # Fetch sector ETF data (with caching)
             try:
-                # Check cache first
-                if sector_etf in self._sector_data_cache:
-                    sector_data = self._sector_data_cache[sector_etf]
-                    # Check if cache is stale (optional, but good practice - for now we assume 
-                    # one run is short enough to not need expiry)
+                # Point-in-time caching key
+                cache_key = f"{sector_etf}_{as_of_date.strftime('%Y-%m-%d')}" if as_of_date else sector_etf
+                
+                if cache_key in self._sector_data_cache:
+                    sector_data = self._sector_data_cache[cache_key]
                 else:
-                    sector_data = self.data_fetcher.fetch_stock_data(sector_etf)
+                    if as_of_date:
+                        # Use fetch_stock_history with end_date for historical accurate sector
+                        sector_data = self.data_fetcher.fetch_stock_history(
+                            sector_etf, period="1y", end_date=as_of_date.strftime('%Y-%m-%d')
+                        )
+                    else:
+                        sector_data = self.data_fetcher.fetch_stock_data(sector_etf)
+                        
                     if sector_data:
-                        self._sector_data_cache[sector_etf] = sector_data
+                        self._sector_data_cache[cache_key] = sector_data
                 
                 if sector_data and 'history' in sector_data:
                     sector_history = sector_data['history']
@@ -249,14 +258,16 @@ class EnhancedFeatureExtractor:
         return features
     
     def extract_all_enhanced_features(self, stock_data: dict, history_data: dict,
-                                     news_data: Optional[List] = None) -> Dict:
+                                     news_data: Optional[List] = None,
+                                     as_of_date: Optional[datetime] = None) -> Dict:
         """
-        Extract all enhanced features
+        Extract all enhanced features (Date-aware)
         
         Args:
             stock_data: Stock info dict
             history_data: Historical price data
             news_data: Optional news data
+            as_of_date: Optional timestamp for point-in-time analysis
             
         Returns:
             Dict with all enhanced features
@@ -271,7 +282,7 @@ class EnhancedFeatureExtractor:
             all_features.update(microstructure)
             
             # Sector relative strength
-            sector_features = self.extract_sector_relative_strength(stock_data, history_data)
+            sector_features = self.extract_sector_relative_strength(stock_data, history_data, as_of_date)
             all_features.update(sector_features)
         
         # Alternative data

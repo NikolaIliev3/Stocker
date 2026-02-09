@@ -78,46 +78,60 @@ class SectorMomentumAnalyzer:
             return False
         return datetime.now() < self._cache_expiry[etf_symbol]
     
-    def _fetch_sector_etf_data(self, etf_symbol: str) -> Optional[pd.DataFrame]:
+    def _fetch_sector_etf_data(self, etf_symbol: str, as_of_date: Optional[datetime] = None) -> Optional[pd.DataFrame]:
         """
-        Fetch sector ETF historical data
+        Fetch sector ETF historical data (date-aware for backtesting)
+        """
+        if as_of_date is None:
+            as_of_date = datetime.now()
         
-        Args:
-            etf_symbol: ETF symbol (e.g., 'XLK')
+        # Use as_of_date for deterministic cache expiry check
+        # This prevents live "now" from affecting historical state
+        reference_date = as_of_date
             
-        Returns:
-            DataFrame with price data or None
-        """
-        # Check cache first
-        if self._is_cache_valid(etf_symbol):
-            return self._sector_cache.get(etf_symbol)
+        # Cache key includes full date to allow daily resolution in backtests (Rule #21)
+        cache_key = f"{etf_symbol}_{as_of_date.strftime('%Y-%m-%d')}"
+        
+        # Check cache
+        if cache_key in self._sector_cache and self._is_cache_valid(etf_symbol):
+            return self._sector_cache[cache_key]
+        
+        # Determine fetch window (need enough for 20-day momentum)
+        start_date = as_of_date - timedelta(days=90)
+        end_date = as_of_date
         
         if not self.data_fetcher:
             try:
                 import yfinance as yf
                 ticker = yf.Ticker(etf_symbol)
-                hist = ticker.history(period='3mo')
+                # Use start/end for backtest accuracy
+                hist = ticker.history(start=start_date.strftime('%Y-%m-%d'), 
+                                     end=(end_date + timedelta(days=1)).strftime('%Y-%m-%d'))
                 if hist is not None and not hist.empty:
-                    # Normalize column names
                     hist.columns = [c.lower() for c in hist.columns]
-                    self._sector_cache[etf_symbol] = hist
+                    self._sector_cache[cache_key] = hist
                     self._cache_expiry[etf_symbol] = datetime.now() + timedelta(hours=self.CACHE_DURATION_HOURS)
                     return hist
             except Exception as e:
-                logger.warning(f"Error fetching ETF {etf_symbol} directly: {e}")
+                logger.warning(f"Error fetching ETF {etf_symbol} directly for {as_of_date}: {e}")
                 return None
         else:
             try:
-                history = self.data_fetcher.fetch_stock_history(etf_symbol, period='3mo')
+                # Use data_fetcher for consistency and rate-limiting
+                history = self.data_fetcher.fetch_stock_history(
+                    etf_symbol, 
+                    start_date=start_date.strftime('%Y-%m-%d'),
+                    end_date=end_date.strftime('%Y-%m-%d')
+                )
                 if history and 'data' in history and history['data']:
                     df = pd.DataFrame(history['data'])
                     df['date'] = pd.to_datetime(df['date'])
                     df.set_index('date', inplace=True)
-                    self._sector_cache[etf_symbol] = df
+                    self._sector_cache[cache_key] = df
                     self._cache_expiry[etf_symbol] = datetime.now() + timedelta(hours=self.CACHE_DURATION_HOURS)
                     return df
             except Exception as e:
-                logger.warning(f"Error fetching ETF {etf_symbol}: {e}")
+                logger.warning(f"Error fetching ETF {etf_symbol} via fetcher for {as_of_date}: {e}")
                 return None
         
         return None
@@ -166,17 +180,20 @@ class SectorMomentumAnalyzer:
             'change_pct': float(change_pct)
         }
     
-    def analyze(self, stock_data: dict, stock_df: pd.DataFrame) -> Dict:
+    def analyze(self, stock_data: dict, stock_df: pd.DataFrame, as_of_date: Optional[datetime] = None) -> Dict:
         """
         Analyze sector momentum and stock's relative performance
         
         Args:
             stock_data: Stock data dict with 'info' containing sector
             stock_df: Stock price DataFrame
+            as_of_date: Optional timestamp for backtesting
             
         Returns:
             Dict with sector analysis results
         """
+        if as_of_date is None and not stock_df.empty:
+            as_of_date = stock_df.index[-1]
         result = {
             'sector': 'Unknown',
             'etf_symbol': None,
@@ -207,8 +224,8 @@ class SectorMomentumAnalyzer:
             
             result['etf_symbol'] = etf_symbol
             
-            # Fetch sector ETF data
-            etf_df = self._fetch_sector_etf_data(etf_symbol)
+            # Fetch sector ETF data (passing as_of_date)
+            etf_df = self._fetch_sector_etf_data(etf_symbol, as_of_date)
             if etf_df is None or etf_df.empty:
                 logger.debug(f"Could not fetch ETF data for {etf_symbol}")
                 return result

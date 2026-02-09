@@ -122,38 +122,95 @@ class YahooFinanceProvider(DataProvider):
             return None
     
     def fetch_history(self, symbol: str, period: str = "1y") -> Optional[Dict]:
-        """Fetch historical data"""
-        try:
-            ticker = yf.Ticker(symbol)
-            hist = ticker.history(period=period, timeout=20)
-            
-            if hist.empty:
-                # Try fallback download if ticker fails
-                import yfinance.utils as yf_utils
-                try:
-                    hist = yf_utils.download(symbol, period=period, progress=False, show_errors=False)
-                except:
+        """Fetch historical data with robust error handling for Crumb/401 issues"""
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                # Approach 1: Ticker.history (Standard)
+                start_time = None
+                end_time = None
+                
+                # If period is "1y", "3mo", etc. let yfinance handle it.
+                # If we are retrying after a 401, start fresh
+                
+                ticker = yf.Ticker(symbol)
+                hist = ticker.history(period=period, timeout=20)
+                
+                if hist.empty and attempt < max_retries - 1:
+                    # If empty, might be a glitch, try fallback immediately?
+                    # But let's check if it's really empty or an error disguised
                     pass
-            
-            if hist is None or hist.empty:
-                return None
-            
-            # Convert to dict format
-            data = []
-            for date, row in hist.iterrows():
-                data.append({
-                    'date': date.strftime('%Y-%m-%d'),
-                    'open': float(row['Open']),
-                    'high': float(row['High']),
-                    'low': float(row['Low']),
-                    'close': float(row['Close']),
-                    'volume': int(row['Volume'])
-                })
-            
-            return {'data': data}
-        except Exception as e:
-            logger.error(f"Yahoo Finance history error for {symbol}: {e}")
-            return None
+                else:
+                    if not hist.empty:
+                         # Success
+                         pass
+                    elif hist.empty:
+                         # Try download fallback
+                         raise ValueError("Empty history")
+
+                if hist is None or hist.empty:
+                     # Check if we should retry
+                     if attempt == max_retries - 1:
+                         return None
+                     raise ValueError("Empty response")
+                
+                # Convert to dict format
+                data = []
+                for date, row in hist.iterrows():
+                    data.append({
+                        'date': date.strftime('%Y-%m-%d'),
+                        'open': float(row['Open']),
+                        'high': float(row['High']),
+                        'low': float(row['Low']),
+                        'close': float(row['Close']),
+                        'volume': int(row['Volume'])
+                    })
+                
+                return {'data': data}
+
+            except Exception as e:
+                error_msg = str(e).lower()
+                is_auth_error = "401" in error_msg or "unauthorized" in error_msg or "crumb" in error_msg
+                
+                if is_auth_error:
+                    logger.warning(f"Yahoo Finance Auth Error for {symbol} (Attempt {attempt+1}/{max_retries}): {e}")
+                    import time
+                    time.sleep(1 + attempt) # Backoff
+                    
+                    # Try yf.download as fallback for auth issues
+                    try:
+                        import yfinance.utils as yf_utils
+                        # Force download which sometimes refreshes crumb
+                        hist = yf.download(symbol, period=period, progress=False, ignore_tz=True)
+                        if not hist.empty:
+                            # Convert and return
+                            data = []
+                            for date, row in hist.iterrows():
+                                # Handle MultiIndex columns if present
+                                open_val = row['Open'].iloc[0] if isinstance(row['Open'], pd.Series) else row['Open']
+                                high_val = row['High'].iloc[0] if isinstance(row['High'], pd.Series) else row['High']
+                                low_val = row['Low'].iloc[0] if isinstance(row['Low'], pd.Series) else row['Low']
+                                close_val = row['Close'].iloc[0] if isinstance(row['Close'], pd.Series) else row['Close']
+                                vol_val = row['Volume'].iloc[0] if isinstance(row['Volume'], pd.Series) else row['Volume']
+                                
+                                data.append({
+                                    'date': date.strftime('%Y-%m-%d'),
+                                    'open': float(open_val),
+                                    'high': float(high_val),
+                                    'low': float(low_val),
+                                    'close': float(close_val),
+                                    'volume': int(vol_val)
+                                })
+                            return {'data': data}
+                    except Exception as download_error:
+                        logger.debug(f"Fallback download failed: {download_error}")
+                else:
+                    # Non-auth error, just log and maybe retry
+                    if attempt == max_retries - 1:
+                        logger.error(f"Yahoo Finance history error for {symbol}: {e}")
+        
+        return None
     
     def fetch_financials(self, symbol: str) -> Optional[Dict]:
         """Fetch financial statements from Yahoo Finance"""

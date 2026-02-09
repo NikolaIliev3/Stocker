@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Stocket for dummies | Live Trading Dashboard</title>
+    <title>Stocker for dummies | Live Trading Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -105,6 +105,18 @@
                         <p class="text-[10px] text-slate-400 lowercase">Learning Rate</p>
                         <p id="learning-rate" class="text-xl font-bold text-purple-400">--%</p>
                     </div>
+                </div>
+            </div>
+
+            <!-- New Star Accuracy Card -->
+            <div class="glass p-6 rounded-2xl">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="font-semibold text-lg flex items-center gap-2">
+                        <i data-lucide="target" class="w-5 h-5 text-yellow-400"></i> Star Accuracy
+                    </h2>
+                </div>
+                <div id="star-stats-container" class="space-y-3">
+                    <p class="text-xs text-slate-500 italic">Waiting for historical data...</p>
                 </div>
             </div>
 
@@ -300,10 +312,7 @@
 
                 // 2. Predictions Table
                 const table = document.getElementById('predictions-table');
-                table.innerHTML = '';
-
-                // Update global data store for modal
-                currentPredictionsData = data.predictions;
+                let tableInner = '';
 
                 // Update global data store for modal
                 currentPredictionsData = data.predictions;
@@ -376,6 +385,7 @@
                     // Format Prices Column
                     let priceHtml = '<span class="text-slate-600">-</span>';
                     if (rec.action === 'BUY' && rec.entry_price && rec.target_price) {
+                        const potentialGain = ((rec.target_price - rec.entry_price) / rec.entry_price) * 100;
                         priceHtml = `
                             <div class="flex flex-col gap-0.5">
                                 <div class="flex justify-between gap-3 text-xs">
@@ -386,30 +396,31 @@
                                     <span class="text-slate-400">Target:</span>
                                     <span class="font-mono text-emerald-300">$${rec.target_price.toFixed(2)}</span>
                                 </div>
+                                <div class="text-[10px] font-bold text-emerald-400/80 mt-0.5 text-right">
+                                    Expected: +${potentialGain.toFixed(1)}%
+                                </div>
                             </div>
                          `;
                     }
 
                     // Star Indicator Logic (Dual Stars)
                     let starsHtml = '';
-                    const reasoning = (pred.reasoning || '').toLowerCase();
+                    let reasoning = pred.reasoning || '';
+                    if (Array.isArray(reasoning)) reasoning = reasoning.join(' ');
+                    reasoning = reasoning.toLowerCase();
 
                     // 1. YELLOW STAR: High Confidence (>80%)
                     if (rec.confidence > 80) {
-                        starsHtml += `<i data-lucide="star" class="w-4 h-4 text-yellow-400 fill-yellow-400 inline-block ml-1" title="High Confidence (>80%)"></i>`;
+                        starsHtml += `<i data-lucide="star" class="w-4 h-4 text-yellow-500 fill-yellow-500/50 inline-block ml-1" style="stroke-width: 3px" title="High Confidence (>80%)"></i>`;
                     }
 
-                    // 2. ORANGE STAR: Consensus (Both methods agree)
-                    // We check the reasoning text for the "agree" keyword inserted by hybrid_predictor.py
-                    // CRITICAL FIX: Strict phrase match only. "Agree" is too common.
+                    // 2. PURPLE STAR: Consensus (Both methods agree)
                     const isConsensus = reasoning.includes('both methods agree');
-
                     if (isConsensus) {
-                        starsHtml += `<i data-lucide="star" class="w-4 h-4 text-purple-500 fill-purple-500 inline-block ml-0.5" title="Consensus (ML + Rules Agree)"></i>`;
+                        starsHtml += `<i data-lucide="star" class="w-4 h-4 text-purple-500 fill-purple-500/50 inline-block ml-0.5" style="stroke-width: 3px" title="Consensus (ML + Rules Agree)"></i>`;
                     }
 
                     // 3. RED STAR: Reversal (Downtrend -> Uptrend)
-                    // Matches "buying the dip", "reversal", "oversold", "downtrend" in a BUY context
                     if (rec.action === 'BUY') {
                         const isReversal = reasoning.includes('reversal') ||
                             reasoning.includes('downtrend') ||
@@ -418,11 +429,11 @@
                             reasoning.includes('rebound');
 
                         if (isReversal) {
-                            starsHtml += `<i data-lucide="star" class="w-4 h-4 text-red-500 fill-red-500 inline-block ml-0.5" title="Reversal / Trend Change"></i>`;
+                            starsHtml += `<i data-lucide="star" class="w-4 h-4 text-rose-500 fill-rose-500/50 inline-block ml-0.5" style="stroke-width: 3px" title="Reversal / Trend Change"></i>`;
                         }
                     }
 
-                    table.innerHTML += `
+                    tableInner += `
                         <tr onclick="openModal('${sym}')" class="border-b border-white/5 hover:bg-white/10 transition-colors group cursor-pointer relative">
                             <td class="py-4 px-2 font-bold flex items-center">
                                 ${sym} ${starsHtml}
@@ -456,10 +467,11 @@
                         </tr>
                     `;
                 });
+                table.innerHTML = tableInner;
 
                 // 2.1 Global History Table
                 const historyTable = document.getElementById('history-table');
-                historyTable.innerHTML = '';
+                let historyInner = '';
 
                 if (data.global_history && data.global_history.length > 0) {
                     data.global_history.forEach(pred => {
@@ -479,15 +491,15 @@
                         }
 
                         // Format Estimated Date for History
-                        let dateHtml = '<span class="text-slate-500">-</span>';
+                        let dateHtmlShort = '<span class="text-slate-500">-</span>';
                         if (pred.estimated_target_date) {
                             const dateObj = new Date(pred.estimated_target_date);
                             const month = dateObj.toLocaleString('default', { month: 'short' });
                             const day = dateObj.getDate();
-                            dateHtml = `<span class="text-slate-400">${month} ${day}</span>`;
+                            dateHtmlShort = `<span class="text-slate-400">${month} ${day}</span>`;
                         }
 
-                        historyTable.innerHTML += `
+                        historyInner += `
                             <tr class="border-b border-white/5 text-xs hover:bg-white/5 transition-colors">
                                 <td class="py-3 px-2 text-slate-500">${time}</td>
                                 <td class="py-3 px-2 font-bold">${pred.symbol}</td>
@@ -495,7 +507,7 @@
                                     <div class="font-bold ${actionClass}">${pred.action}</div>
                                     <div class="text-[10px] text-slate-500">@ $${pred.entry_price ? pred.entry_price.toFixed(2) : '0.00'}</div>
                                 </td>
-                                <td class="py-3 px-2">${dateHtml}</td>
+                                <td class="py-3 px-2">${dateHtmlShort}</td>
                                 <td class="py-3 px-2">
                                     <span class="px-2 py-0.5 rounded-full ${statusClass}">${statusLabel}</span>
                                 </td>
@@ -503,9 +515,13 @@
                             </tr>
                         `;
                     });
+                    historyTable.innerHTML = historyInner;
                 } else {
                     historyTable.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-slate-500 italic lowercase">Waiting for GUI/Bot signals...</td></tr>';
                 }
+
+                // Update Star Stats
+                updateStarStats(data.global_history);
 
                 // Re-init icons for new table rows
                 lucide.createIcons();
@@ -566,7 +582,11 @@
             const reasoningEl = document.getElementById('modal-reasoning');
             // Clean up the text a bit if needed, or display as is
             let text = pred.reasoning || "No detailed reasoning available.";
-            reasoningEl.textContent = text;
+            if (Array.isArray(text)) {
+                reasoningEl.innerHTML = text.map(t => `<div class="mb-2">• ${t}</div>`).join('');
+            } else {
+                reasoningEl.textContent = text;
+            }
 
             // Timestamp
             if (pred.timestamp) {
@@ -605,6 +625,103 @@
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') closeModal();
         });
+
+        // Star Accuracy Logic
+        function updateStarStats(history) {
+            if (!history || history.length === 0) return;
+
+            const buckets = {
+                yellow: { total: 0, correct: 0, label: 'High Condфиence', icon: 'text-yellow-400', iconName: 'star' }, // >80%
+                purple: { total: 0, correct: 0, label: 'Consensus', icon: 'text-purple-500', iconName: 'users' }, // Agree
+                red: { total: 0, correct: 0, label: 'Reversal', icon: 'text-red-500', iconName: 'refresh-ccw' }, // Reversal
+                // Combinations
+                golden: { total: 0, correct: 0, label: 'Golden (Yellow+Red)', icon: 'text-orange-400', iconName: 'trophy' }
+            };
+
+            history.forEach(pred => {
+                if (!pred.verified) return;
+
+                const rec = pred.recommendation || pred; // Handle both formats
+                const confidence = rec.confidence || pred.confidence || 0;
+
+                let reasoning = pred.reasoning || '';
+                if (Array.isArray(reasoning)) reasoning = reasoning.join(' ');
+                reasoning = reasoning.toLowerCase();
+
+                const action = pred.action;
+                const isCorrect = pred.was_correct;
+
+                // Identification Logic (Same as table)
+                const isYellow = confidence > 80;
+                const isPurple = reasoning.includes('both methods agree');
+                const isRed = action === 'BUY' && (
+                    reasoning.includes('reversal') ||
+                    reasoning.includes('downtrend') ||
+                    reasoning.includes('dip') ||
+                    reasoning.includes('oversold') ||
+                    reasoning.includes('rebound')
+                );
+
+                // Update Buckets
+                if (isYellow) {
+                    buckets.yellow.total++;
+                    if (isCorrect) buckets.yellow.correct++;
+                }
+                if (isPurple) {
+                    buckets.purple.total++;
+                    if (isCorrect) buckets.purple.correct++;
+                }
+                if (isRed) {
+                    buckets.red.total++;
+                    if (isCorrect) buckets.red.correct++;
+                }
+                if (isYellow && isRed) {
+                    buckets.golden.total++;
+                    if (isCorrect) buckets.golden.correct++;
+                }
+            });
+
+            // Render
+            const container = document.getElementById('star-stats-container');
+            container.innerHTML = '';
+
+            Object.keys(buckets).forEach(key => {
+                const b = buckets[key];
+                if (b.total === 0) return;
+
+                const acc = Math.round((b.correct / b.total) * 100);
+                const colorClass = acc >= 60 ? 'text-emerald-400' : acc >= 50 ? 'text-blue-400' : 'text-slate-400';
+
+                // Icon handling
+                let iconHtml = '';
+                if (key === 'yellow') iconHtml = '<i data-lucide="star" class="w-3 h-3 text-yellow-400 fill-yellow-400"></i>';
+                else if (key === 'purple') iconHtml = '<i data-lucide="star" class="w-3 h-3 text-purple-500 fill-purple-500"></i>';
+                else if (key === 'red') iconHtml = '<i data-lucide="star" class="w-3 h-3 text-red-500 fill-red-500"></i>';
+                else if (key === 'golden') iconHtml = '<div class="flex"><i data-lucide="star" class="w-3 h-3 text-yellow-400 fill-yellow-400"></i><i data-lucide="star" class="w-3 h-3 text-red-500 fill-red-500 -ml-1"></i></div>';
+
+                container.innerHTML += `
+                    <div class="flex items-center justify-between text-xs">
+                        <div class="flex items-center gap-2 text-slate-300">
+                            ${iconHtml}
+                            <span>${b.label}</span>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <span class="text-slate-500 lowercase">${b.total} signals</span>
+                            <span class="font-bold ${colorClass}">${acc}%</span>
+                        </div>
+                    </div>
+                    <div class="w-full h-1 bg-slate-800 rounded-full overflow-hidden mb-1">
+                        <div class="h-full ${acc >= 60 ? 'bg-emerald-500' : 'bg-blue-500'}" style="width: ${acc}%"></div>
+                    </div>
+                `;
+            });
+
+            if (container.innerHTML === '') {
+                container.innerHTML = '<p class="text-xs text-slate-500 italic">No verified star signals yet.</p>';
+            }
+
+            lucide.createIcons();
+        }
 
     </script>
 </body>

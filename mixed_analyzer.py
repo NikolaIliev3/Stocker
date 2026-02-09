@@ -77,14 +77,17 @@ class MixedAnalyzer:
             if self.has_market_intel:
                 if sentiment_info is None:
                     try:
-                        sentiment_info = self.sentiment_analyzer.analyze_sentiment(stock_data.get('symbol', ''))
+                        sentiment_info = self.sentiment_analyzer.analyze_sentiment(
+                            stock_data.get('symbol', ''), 
+                            as_of_date=current_date
+                        )
                     except Exception as e:
                         logger.debug(f"Error in sentiment analysis: {e}")
                 
                 if macro_info is None:
                     try:
-                        # Use SPY as proxy if available, or fetch
-                        macro_info = self.macro_detector.detect_regime(None)
+                        # Use detector with current_date for historical accuracy
+                        macro_info = self.macro_detector.detect_regime(current_date=current_date)
                     except Exception as e:
                         logger.debug(f"Error in macro analysis: {e}")
             
