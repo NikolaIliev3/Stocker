@@ -4068,6 +4068,10 @@ class StockerApp:
                         else:  # investing
                             estimated_days = 547
                     
+                    # Normalize types to avoid numpy JSON serialization issues
+                    confidence = float(confidence or 0)
+                    estimated_days = int(estimated_days or 0)
+                    
                     # Save prediction
                     prediction = self.predictions_tracker.add_prediction(
                         symbol, strategy, action, current_price,
@@ -4075,7 +4079,7 @@ class StockerApp:
                     )
                     predictions_created += 1
                     self.root.after(0, self._append_firing_result, 
-                                  f"✅ {symbol}: Prediction #{prediction['id']} ({action}, {confidence:.1f}%)\n")
+                                  f"✅ {symbol}: Prediction #{prediction['id']} ({action}, {(confidence or 0):.1f}%)\n")
                     
                     # Generate trend change predictions (if trading or mixed strategy)
                     if strategy in ['trading', 'mixed']:
@@ -4099,13 +4103,17 @@ class StockerApp:
                                 if trend_predictions and len(trend_predictions) > 0:
                                     # Store trend change predictions
                                     for pred in trend_predictions:
+                                        # Normalize types to avoid numpy JSON serialization issues
+                                        p_confidence = float(pred.get('confidence', 0) or 0)
+                                        p_est_days = int(pred.get('estimated_days', 0) or 0)
+                                        
                                         stored_pred = self.trend_change_tracker.add_prediction(
                                             symbol=pred['symbol'],
                                             current_trend=pred['current_trend'],
                                             predicted_change=pred['predicted_change'],
-                                            estimated_days=pred['estimated_days'],
+                                            estimated_days=p_est_days,
                                             estimated_date=pred['estimated_date'],
-                                            confidence=pred['confidence'],
+                                            confidence=p_confidence,
                                             reasoning=pred['reasoning'],
                                             key_indicators=pred.get('key_indicators', {})
                                         )
@@ -4114,13 +4122,13 @@ class StockerApp:
                                         self.learning_tracker.record_trend_change_prediction(
                                             symbol=pred['symbol'],
                                             predicted_change=pred['predicted_change'],
-                                            estimated_days=pred['estimated_days'],
-                                            confidence=pred['confidence']
+                                            estimated_days=p_est_days,
+                                            confidence=p_confidence
                                         )
                                         
                                         trend_predictions_created += 1
                                         self.root.after(0, self._append_firing_result,
-                                                      f"  📊 Trend change prediction #{stored_pred['id']}: {pred['predicted_change']} ({pred['confidence']:.1f}%)\n")
+                                                      f"  📊 Trend change prediction #{stored_pred['id']}: {pred['predicted_change']} ({(p_confidence):.1f}%)\n")
                                 else:
                                     # No trend predictions generated (might be normal - not all stocks have trend changes)
                                     logger.debug(f"No trend change predictions generated for {symbol} (may be normal)")
@@ -5124,11 +5132,11 @@ SELL SIGNALS:
             change_display = trend_emojis.get(change_type, change_type.replace('_', ' ').title())
             
             # Visual confidence bar
-            conf = pred.get('confidence', 0)
+            conf = float(pred.get('confidence', 0) or 0)
             bar_len = 10
             filled = int((conf / 100) * bar_len)
             conf_bar = "█" * filled + "░" * (bar_len - filled)
-            conf_display = f"{conf_bar} {conf}%"
+            conf_display = f"{conf_bar} {conf:.0f}%"
             
             # Determine Status Display
             status = pred.get('status', 'active').title()

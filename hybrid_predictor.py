@@ -464,7 +464,8 @@ class HybridStockPredictor:
         # 5. Combine predictions (Rules and ML)
         final_prediction = self._ensemble_predictions(
             rule_prediction, ml_prediction, ensemble_weights, base_analysis,
-            stock_data, history_data
+            stock_data, history_data,
+            is_backtest=is_backtest
         )
         
         # Diagnostic logging for backtesting
@@ -488,9 +489,6 @@ class HybridStockPredictor:
             final_prediction['sector_fallback_reason'] = sector_fallback_reason
         else:
             final_prediction['used_sector_model'] = False
-            final_prediction['sector'] = None
-            final_prediction['sector_fallback_reason'] = sector_fallback_reason
-        
             final_prediction['sector'] = None
             final_prediction['sector_fallback_reason'] = sector_fallback_reason
         
@@ -609,10 +607,11 @@ class HybridStockPredictor:
         recommendation = base_analysis.get('recommendation', {}).copy()
         return {
             'action': recommendation.get('action', 'HOLD'),
-            'confidence': recommendation.get('confidence', 50),
-            'entry_price': recommendation.get('entry_price', 0),
-            'target_price': recommendation.get('target_price', 0),
-            'stop_loss': recommendation.get('stop_loss', 0)
+            'confidence': float(recommendation.get('confidence', 50)),
+            'entry_price': float(recommendation.get('entry_price', 0)),
+            'target_price': float(recommendation.get('target_price', 0)),
+            'stop_loss': float(recommendation.get('stop_loss', 0)),
+            'estimated_days': int(recommendation.get('estimated_days', 7))
         }
     
     def _calculate_dynamic_weights(self, rule_pred: Dict, ml_pred: Optional[Dict]) -> Dict:
@@ -697,8 +696,51 @@ class HybridStockPredictor:
         total = rule_weight + ml_weight
         return {'rule': rule_weight / total, 'ml': ml_weight / total, 'ai': 0.0}
 
+    def _calculate_market_stress_threshold(self, regime: str, market_data: dict) -> float:
+        """
+        Dynamic threshold based on regime and recovery signals (Conservative Logic)
+        """
+        base_threshold = -0.10  # -10.0% base
+        
+        # Regime adjustments
+        if regime == "bull":
+            regime_adj = -0.03  # Allow -13.0% in bull
+        elif regime == "sideways":
+            regime_adj = -0.01  # Allow -11.0% in sideways
+        else:  # bear / crash
+            regime_adj = 0.02   # Tighten to -8.0% in bear
+            
+        # Recovery bonus (only if substantial)
+        roc_20 = market_data.get('roc_20', 0)
+        recovery_adj = -0.02 if roc_20 > 3.0 else 0.0  # Allow 2% more if 3% recovery
+        
+        final_threshold = base_threshold + regime_adj + recovery_adj
+        
+        # Safety net: Don't allow beyond absolute -15% or above -8%
+        return max(-0.15, min(-0.08, final_threshold))
+
+    def _apply_market_stress_filter(self, regime: str, market_data: dict) -> tuple:
+        """
+        Adaptive market stress veto with regime awareness
+        """
+        current_drawdown = market_data.get('drawdown', 0)
+        regime = regime.lower()
+        
+        threshold = self._calculate_market_stress_threshold(regime, market_data)
+        
+        if current_drawdown < threshold:
+            msg = (
+                f"🛑 MARKET STRESS VETO: "
+                f"Drawdown {current_drawdown*100:.1f}% exceeds {threshold*100:.1f}% threshold "
+                f"(Regime: {regime}, Recovery: {market_data.get('roc_20', 0):.1f}%)"
+            )
+            return True, msg
+        
+        return False, None
+
     def _apply_pro_filters(self, final_action: str, final_confidence: float, 
-                      stock_data: dict, history_data: dict, base_analysis: dict = None) -> tuple:
+                      stock_data: dict, history_data: dict, base_analysis: dict = None, reasoning: str = "",
+                      ml_prediction: dict = None, is_backtest: bool = False) -> tuple:
         """
         ELITE LONG-ONLY FILTERS (Quant Mode):
         - Goal: Extreme Accuracy (>60%) by filtering out 'noise' and shorting.
@@ -708,7 +750,7 @@ class HybridStockPredictor:
             3. SMA200 / Bear Market BUY threshold: 85% confidence.
         """
         if not base_analysis or final_action == 'HOLD':
-            return final_action, final_confidence
+            return final_action, final_confidence, reasoning
             
         symbol = stock_data.get('symbol', 'Unknown')
         regime_info = base_analysis.get('market_regime', {})
@@ -724,25 +766,29 @@ class HybridStockPredictor:
              atr_percent = volatility.get('atr_percent', 0)
              
              if atr_percent > 4.0:
-                 logger.info(f"🛑 VOLATILITY VETO: ATR {atr_percent:.1f}% > 4.0% (Too Volatile). Forced HOLD.")
-                 return 'HOLD', 50.0
+                 msg = f"🛑 VOLATILITY VETO: ATR {atr_percent:.1f}% > 4.0% (Too Volatile)"
+                 logger.info(msg + ". Forced HOLD.")
+                 reasoning += msg + "\n"
+                 return 'HOLD', 50.0, reasoning
              elif atr_percent > 0 and atr_percent < 0.5:
-                 logger.info(f"🛑 VOLATILITY VETO: ATR {atr_percent:.1f}% < 0.5% (Too Dead). Forced HOLD.")
-                 return 'HOLD', 50.0
+                 msg = f"🛑 VOLATILITY VETO: ATR {atr_percent:.1f}% < 0.5% (Too Dead)"
+                 logger.info(msg + ". Forced HOLD.")
+                 reasoning += msg + "\n"
+                 return 'HOLD', 50.0, reasoning
 
         # 1. HARD VETO ON SHORTS
         if final_action == 'SELL':
-            logger.info(f"🛑 ELITE VETO: Suppressing {symbol} SELL ({final_confidence:.1f}%) - Long-Only Strategy")
-            return 'HOLD', 50.0
+            msg = f"🛑 ELITE VETO: Suppressing {symbol} SELL ({final_confidence:.1f}%) - Long-Only Strategy"
+            logger.info(msg)
+            reasoning += msg + "\n"
+            return 'HOLD', 50.0, reasoning
             
-        # 2. CRASH & STRESS STAND-DOWN (Extreme Protection)
-        market_drawdown = regime_info.get('drawdown', 0)
-        
-        # MISSION CRITICAL: If the market is under ANY significant stress (Drawdown > 10%),
-        # we VETO ALL BUYs. 
-        if final_action == 'BUY' and (regime == 'crash' or market_drawdown < -0.10):
-            logger.info(f"🚫 MARKET STRESS VETO: No-BUY zone active (Drawdown: {market_drawdown*100:.1f}%). Missing trade for capital preservation.")
-            return 'HOLD', 50.0
+        # 2. MARKET STRESS VETO (Adaptive)
+        is_vetoed, veto_reason = self._apply_market_stress_filter(regime, regime_info)
+        if final_action == 'BUY' and is_vetoed:
+            logger.info(veto_reason + " Missing trade for capital preservation.")
+            reasoning += veto_reason + "\n"
+            return 'HOLD', 50.0, reasoning
 
         # 3. ELITE BUY FILTERS (Uptrend Only)
         if final_action == 'BUY':
@@ -757,20 +803,36 @@ class HybridStockPredictor:
             if final_confidence < 80.0 and ema_50 > 0:
                 dist_sma50 = ((current_price / ema_50) - 1) * 100
                 if dist_sma50 > 5.0:
-                     logger.info(f"🛑 EXTENSION VETO: {symbol} is too extended ({dist_sma50:.1f}% > 5.0%) for moderate confidence.")
-                     return 'HOLD', 50.0
+                     msg = f"🛑 EXTENSION VETO: {symbol} is too extended ({dist_sma50:.1f}% > 5.0%) for moderate confidence."
+                     logger.info(msg)
+                     reasoning += msg + "\n"
+                     return 'HOLD', 50.0, reasoning
 
             # --- PHASE 3: GOLDEN SIGNAL & HARD ML FILTER ---
             # Goal: Maximize precision by enforcing Rule+ML confluence
-            ml_prediction = base_analysis.get('ml_prediction', {})
+            if ml_prediction is None:
+                ml_prediction = base_analysis.get('ml_prediction', {})
+            
             ml_prob_buy = 0.0
             if ml_prediction and 'probabilities' in ml_prediction:
-                ml_prob_buy = ml_prediction['probabilities'][2] # BUY probability
+                probs = ml_prediction['probabilities']
+                if isinstance(probs, dict):
+                    # Handle dictionary format (percentages 0-100 or ratios 0-1)
+                    ml_prob_buy = probs.get('BUY', probs.get('buy', 0.0))
+                    if ml_prob_buy > 1.0:
+                        ml_prob_buy /= 100.0
+                elif isinstance(probs, (list, np.ndarray)) and len(probs) > 2:
+                    # Handle array format (0: SELL, 1: HOLD, 2: BUY)
+                    ml_prob_buy = probs[2]
+                    if ml_prob_buy > 1.0:
+                        ml_prob_buy /= 100.0
             
             # Rule A: THE GOLDEN SIGNAL (Confluence)
             # If Rules are very strong AND ML agrees, it's a nearly "guaranteed" winner
             if final_confidence >= 80.0 and ml_prob_buy >= 0.60:
-                logger.info(f"✨ GOLDEN SIGNAL: Rule ({final_confidence:.1f}%) and ML ({ml_prob_buy*100:.1f}%) in high agreement.")
+                msg = f"✨ GOLDEN SIGNAL: Rule ({final_confidence:.1f}%) and ML ({ml_prob_buy*100:.1f}%) in high agreement."
+                logger.info(msg)
+                reasoning += msg + "\n"
                 # We do not return here, we let it pass through with potentially boosted confidence
                 final_confidence = max(final_confidence, 90.0)
             
@@ -778,8 +840,10 @@ class HybridStockPredictor:
             # If Rules approve but ML thinks it's likely a loser/neutral, we VETO
             # Except for "Ultra High Confidence" rules (>95%) which are allowed as safety overrides
             elif final_confidence < 95.0 and ml_prob_buy < 0.40:
-                logger.info(f"🛑 ML UTILITY VETO: ML probability {ml_prob_buy*100:.1f}% too low for Rule {final_confidence:.1f}%. Forced HOLD.")
-                return 'HOLD', 50.0
+                msg = f"🛑 ML UTILITY VETO: ML probability {ml_prob_buy*100:.1f}% too low for Rule {final_confidence:.1f}%."
+                logger.info(msg + " Forced HOLD.")
+                reasoning += msg + "\n"
+                return 'HOLD', 50.0, reasoning
             
             # --------------------------------------
 
@@ -789,22 +853,30 @@ class HybridStockPredictor:
             min_threshold = 75.0 # Lowered from 85.0 based on audit
             
             if final_confidence < min_threshold:
-                logger.info(f"🛡️ PROTECTION: Suppressing weak {symbol} BUY ({final_confidence:.1f}% < {min_threshold}%)")
-                return 'HOLD', 50.0
+                msg = f"🛡️ PROTECTION: Suppressing weak {symbol} BUY ({final_confidence:.1f}% < {min_threshold}%)"
+                logger.info(msg)
+                reasoning += msg + "\n"
+                return 'HOLD', 50.0, reasoning
             else:
                 logger.info(f"💎 ELITE TRADE: Executing High-Conviction {symbol} BUY ({final_confidence:.1f}% >= {min_threshold}%)")
-                return 'BUY', final_confidence
                     
         if final_action == 'BUY' and final_confidence > 80.0 and not is_backtest:
             logger.debug(f"⚠️ CALIBRATION CAP: Reducing {final_confidence:.1f}% -> 80.0% (Inversion Safeguard)")
             final_confidence = 80.0
             
-        return final_action, final_confidence
+        # 4. FINAL PASS
+        if final_action != 'HOLD':
+            pass_msg = "✅ ALL PRO FILTERS PASSED"
+            logger.info(f"{pass_msg} for {symbol}")
+            reasoning += pass_msg + "\n"
+            
+        return final_action, final_confidence, reasoning
     
     
     def _ensemble_predictions(self, rule_pred: Dict, ml_pred: Optional[Dict],
                              weights: Dict, base_analysis: Dict,
-                             stock_data: dict = None, history_data: dict = None) -> Dict:
+                             stock_data: dict = None, history_data: dict = None,
+                             is_backtest: bool = False) -> Dict:
         """Combine rule-based and ML predictions with Volatility-Adjusted Targeting"""
         
         # --- QUANT MODE: CALCULATE ATR (Average True Range) ---
@@ -860,11 +932,15 @@ class HybridStockPredictor:
         has_ml = ml_pred is not None
         
         if not has_ml:
-            return {
+            res = {
                 **base_analysis,
                 'method': 'rule_based_only',
                 'ensemble_weights': {'rule': 1.0, 'ml': 0.0, 'ai': 0.0}
             }
+            # Ensure estimated_days is also at top-level for early return
+            if 'recommendation' in base_analysis:
+                res['estimated_days'] = base_analysis['recommendation'].get('estimated_days', 7)
+            return res
         
         rule_action = rule_pred.get('action', 'HOLD')
         rule_confidence = rule_pred.get('confidence', 50)
@@ -1370,11 +1446,12 @@ class HybridStockPredictor:
             context = self._determine_signal_context(stock_data, history_data, base_analysis)
             reasoning = f"[{context}] " + reasoning
 
+        # Fetch est days from wherever it ended up
+        est_days = result.get('estimated_days') or recommendation.get('estimated_days') or 7
+
         # APPLY STATISTICAL CALIBRATION (Final Realism Filter)
         if final_action != 'HOLD':
             atr = base_analysis.get('indicators', {}).get('atr', 0)
-            # Fetch est days from wherever it ended up
-            est_days = result.get('estimated_days') or recommendation.get('estimated_days') or 7
             
             calibration = self.statistical_calibrator.calibrate(
                 current_price, final_target, est_days, atr, market_regime=base_analysis.get('market_regime', 'unknown')
@@ -1386,15 +1463,18 @@ class HybridStockPredictor:
 
         # QUANT MODE: Apply Elite Long-Only Filters (Veto weak signals and all shorts)
         # Goal: Extreme Accuracy (>60%) by accepting lower trade frequency.
-        final_action, final_confidence = self._apply_pro_filters(final_action, final_confidence, stock_data, history_data, base_analysis)
+        final_action, final_confidence, reasoning = self._apply_pro_filters(
+            final_action, final_confidence, stock_data, history_data, base_analysis, reasoning, ml_pred,
+            is_backtest=is_backtest
+        )
 
         result['recommendation'] = {
             **recommendation,
             'action': final_action,
-            'confidence': final_confidence,
-            'target_price': final_target,
-            'stop_loss': final_stop,
-            'estimated_days': result.get('estimated_days') or 7,
+            'confidence': float(final_confidence),
+            'target_price': float(final_target),
+            'stop_loss': float(final_stop),
+            'estimated_days': int(est_days), # Use the dynamic est_days from calibration check a few lines above
             'context': context
         }
         result['reasoning'] = reasoning
@@ -1442,6 +1522,10 @@ class HybridStockPredictor:
             'confidence': ml_confidence,
             'probabilities': ml_pred.get('probabilities', {})
         }
+        
+        # Standardize reasoning into a list for the UI
+        if 'recommendation' in result:
+            result['recommendation']['reasoning'] = [line.strip() for line in reasoning.split('\n') if line.strip()]
         
         return result
     

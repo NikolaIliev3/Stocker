@@ -154,6 +154,23 @@ class PredictionsTracker:
             
             symbol = prediction['symbol']
             
+            # Determine reasoning format
+            raw_reasoning = prediction.get('reasoning', [])
+            
+            # Validation: Ensure reasoning is never empty
+            if not raw_reasoning or (isinstance(raw_reasoning, list) and not raw_reasoning):
+                reasoning_list = ["No reasoning provided - check development logs"]
+            elif isinstance(raw_reasoning, str):
+                reasoning_list = [line for line in raw_reasoning.split('\n') if line.strip()]
+                if not reasoning_list:
+                    reasoning_list = ["No reasoning provided - check development logs"]
+            elif isinstance(raw_reasoning, list):
+                reasoning_list = [str(r) for r in raw_reasoning if str(r).strip()]
+                if not reasoning_list:
+                    reasoning_list = ["No reasoning provided - check development logs"]
+            else:
+                reasoning_list = [str(raw_reasoning)]
+
             # Convert internal prediction format to dashboard recommendation format
             # This allows manual scans from the GUI to show up in "Live Recommendations"
             recommendation = {
@@ -164,7 +181,8 @@ class PredictionsTracker:
                 "stop_loss": prediction['stop_loss'],
                 "estimated_days": prediction['estimated_days'],
                 "rr_ratio": 0.0, # Placeholder
-                "reasoning": prediction['reasoning'].split('\n') if isinstance(prediction['reasoning'], str) else [],
+                "reasoning": reasoning_list,
+                "description": "\n".join(reasoning_list), # Alias for UI compatibility
                 "context": "Manual Scan",
                 "estimated_target_date": prediction['estimated_target_date']
             }
