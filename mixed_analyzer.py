@@ -112,7 +112,8 @@ class MixedAnalyzer:
                 'strategy': 'mixed',
                 'timeframe': '1 week - 1 month',
                 'sentiment_info': sentiment_info,
-                'macro_info': macro_info
+                'macro_info': macro_info,
+                'market_regime': macro_info
             }
         
         except Exception as e:

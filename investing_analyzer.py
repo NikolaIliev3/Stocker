@@ -86,7 +86,8 @@ class InvestingAnalyzer:
                     valuation, growth, risk_analysis
                 ),
                 "sentiment_info": sentiment_info,
-                "macro_info": macro_info
+                "macro_info": macro_info,
+                "market_regime": macro_info
             }
         
         except Exception as e:

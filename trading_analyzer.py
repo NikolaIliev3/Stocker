@@ -1709,7 +1709,7 @@ class TradingAnalyzer:
             regime = market_regime.get('regime', 'unknown')
             strength = market_regime.get('strength', 50)
             regime_emoji = "📈" if regime == 'bull' else "📉" if regime == 'bear' else "↔️"
-            reasoning += f"{regime_emoji} Market Regime: {regime.upper()} (Strength: {strength:.0f}%)\n"
+            reasoning += f"{regime_emoji} Global Market Regime (SPY): {regime.upper()} (Strength: {strength:.0f}%)\n"
             if regime == 'bull':
                 reasoning += "   • Bull market conditions - favorable for long positions\n"
             elif regime == 'bear':

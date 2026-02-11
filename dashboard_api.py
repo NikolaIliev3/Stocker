@@ -143,30 +143,59 @@ def get_state():
                 except Exception as e:
                     logger.error(f"Error reading portfolio file: {e}")
 
-        # Inject Active Predictions if list is empty (or emptied above)
-        if not state['predictions'] or len(state['predictions']) == 0:
-            active_from_history = [p for p in history if p.get('status') == 'active']
-            # Convert list to dict format expected by dashboard
-            injected_preds = {}
-            for p in active_from_history:
-                # Map history format to dashboard format
-                injected_preds[p['symbol']] = {
-                    "price": 0, # Current price might be stale/unknown w/o fetcher
-                    "recommendation": {
-                        "action": p['action'],
-                        "confidence": p['confidence'],
-                        "entry_price": p.get('entry_price'),
-                        "target_price": p.get('target_price'),
-                        "stop_loss": p.get('stop_loss'),
-                    },
-                    "market_regime": p.get('market_regime', 'unknown'),
-                    "estimated_target_date": p.get('estimated_target_date'),
-                    "estimated_days": p.get('estimated_days'),
-                    "timestamp": p.get('timestamp'),
-                    "safety_lock": {"lock_active": False},
-                    "reasoning": p.get('reasoning', 'No detailed reasoning available.')
-                }
-            state['predictions'] = injected_preds
+        # [FIX] Merge ACTIVE predictions from history file into state['predictions']
+        # This ensures manual scans appear immediately even if paper_trader hasn't looped.
+        history_active = [p for p in history if p.get('status') == 'active']
+        
+        # Ensure state['predictions'] is a dict (expected format)
+        if 'predictions' not in state or not isinstance(state['predictions'], dict):
+            state['predictions'] = {}
+
+        for p in history_active:
+            symbol = p.get('symbol')
+            if not symbol: continue
+            
+            # Map history item to dashboard prediction format
+            mapped_p = {
+                "price": 0, # Price will be 0 until paper_trader/fetcher updates it
+                "recommendation": {
+                    "action": p.get('action'),
+                    "confidence": p.get('confidence'),
+                    "entry_price": p.get('entry_price'),
+                    "target_price": p.get('target_price'),
+                    "stop_loss": p.get('stop_loss'),
+                },
+                "market_regime": p.get('market_regime', 'unknown'),
+                "estimated_target_date": p.get('estimated_target_date'),
+                "estimated_days": p.get('estimated_days'),
+                "timestamp": p.get('timestamp'),
+                "safety_lock": {"lock_active": False},
+                "reasoning": p.get('reasoning', 'No detailed reasoning available.')
+            }
+
+            # Merge logic: If exists in cache, only overwite if history is NEWER
+            if symbol in state['predictions']:
+                cache_time_str = state['predictions'][symbol].get('timestamp')
+                hist_time_str = p.get('timestamp')
+                
+                try:
+                    if hist_time_str:
+                        h_ts = datetime.fromisoformat(hist_time_str)
+                        if cache_time_str:
+                            c_ts = datetime.fromisoformat(cache_time_str)
+                            if h_ts > c_ts:
+                                # History is newer, overwrite recommendation data but keep price if available
+                                old_price = state['predictions'][symbol].get('price', 0)
+                                state['predictions'][symbol] = mapped_p
+                                state['predictions'][symbol]['price'] = old_price
+                        else:
+                            # No timestamp in cache, history wins
+                            state['predictions'][symbol] = mapped_p
+                except Exception as e:
+                    logger.warning(f"Error comparing timestamps for {symbol}: {e}")
+            else:
+                # Not in cache, inject
+                state['predictions'][symbol] = mapped_p
 
         # [FIX] Ensure estimated_target_date is present for all predictions
         if 'predictions' in state and state['predictions']:

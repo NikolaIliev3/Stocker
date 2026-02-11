@@ -1481,7 +1481,7 @@ class HybridStockPredictor:
         result['method'] = 'hybrid_ensemble'
         result['ml_enhanced'] = True
         # CRITICAL FIX: Ensure dictionary vs object consistency for regime
-        regime_data = base_analysis.get('market_regime', 'unknown')
+        regime_data = base_analysis.get('market_regime') or base_analysis.get('macro_info') or 'unknown'
         result['market_regime'] = regime_data
         
         # --- TIME HORIZON ENHANCEMENT ---

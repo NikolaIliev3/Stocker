@@ -291,6 +291,7 @@ class MarketScanner:
                         'stop_loss': recommendation.get('stop_loss', 0),
                         'estimated_days': est_days,
                         'estimated_target_date': est_date,
+                        'market_regime': analysis.get('market_regime', 'unknown'),
                         'reasoning': analysis.get('reasoning', '')[:200]  # Truncate
                     })
                 
