@@ -158,25 +158,28 @@ class Portfolio:
                 # Update portfolio value
                 self.risk_manager.portfolio_value = self.balance
                 
-                # Calculate optimal position size
+                # Calculate optimal position size (Phase 4: Kelly Positioning)
                 position_info = self.risk_manager.calculate_position_size(
                     entry_price=entry_price,
                     stop_loss=stop_loss,
                     confidence=confidence,
-                    method='fixed_fraction'
+                    method='kelly', 
+                    target_price=target_price
                 )
                 
                 if 'error' not in position_info:
                     shares = position_info['shares']
                     budget_used = position_info['position_value']
+                    # Use potentially adjusted stop_loss from RiskManager (e.g. Hard Stop Floor)
+                    current_stop = position_info.get('stop_loss', stop_loss)
                     
-                    # Calculate win/loss with optimal position
+                    # Calculate win/loss with optimal position and potentially closer stop
                     if action == "BUY":
                         potential_win = (target_price - entry_price) * shares
-                        potential_loss = (entry_price - stop_loss) * shares
+                        potential_loss = (entry_price - current_stop) * shares
                     elif action == "SELL":
                         potential_win = (entry_price - target_price) * shares
-                        potential_loss = (stop_loss - entry_price) * shares
+                        potential_loss = (current_stop - entry_price) * shares
                     else:
                         if target_price > entry_price:
                             potential_win = (target_price - entry_price) * shares
@@ -191,7 +194,7 @@ class Portfolio:
                         "shares": shares,
                         "entry_price": entry_price,
                         "target_price": target_price,
-                        "stop_loss": stop_loss,
+                        "stop_loss": current_stop,
                         "budget_used": budget_used,
                         "potential_win": potential_win,
                         "potential_loss": potential_loss,

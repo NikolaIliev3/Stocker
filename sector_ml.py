@@ -213,23 +213,56 @@ class SectorML:
             
             # Generate samples from all sector stocks
             all_samples = []
-            for i, symbol in enumerate(stocks):
-                if progress_callback:
-                    progress_callback(f"Generating samples for {symbol} ({i+1}/{len(stocks)})...")
-                
+            # Generate samples from all sector stocks
+            all_samples = []
+            
+            # Helper function for parallel processing
+            def process_stock(stock_symbol):
                 try:
-                    samples = generator.generate_training_samples(
-                        symbol=symbol,
+                    return generator.generate_training_samples(
+                        symbol=stock_symbol,
                         start_date=start_date,
                         end_date=end_date,
                         strategy=self.strategy,
                         lookforward_days=lookforward_days
                     )
-                    if samples:
-                        all_samples.extend(samples)
-                        logger.info(f"  {symbol}: {len(samples)} samples")
-                except Exception as e:
-                    logger.warning(f"  {symbol}: Failed - {e}")
+                except Exception as ex:
+                    logger.warning(f"  {stock_symbol}: Failed - {ex}")
+                    return []
+
+            # Use ThreadPoolExecutor for parallel processing
+            # 5-10 workers is usually a sweet spot for network/IO bound tasks without overwhelming APIs
+            max_workers = min(10, len(stocks))
+            
+            if progress_callback:
+                progress_callback(f"Generating samples for {len(stocks)} stocks (Parallel - {max_workers} workers)...")
+            
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_stock = {executor.submit(process_stock, symbol): symbol for symbol in stocks}
+                
+                completed_count = 0
+                for future in as_completed(future_to_stock):
+                    symbol = future_to_stock[future]
+                    completed_count += 1
+                    
+                    try:
+                        samples = future.result()
+                        if samples:
+                            all_samples.extend(samples)
+                            # Log every 5 stocks to reduce clutter
+                            if completed_count % 5 == 0 or completed_count == len(stocks):
+                                logger.info(f"  {symbol}: {len(samples)} samples ({completed_count}/{len(stocks)})")
+                        else:
+                            logger.debug(f"  {symbol}: No samples generated")
+                            
+                        if progress_callback:
+                            percent = int((completed_count / len(stocks)) * 100)
+                            progress_callback(f"Generating samples... {percent}% ({completed_count}/{len(stocks)})")
+                            
+                    except Exception as e:
+                        logger.warning(f"Error processing {symbol}: {e}")
             
             if len(all_samples) < 500:
                 return {
@@ -413,6 +446,17 @@ class SectorML:
             if hasattr(self._ml_model, 'predict_proba'):
                 probas = self._ml_model.predict_proba(features_scaled)[0]
                 confidence = float(max(probas))
+                
+                # Map probabilities to classes
+                probabilities = {}
+                if self._label_encoder:
+                    for i, class_name in enumerate(self._label_encoder.classes_):
+                        # Map UP/DOWN to BUY/SELL
+                        mapped_name = class_name
+                        if class_name == 'UP': mapped_name = 'BUY'
+                        elif class_name == 'DOWN': mapped_name = 'SELL'
+                        if i < len(probas):
+                            probabilities[mapped_name] = float(probas[i])
             else:
                 confidence = 0.5
             
@@ -431,6 +475,7 @@ class SectorML:
             result['used_sector_model'] = True
             result['action'] = action
             result['confidence'] = confidence
+            result['probabilities'] = probabilities if 'probabilities' in locals() else {}
             
             return result
             

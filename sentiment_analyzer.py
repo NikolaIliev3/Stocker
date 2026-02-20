@@ -89,16 +89,31 @@ class SentimentAnalyzer:
             return max(-1.0, min(1.0, final_score))
         return 0.0
         
-    def analyze_sentiment(self, symbol: str) -> Dict:
+    def analyze_sentiment(self, symbol: str, as_of_date: Optional[datetime] = None) -> Dict:
         """
         Fetch news and analyze sentiment for a stock
         
         Args:
             symbol: Stock ticker symbol
+            as_of_date: Optional timestamp for point-in-time analysis
             
         Returns:
             Dict with sentiment metrics, including score (-100 to 100)
         """
+        # INTEGRITY LOCK: If backtesting (as_of_date in the past), do NOT use live news.
+        # Live news from 'ticker.news' is ALWAYS current/2026 data.
+        reference_date = as_of_date if as_of_date else datetime.now()
+        if as_of_date and (datetime.now() - as_of_date).days > 7:
+            return {
+                'symbol': symbol,
+                'sentiment_score': 0.0,
+                'sentiment_rating': 'neutral',
+                'news_count': 0,
+                'reasoning': ["Historical sentiment not available for backtest period"],
+                'headlines': [],
+                'available': False
+            }
+
         # Check cache
         if self._is_cache_valid(symbol):
             return self._sentiment_cache[symbol]
@@ -139,7 +154,7 @@ class SentimentAnalyzer:
                 if pub_time:
                     try:
                         pub_date = datetime.fromtimestamp(pub_time)
-                        if (datetime.now() - pub_date) > timedelta(days=7):
+                        if (reference_date - pub_date) > timedelta(days=7):
                             continue
                     except:
                         pass

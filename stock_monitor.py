@@ -91,9 +91,9 @@ class StockMonitor:
         
         old_action = self.monitored_stocks[symbol_upper].get('last_action', 'UNKNOWN')
         
-        # INVERTED logic: SELL action means bullish (buy opportunity)
-        # Check if changed from non-SELL to SELL
-        if old_action in ['HOLD', 'AVOID', 'BUY'] and new_action == 'SELL':
+        # STANDARD logic: BUY action means bullish (buy opportunity)
+        # Check if changed from non-BUY to BUY
+        if old_action != 'BUY' and new_action == 'BUY':
             # Update the action
             self.update_stock_action(symbol_upper, new_action, confidence)
             return True

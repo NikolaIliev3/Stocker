@@ -15,118 +15,142 @@ class MarketRegimeDetector:
     
     def detect_regime(self, market_data: pd.DataFrame) -> Dict:
         """
-        Detect current market regime
-        
-        Args:
-            market_data: DataFrame with 'close' column (SPY or market index data)
-            
-        Returns:
-            Dict with regime info: {'regime': 'bull'/'bear'/'sideways', 'strength': 0-100}
+        Detect current market regime using Multi-Factor Analysis (SMA, Momentum, Drawdown)
+        Provides high-fidelity detection to prevent 'Bull-Trap' entries in Bear markets.
         """
-        # Allow detection with less data (minimum 20 days instead of 50)
-        if market_data.empty or len(market_data) < 20:
+        if market_data.empty or len(market_data) < 50:
             return {'regime': 'unknown', 'strength': 50}
         
-        # Handle both 'close' and 'Close' column names
-        if 'close' in market_data.columns:
-            prices = market_data['close'].values
-        elif 'Close' in market_data.columns:
-            prices = market_data['Close'].values
-        else:
-            # Try to find any price-like column
-            price_cols = [c for c in market_data.columns if 'close' in c.lower() or 'price' in c.lower()]
-            if price_cols:
-                prices = market_data[price_cols[0]].values
+        # Standardize column name
+        col = 'close' if 'close' in market_data.columns else 'Close'
+        prices = market_data[col]
+        current_price = float(prices.iloc[-1])
+        
+        # 1. Trend Analysis (Moving Averages)
+        sma_50 = prices.rolling(50).mean().iloc[-1]
+        sma_200 = prices.rolling(200).mean().iloc[-1] if len(prices) >= 200 else sma_50
+        
+        # 2. Risk Context (Drawdown from 1-year High)
+        high_252 = prices.rolling(252).max().iloc[-1] if len(prices) >= 252 else prices.max()
+        drawdown = (current_price - high_252) / high_252
+        
+        # 3. Momentum (Rate of Change)
+        roc_20 = ((current_price - prices.iloc[-20]) / prices.iloc[-20]) * 100 if len(prices) >= 20 else 0
+        
+        # --- ELITE CLASSIFICATION LOGIC ---
+        # A. CRASH DETECTION (Deep Drawdown or Extreme Velocity)
+        if drawdown < -0.15 or roc_20 < -8:
+            regime = 'crash'
+            strength = min(100, abs(drawdown) * 400)
+        
+        # B. BEAR DETECTION (Price below 200 SMA or sustained negative slope)
+        elif current_price < sma_200 or (current_price < sma_50 and roc_20 < -2):
+            regime = 'bear'
+            # If we are in a 'Bear Market Rally' (Price > SMA50 but < SMA200), still flag as Bear
+            if current_price > sma_50:
+                strength = 50 # Rally Strength
             else:
-                # Use first numeric column as fallback
-                numeric_cols = market_data.select_dtypes(include=[np.number]).columns
-                if len(numeric_cols) > 0:
-                    prices = market_data[numeric_cols[0]].values
-                else:
-                    return {'regime': 'unknown', 'strength': 50}
-        current_price = prices[-1]
+                strength = 75 # Solid Bear
         
-        # Calculate moving averages
-        sma_50 = np.mean(prices[-50:]) if len(prices) >= 50 else np.mean(prices)
-        sma_200 = np.mean(prices[-200:]) if len(prices) >= 200 else sma_50
-        
-        # Trend strength - ensure arrays have matching lengths
-        trend_strength = 0.0  # Initialize to prevent UnboundLocalError
-        if len(prices) >= 20:
-            # Get last 20 prices
-            price_slice = prices[-20:]
-            # Calculate differences (gives 19 elements: differences between consecutive pairs)
-            price_changes = np.diff(price_slice)
-            # Get base prices for division (first 19 prices from the slice, matching price_changes length)
-            price_bases = price_slice[:-1]  # This gives 19 elements, matching price_changes
+        # C. BULL DETECTION
+        elif current_price > sma_200 and current_price > sma_50 and roc_20 > -1:
+            regime = 'bull'
+            strength = 80 if roc_20 > 0 else 60
             
-            # Handle division by zero and NaN/inf values
-            with np.errstate(divide='ignore', invalid='ignore'):
-                returns = np.divide(price_changes, price_bases, out=np.zeros_like(price_changes), where=price_bases!=0)
-                # Remove any NaN or inf values
-                returns = returns[np.isfinite(returns)]
-            
-            if len(returns) > 0:
-                trend_strength = np.mean(returns) * 100
-            else:
-                trend_strength = 0.0
-        
-        # Determine regime - relaxed thresholds for better classification
-        # Use trend_strength threshold of 0.02 (2%) instead of 0.1 (10%) for more realistic detection
-        # Also consider price position relative to moving averages more flexibly
-        
-        # Calculate price position relative to MAs
-        price_above_sma50 = current_price > sma_50
-        price_above_sma200 = current_price > sma_200
-        sma50_above_sma200 = sma_50 > sma_200
-        
-        # Bull market: Price above both MAs, SMA50 above SMA200, positive trend
-        is_bull_aligned = price_above_sma50 and price_above_sma200 and sma50_above_sma200
-        is_bull_trend = trend_strength > 0.005  # Further relaxed from 0.02 to 0.005 (0.5% avg daily return)
-        
-        # Bear market: Price below both MAs, SMA50 below SMA200, negative trend
-        is_bear_aligned = not price_above_sma50 and not price_above_sma200 and not sma50_above_sma200
-        is_bear_trend = trend_strength < -0.005  # Further relaxed from -0.02 to -0.005 (-0.5% avg daily return)
-        
-        # Determine regime with SIMPLIFIED and VERY relaxed criteria
-        # PRIMARY SIGNAL: Price position relative to SMA50 (this is the key decision point)
-        # SECONDARY SIGNAL: Trend strength reinforces the primary signal
-        # Goal: Classify as bull/bear more often, only use sideways for truly neutral cases
-        
-        # Primary classification: Price above SMA50 = Bull, Price below/equal SMA50 = Bear
-        # This ensures we ALWAYS get either bull or bear (never sideways) unless there's an error
-        
-        if price_above_sma50:
-            # Price is above SMA50 - classify as BULL
-            # Stronger if fully aligned and positive trend, but still bull even if not
-            if is_bull_aligned and is_bull_trend:
-                regime = 'bull'
-                strength = min(100, 50 + abs(trend_strength) * 20)
-            else:
-                regime = 'bull'  # Still bull, just moderate
-                strength = min(80, 40 + abs(trend_strength) * 15)
+        # D. SIDEWAYS / UNCERTAIN
         else:
-            # Price is at or below SMA50 - classify as BEAR
-            # Stronger if fully aligned and negative trend, but still bear even if not
-            if is_bear_aligned and is_bear_trend:
-                regime = 'bear'
-                strength = min(100, 50 + abs(trend_strength) * 20)
-            else:
-                regime = 'bear'  # Still bear, just moderate
-                strength = min(80, 40 + abs(trend_strength) * 15)
-        
-        # Safety check: ensure we never return 'unknown' from this point (should be caught earlier)
-        if regime not in ['bull', 'bear', 'sideways']:
-            regime = 'sideways'  # Fallback safety
+            regime = 'sideways'
             strength = 50
-        
+            
         return {
             'regime': regime,
             'strength': strength,
+            'drawdown': drawdown,
             'sma_50': sma_50,
             'sma_200': sma_200,
-            'trend_strength': trend_strength
+            'roc_20': roc_20
         }
+
+
+    def compute_regimes_vectorized(self, market_data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Detect market regimes for the entire history vectorially
+        
+        Args:
+            market_data: DataFrame with 'Close' or 'close' column
+            
+        Returns:
+            DataFrame with 'Regime' column and other metrics
+        """
+        df = market_data.copy()
+        
+        # Standardize column name
+        if 'Close' in df.columns:
+            prices = df['Close']
+        elif 'close' in df.columns:
+            prices = df['close']
+        else:
+             # Try first numeric column
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                prices = df[numeric_cols[0]]
+            else:
+                raise ValueError("No price column found in market data")
+                
+        # Calculate Moving Averages
+        sma_50 = prices.rolling(window=50).mean()
+        sma_200 = prices.rolling(window=200).mean()
+        
+        # Calculate Trend Strength (Vectorized)
+        daily_returns = prices.pct_change()
+        # Equivalent to original logic: mean return over 20 days * 100
+        trend_strength = daily_returns.rolling(window=20).mean() * 100
+        
+        # Define Thresholds
+        is_positive_trend = trend_strength > 0.02
+        is_negative_trend = trend_strength < -0.02
+        
+        price_above_sma50 = prices > sma_50
+        price_above_sma200 = prices > sma_200
+        
+        # Vectorized Regime Classification
+        # Default to 'sideways'
+        regimes = pd.Series('sideways', index=df.index)
+        
+        # Long-term BULL Context (Price > SMA200)
+        bull_context = price_above_sma200
+        
+        # 1. Strong Bull: Price > SMA200 AND Price > SMA50
+        mask_strong_bull = bull_context & price_above_sma50
+        regimes[mask_strong_bull] = 'bull'
+        
+        # 2. Pullback/Sideways in Bull
+        mask_bull_pullback = bull_context & (~price_above_sma50)
+        regimes[mask_bull_pullback & is_negative_trend] = 'sideways'
+        regimes[mask_bull_pullback & (~is_negative_trend)] = 'bull'
+        
+        # Long-term BEAR Context (Price <= SMA200)
+        bear_context = ~price_above_sma200
+        
+        # 3. Strong Bear
+        mask_strong_bear = bear_context & (~price_above_sma50)
+        regimes[mask_strong_bear] = 'bear'
+        
+        # 4. Rally/Sideways in Bear
+        mask_bear_rally = bear_context & price_above_sma50
+        regimes[mask_bear_rally & is_positive_trend] = 'sideways'
+        regimes[mask_bear_rally & (~is_positive_trend)] = 'bear'
+        
+        # Fill NaN at beginning with 'sideways'
+        regimes = regimes.fillna('sideways')
+        
+        # Create result DataFrame
+        result = pd.DataFrame(index=df.index)
+        result['Regime'] = regimes
+        result['TrendStrength'] = trend_strength
+        result['SMA50'] = sma_50
+        
+        return result
 
 
 class VolumeWeightedLevels:
@@ -143,26 +167,51 @@ class VolumeWeightedLevels:
         Returns:
             Dict with support/resistance levels and their strengths
         """
-        if len(df) < lookback:
-            lookback = len(df)
+        # Drop rows with NaNs in required columns
+        data = df.tail(lookback).copy()
+        data = data.dropna(subset=['high', 'low', 'close', 'volume'])
         
-        data = df.tail(lookback)
+        if data.empty:
+            return {
+                'support': df['low'].min() if not df['low'].empty else 0,
+                'resistance': df['high'].max() if not df['high'].empty else 0,
+                'support_strength': 0,
+                'resistance_strength': 0,
+                'support_levels': [],
+                'resistance_levels': [],
+                'volume_profile': {}
+            }
         
         # Create price bins
-        price_range = data['high'].max() - data['low'].min()
+        low_min = data['low'].min()
+        high_max = data['high'].max()
+        price_range = high_max - low_min
         num_bins = 20
-        bin_size = price_range / num_bins
+        
+        if price_range <= 0 or np.isnan(price_range):
+            bin_size = 0.01  # Minimum bin size
+        else:
+            bin_size = price_range / num_bins
         
         # Volume profile
         volume_profile = {}
         for idx, row in data.iterrows():
             price = row['close']
-            volume = row['volume']
-            bin_price = round((price - data['low'].min()) / bin_size) * bin_size + data['low'].min()
+            # [FIX] Apply RECENCY BIAS to volume weighting
+            # Recent volume is more relevant than volume from 100 days ago
+            days_ago = len(data) - data.index.get_loc(idx) - 1
+            recency_weight = 1.0 / (1.0 + (days_ago / 30.0)) # Decay by 50% every 30 days
+            
+            # Safely calculate bin index
+            try:
+                bin_idx = round((price - low_min) / bin_size)
+                bin_price = bin_idx * bin_size + low_min
+            except (ValueError, OverflowError, ZeroDivisionError):
+                continue
             
             if bin_price not in volume_profile:
                 volume_profile[bin_price] = 0
-            volume_profile[bin_price] += volume
+            volume_profile[bin_price] += row['volume'] * recency_weight
         
         # Find high-volume nodes (support/resistance)
         sorted_profile = sorted(volume_profile.items(), key=lambda x: x[1], reverse=True)
@@ -406,4 +455,73 @@ class DynamicConfidenceAdjuster:
         
         # Clamp to valid range
         return max(30, min(95, confidence))
+
+
+class StatisticalTargetCalibrator:
+    """Validates and adjusts price targets using statistical probability (Z-Scores)"""
+    
+    def calibrate(self, current_price: float, target_price: float, 
+                  estimated_days: int, atr: float, market_regime: str = 'unknown') -> Dict:
+        """
+        Calibrates the target price based on volatility and time
+        
+        Args:
+            current_price: Current stock price
+            target_price: Proposed target price
+            estimated_days: Estimated time to reach target
+            atr: Average True Range (Volatility)
+            market_regime: 'bull', 'bear', or 'sideways'
+            
+        Returns:
+            Dict with calibrated target and statistical metrics
+        """
+        if current_price <= 0 or estimated_days <= 0 or atr <= 0:
+            return {'target_price': target_price, 'is_realistic': True, 'z_score': 0}
+            
+        # 1. Calculate Estimated Daily Volatility (Standard Deviation Proxy)
+        # ATR is a range. Standard deviation of returns (sigma) is typically ~80% of ATR/Price ratio
+        sigma_daily = (atr * 0.8) / current_price
+        
+        # 2. Square Root of Time rule for multi-day volatility (Sigma_T = Sigma * sqrt(T))
+        # This handles the fact that price dispersion increases with the root of time
+        sigma_t = sigma_daily * np.sqrt(estimated_days)
+        
+        # 3. Calculate Required Move as a Z-Score
+        actual_move_pct = abs(target_price - current_price) / current_price
+        z_score = actual_move_pct / sigma_t if sigma_t > 0 else 0
+        
+        # 4. Determine Dynamic Threshold based on Regime
+        # Bull markets allow for higher momentum (2.8 sigma)
+        # Bear/Sideways markets should be more conservative (1.8 sigma)
+        threshold = 2.2 
+        if market_regime == 'bull':
+            threshold = 2.8
+        elif market_regime == 'bear':
+            threshold = 1.8
+            
+        calibrated_target = target_price
+        is_realistic = True
+        reason = ""
+        
+        # 5. Calibration Logic
+        if z_score > threshold:
+            # Over-extended target (Statistically improbable for the window)
+            # Cap it at the threshold sigma
+            max_realistic_move = current_price * (threshold * sigma_t)
+            
+            if target_price > current_price:
+                calibrated_target = current_price + max_realistic_move
+            else:
+                calibrated_target = current_price - max_realistic_move
+            
+            is_realistic = False
+            reason = f"Target was statistically extreme (Z={z_score:.1f}). Capped at {threshold} Sigma for {estimated_days}d."
+            
+        return {
+            'target_price': float(calibrated_target),
+            'z_score': float(z_score),
+            'is_realistic': is_realistic,
+            'reason': reason,
+            'implied_sigma_t': float(sigma_t)
+        }
 

@@ -359,9 +359,15 @@ class DataQualityChecker:
             # For now, we'll keep outliers but could remove them
             pass
         
-        # Fill missing values
+        # Fill missing values: STRICT FORWARD FILL ONLY (Rule #5)
+        # Never use bfill() as it introduces look-ahead bias from future prices.
         if 'close' in df.columns:
-            df['close'] = df['close'].fillna(method='ffill').fillna(method='bfill')
+            df['close'] = df['close'].ffill()
+        
+        # Also ffill other price columns to be safe
+        for col in ['open', 'high', 'low', 'volume']:
+            if col in df.columns:
+                df[col] = df[col].ffill()
         
         # Ensure price relationships are valid
         if all(col in df.columns for col in ['open', 'high', 'low', 'close']):

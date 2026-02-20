@@ -42,12 +42,16 @@ class MixedAnalyzer:
             self.has_market_intel = False
     
     def analyze(self, stock_data: dict, financials_data: dict, history_data: dict,
-               sentiment_info: dict = None, macro_info: dict = None) -> Dict:
+               sentiment_info: dict = None, macro_info: dict = None, current_date=None) -> Dict:
         """
         Perform mixed analysis combining technical and fundamental factors
         for medium-term holding (1 week to 1 month)
         """
         try:
+            # Filter financials if date is provided
+            if current_date and financials_data:
+                financials_data = self._filter_financials(financials_data, current_date)
+
             if not stock_data or 'error' in stock_data:
                 return {'error': 'Invalid stock data'}
             
@@ -73,14 +77,17 @@ class MixedAnalyzer:
             if self.has_market_intel:
                 if sentiment_info is None:
                     try:
-                        sentiment_info = self.sentiment_analyzer.analyze_sentiment(stock_data.get('symbol', ''))
+                        sentiment_info = self.sentiment_analyzer.analyze_sentiment(
+                            stock_data.get('symbol', ''), 
+                            as_of_date=current_date
+                        )
                     except Exception as e:
                         logger.debug(f"Error in sentiment analysis: {e}")
                 
                 if macro_info is None:
                     try:
-                        # Use SPY as proxy if available, or fetch
-                        macro_info = self.macro_detector.detect_regime(None)
+                        # Use detector with current_date for historical accuracy
+                        macro_info = self.macro_detector.detect_regime(current_date=current_date)
                     except Exception as e:
                         logger.debug(f"Error in macro analysis: {e}")
             
@@ -105,12 +112,41 @@ class MixedAnalyzer:
                 'strategy': 'mixed',
                 'timeframe': '1 week - 1 month',
                 'sentiment_info': sentiment_info,
-                'macro_info': macro_info
+                'macro_info': macro_info,
+                'market_regime': macro_info
             }
         
         except Exception as e:
             logger.error(f"Error in mixed analysis: {e}")
             return {'error': f'Analysis error: {str(e)}'}
+            
+    def _filter_financials(self, financials_data: dict, current_date) -> dict:
+        """Filter financials to only include data available relative to current_date"""
+        if not financials_data or not current_date:
+            return financials_data
+            
+        filtered = financials_data.copy()
+        try:
+            from datetime import datetime
+            if isinstance(current_date, str):
+                current_date = datetime.strptime(current_date, '%Y-%m-%d')
+            
+            for key in ['financials', 'balance_sheet', 'cashflow']:
+                if key in filtered and isinstance(filtered[key], dict):
+                    valid_data = {}
+                    for date_str, metrics in filtered[key].items():
+                        try:
+                            # Assume date keys in YYYY-MM-DD
+                            report_date = datetime.strptime(str(date_str).split()[0], '%Y-%m-%d')
+                            if report_date <= current_date:
+                                valid_data[date_str] = metrics
+                        except:
+                            pass
+                    filtered[key] = valid_data
+        except Exception as e:
+            logger.warning(f"Error filtering financials in mixed analyzer: {e}")
+            
+        return filtered
     
     def _calculate_technical_score(self, data: list, current_price: float) -> float:
         """Calculate technical analysis score (0-100) using advanced indicators"""
@@ -280,6 +316,10 @@ class MixedAnalyzer:
         """Calculate fundamental analysis score (0-100)"""
         try:
             score = 50.0  # Start neutral
+            
+            # Handle missing financials data gracefully
+            if financials_data is None:
+                financials_data = {}
             
             # Market cap (larger is generally more stable)
             market_cap = stock_data.get('market_cap', 0)

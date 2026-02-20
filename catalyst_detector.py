@@ -33,17 +33,17 @@ class CatalystDetector:
             return False
         return datetime.now() < self._cache_expiry[symbol]
     
-    def get_earnings_date(self, symbol: str, stock_info: dict = None) -> Optional[datetime]:
+    def get_earnings_date(self, symbol: str, stock_info: dict = None, 
+                          as_of_date: Optional[datetime] = None) -> Optional[datetime]:
         """
-        Get next earnings date for a stock
-        
-        Args:
-            symbol: Stock ticker symbol
-            stock_info: Optional pre-fetched stock info
-            
-        Returns:
-            Next earnings date or None
+        Get next earnings date for a stock (Date-aware)
         """
+        # INTEGRITY LOCK: If backtesting, return None. 
+        # yfinance.calendar is always "current" (2026). 
+        # Using 2026 earnings dates in a 2018 backtest is a leak.
+        if as_of_date and (datetime.now() - as_of_date).days > 7:
+            return None
+
         cache_key = f"{symbol}_earnings"
         
         # Check cache
@@ -106,17 +106,15 @@ class CatalystDetector:
         
         return None
     
-    def get_dividend_date(self, symbol: str, stock_info: dict = None) -> Optional[datetime]:
+    def get_dividend_date(self, symbol: str, stock_info: dict = None,
+                          as_of_date: Optional[datetime] = None) -> Optional[datetime]:
         """
-        Get next ex-dividend date for a stock
-        
-        Args:
-            symbol: Stock ticker symbol
-            stock_info: Optional pre-fetched stock info
-            
-        Returns:
-            Next ex-dividend date or None
+        Get next ex-dividend date for a stock (Date-aware)
         """
+        # INTEGRITY LOCK: If backtesting, return None.
+        if as_of_date and (datetime.now() - as_of_date).days > 7:
+            return None
+
         cache_key = f"{symbol}_dividend"
         
         # Check cache
@@ -161,15 +159,10 @@ class CatalystDetector:
         
         return None
     
-    def days_to_catalyst(self, catalyst_date: Optional[datetime]) -> Optional[int]:
+    def days_to_catalyst(self, catalyst_date: Optional[datetime], 
+                         as_of_date: Optional[datetime] = None) -> Optional[int]:
         """
-        Calculate days until a catalyst event
-        
-        Args:
-            catalyst_date: Date of the catalyst
-            
-        Returns:
-            Days until catalyst or None
+        Calculate days until a catalyst event relative to as_of_date (Date-aware)
         """
         if catalyst_date is None:
             return None
@@ -182,22 +175,21 @@ class CatalystDetector:
             if hasattr(catalyst_date, 'tzinfo') and catalyst_date.tzinfo is not None:
                 catalyst_date = catalyst_date.replace(tzinfo=None)
             
-            delta = catalyst_date - datetime.now()
+            # Use as_of_date as reference for backtesting
+            reference_date = as_of_date if as_of_date else datetime.now()
+            if hasattr(reference_date, 'tzinfo') and reference_date.tzinfo is not None:
+                reference_date = reference_date.replace(tzinfo=None)
+                
+            delta = catalyst_date - reference_date
             return max(0, delta.days)
         except Exception as e:
             logger.warning(f"Error calculating days to catalyst: {e}")
             return None
     
-    def detect_catalysts(self, symbol: str, stock_info: dict = None) -> Dict:
+    def detect_catalysts(self, symbol: str, stock_info: dict = None, 
+                         as_of_date: Optional[datetime] = None) -> Dict:
         """
-        Detect all upcoming catalysts for a stock
-        
-        Args:
-            symbol: Stock ticker symbol
-            stock_info: Optional pre-fetched stock info
-            
-        Returns:
-            Dict with catalyst information
+        Detect all upcoming catalysts for a stock (Date-aware)
         """
         result = {
             'symbol': symbol,
@@ -213,10 +205,10 @@ class CatalystDetector:
         
         try:
             # Get earnings date
-            earnings_date = self.get_earnings_date(symbol, stock_info)
+            earnings_date = self.get_earnings_date(symbol, stock_info, as_of_date)
             if earnings_date:
                 result['earnings_date'] = earnings_date.strftime('%Y-%m-%d')
-                result['days_to_earnings'] = self.days_to_catalyst(earnings_date)
+                result['days_to_earnings'] = self.days_to_catalyst(earnings_date, as_of_date)
                 result['has_upcoming_catalyst'] = True
                 result['available'] = True
                 
@@ -226,10 +218,10 @@ class CatalystDetector:
                     result['catalyst_type'] = 'earnings'
             
             # Get dividend date
-            dividend_date = self.get_dividend_date(symbol, stock_info)
+            dividend_date = self.get_dividend_date(symbol, stock_info, as_of_date)
             if dividend_date:
                 result['dividend_date'] = dividend_date.strftime('%Y-%m-%d')
-                result['days_to_dividend'] = self.days_to_catalyst(dividend_date)
+                result['days_to_dividend'] = self.days_to_catalyst(dividend_date, as_of_date)
                 result['has_upcoming_catalyst'] = True
                 result['available'] = True
                 

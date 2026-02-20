@@ -1,160 +1,133 @@
 """
-Diagnostic script to investigate SELL bias in ML predictions
+Diagnose SELL Bias in ML Model
+This script checks how labels are encoded and decoded to find the inversion bug.
 """
-import json
-import numpy as np
+import sys
+sys.path.insert(0, '.')
+
 from pathlib import Path
-from ml_training import StockPredictionML, FeatureExtractor
+import json
 import logging
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
-def analyze_model_bias():
-    """Analyze why the model is biased toward SELL predictions"""
-    
-    data_dir = Path("data")
-    strategy = "trading"
-    
-    # Load the model
-    ml_predictor = StockPredictionML(data_dir, strategy)
-    
-    # Force reload if needed
-    if not ml_predictor.is_trained():
-        logger.warning("Model not loaded, attempting to reload...")
-        try:
-            ml_predictor._load_model()
-        except:
-            pass
-    
-    if not ml_predictor.is_trained():
-        logger.error("Model is not trained!")
-        # Try to read metadata directly
-        metadata_file = data_dir / f"ml_metadata_{strategy}.json"
-        if metadata_file.exists():
-            logger.info(f"Reading metadata directly from {metadata_file}")
-            with open(metadata_file, 'r') as f:
-                metadata = json.load(f)
-                ml_predictor.metadata = metadata
-                logger.info("Loaded metadata directly")
-        else:
-            logger.error("Metadata file not found!")
-            return
-    
-    logger.info("=" * 60)
-    logger.info("MODEL BIAS DIAGNOSTIC")
-    logger.info("=" * 60)
-    
-    # Check metadata
-    if ml_predictor.metadata:
-        logger.info("\n1. MODEL METADATA:")
-        logger.info(f"   - Use binary classification: {ml_predictor.metadata.get('use_binary_classification', False)}")
-        logger.info(f"   - Training accuracy: {ml_predictor.metadata.get('train_accuracy', 0)*100:.1f}%")
-        logger.info(f"   - Test accuracy: {ml_predictor.metadata.get('test_accuracy', 0)*100:.1f}%")
-        
-        # Check class distribution in training
-        if 'training_label_distribution' in ml_predictor.metadata:
-            logger.info(f"   - Training label distribution: {ml_predictor.metadata['training_label_distribution']}")
-    
-    # Check label encoder
-    logger.info("\n2. LABEL ENCODER:")
-    if hasattr(ml_predictor, 'label_encoder') and hasattr(ml_predictor.label_encoder, 'classes_'):
-        classes = list(ml_predictor.label_encoder.classes_)
-        logger.info(f"   - Classes: {classes}")
-        logger.info(f"   - Number of classes: {len(classes)}")
-        
-        # Check if it's binary mode
-        is_binary = set(classes) == {'UP', 'DOWN'} or (len(classes) == 2 and 'UP' in classes and 'DOWN' in classes)
-        logger.info(f"   - Binary mode: {is_binary}")
-        
-        if is_binary:
-            logger.info("   - UP → SELL (price goes up = sell signal)")
-            logger.info("   - DOWN → BUY (price goes down = buy signal)")
-    else:
-        logger.warning("   - Label encoder not available!")
-    
-    # Check regime models
-    logger.info("\n3. REGIME MODELS:")
-    if hasattr(ml_predictor, 'regime_models') and ml_predictor.regime_models:
-        logger.info(f"   - Number of regime models: {len(ml_predictor.regime_models)}")
-        for regime, regime_ml in ml_predictor.regime_models.items():
-            logger.info(f"   - {regime}:")
-            if hasattr(regime_ml, 'label_encoder') and hasattr(regime_ml.label_encoder, 'classes_'):
-                regime_classes = list(regime_ml.label_encoder.classes_)
-                logger.info(f"     Classes: {regime_classes}")
-            if hasattr(regime_ml, 'metadata') and regime_ml.metadata:
-                logger.info(f"     Test accuracy: {regime_ml.metadata.get('test_accuracy', 0)*100:.1f}%")
-                if 'training_label_distribution' in regime_ml.metadata:
-                    logger.info(f"     Training distribution: {regime_ml.metadata['training_label_distribution']}")
-    else:
-        logger.info("   - No regime models (using single model)")
-    
-    # Test with dummy features to see default behavior
-    logger.info("\n4. TESTING WITH DUMMY FEATURES:")
-    feature_extractor = FeatureExtractor()
-    num_features = 130  # Standard number of features
-    
-    # Create dummy features (all zeros - neutral)
-    dummy_features = np.zeros((1, num_features))
-    
-    # Create dummy stock_data and history_data
-    dummy_stock_data = {'price': 100.0}
-    dummy_history_data = {'data': []}
-    
-    try:
-        # Try to get prediction
-        result = ml_predictor.predict(dummy_features, dummy_stock_data, dummy_history_data)
-        if result and 'action' in result:
-            logger.info(f"   - Dummy prediction: {result['action']}")
-            logger.info(f"   - Confidence: {result.get('confidence', 0):.1f}%")
-            logger.info(f"   - Probabilities: {result.get('probabilities', {})}")
-        else:
-            logger.warning(f"   - Prediction failed: {result}")
-    except Exception as e:
-        logger.error(f"   - Error making prediction: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-    
-    # Check if there's a class imbalance issue
-    logger.info("\n5. CLASS IMBALANCE ANALYSIS:")
-    if ml_predictor.metadata and 'training_label_distribution' in ml_predictor.metadata:
-        dist = ml_predictor.metadata['training_label_distribution']
-        if isinstance(dist, dict):
-            total = sum(dist.values())
-            for label, count in dist.items():
-                pct = (count / total * 100) if total > 0 else 0
-                logger.info(f"   - {label}: {count} ({pct:.1f}%)")
-                
-                # Check if there's significant imbalance
-                if pct > 60:
-                    logger.warning(f"     ⚠️  {label} is overrepresented ({pct:.1f}%)")
-                    logger.warning(f"     This may cause the model to bias toward {label}")
-    
-    logger.info("\n" + "=" * 60)
-    logger.info("RECOMMENDATIONS:")
-    logger.info("=" * 60)
-    
-    # Provide recommendations
-    if ml_predictor.metadata and 'training_label_distribution' in ml_predictor.metadata:
-        dist = ml_predictor.metadata['training_label_distribution']
-        if isinstance(dist, dict):
-            total = sum(dist.values())
-            for label, count in dist.items():
-                pct = (count / total * 100) if total > 0 else 0
-                if pct > 60:
-                    logger.info(f"1. Class imbalance detected: {label} is {pct:.1f}% of training data")
-                    logger.info("   → Consider using stronger class weights or SMOTE oversampling")
-                    logger.info("   → Collect more samples for the minority class")
-    
-    logger.info("2. Model is predicting SELL almost exclusively")
-    logger.info("   → Check if features are providing good separation")
-    logger.info("   → Consider adding a confidence threshold to filter low-confidence predictions")
-    logger.info("   → Review feature importance to see which features drive SELL predictions")
-    
-    logger.info("3. Backtesting accuracy is 41% (below random)")
-    logger.info("   → Model may need more diverse training data")
-    logger.info("   → Consider retraining with more balanced classes")
-    logger.info("   → Check if there's a data leakage issue")
+# Find the model files
+from config import APP_DATA_DIR
+data_dir = Path(APP_DATA_DIR)
 
-if __name__ == "__main__":
-    analyze_model_bias()
+# Load secure storage
+from secure_ml_storage import SecureMLStorage
+storage = SecureMLStorage(data_dir)
+
+print("=" * 70)
+print("DIAGNOSING SELL BIAS - LABEL ENCODING CHECK")
+print("=" * 70)
+
+# Check each regime model
+regimes = ['bull', 'bear', 'sideways']
+
+for regime in regimes:
+    print(f"\n{'='*30} {regime.upper()} MODEL {'='*30}")
+    
+    # Load label encoder
+    encoder_file = f"label_encoder_trading_{regime}.pkl"
+    encoder = storage.load_model(encoder_file)
+    
+    if encoder is None:
+        print(f"  ❌ Could not load {encoder_file}")
+        continue
+    
+    classes = list(encoder.classes_)
+    print(f"  Label Encoder Classes: {classes}")
+    print(f"  Class Index Mapping:")
+    for i, cls in enumerate(classes):
+        print(f"    {i} -> {cls}")
+    
+    # Check model
+    model_file = f"ml_model_trading_{regime}.pkl"
+    model = storage.load_model(model_file)
+    
+    if model is None:
+        print(f"  ❌ Could not load {model_file}")
+        continue
+    
+    print(f"  Model type: {type(model).__name__}")
+    
+    # If it's a calibrated classifier, get the base classes
+    if hasattr(model, 'classes_'):
+        print(f"  Model.classes_: {list(model.classes_)}")
+    
+    # Test prediction with dummy data
+    print(f"\n  Testing prediction flow...")
+    import numpy as np
+    
+    # Load scaler
+    scaler_file = f"scaler_trading_{regime}.pkl"
+    scaler = storage.load_model(scaler_file)
+    
+    if scaler is None:
+        print(f"  ❌ Could not load {scaler_file}")
+        continue
+    
+    n_features = scaler.n_features_in_
+    print(f"  Scaler expects {n_features} features")
+    
+    # Create dummy feature vector (all zeros)
+    dummy_features = np.zeros((1, n_features))
+    dummy_scaled = scaler.transform(dummy_features)
+    
+    # Get probabilities
+    try:
+        probs = model.predict_proba(dummy_scaled)[0]
+        pred_idx = model.predict(dummy_scaled)[0]
+        
+        print(f"\n  Dummy Test (all-zero features):")
+        print(f"    Raw probabilities: {probs}")
+        print(f"    Predicted class index: {pred_idx}")
+        print(f"    Decoded label: {encoder.inverse_transform([pred_idx])[0]}")
+        
+        print(f"\n  Probability interpretation:")
+        for i, p in enumerate(probs):
+            label = encoder.classes_[i]
+            # How the code converts to BUY/SELL
+            display = 'SELL' if label == 'DOWN' else ('BUY' if label == 'UP' else label)
+            print(f"    prob[{i}] = {p:.4f} -> {label} -> display as {display}")
+        
+        # Check which has higher probability
+        max_idx = np.argmax(probs)
+        max_label = encoder.classes_[max_idx]
+        max_display = 'SELL' if max_label == 'DOWN' else ('BUY' if max_label == 'UP' else max_label)
+        print(f"\n  ⚡ Final prediction: {max_display} (prob={probs[max_idx]:.4f})")
+        
+        # THE KEY CHECK: Is the model correctly predicting based on training data?
+        # Training has MORE UP (839) than DOWN (360), so with neutral features,
+        # the model's prior should lean toward UP (BUY), NOT DOWN (SELL)
+        if max_display == 'SELL':
+            print(f"\n  ⚠️ WARNING: Model predicts SELL even with neutral features!")
+            print(f"  ⚠️ This suggests the model is biased toward SELL/DOWN class.")
+            print(f"  ⚠️ But training had 839 UP vs 360 DOWN - should be biased toward UP!")
+        else:
+            print(f"\n  ✅ Model predicts BUY with neutral features (expected with 839 UP vs 360 DOWN)")
+            
+    except Exception as e:
+        print(f"  ❌ Error during prediction: {e}")
+        import traceback
+        traceback.print_exc()
+
+# Check metadata
+print("\n" + "=" * 70)
+print("CHECKING METADATA")
+print("=" * 70)
+
+for regime in regimes:
+    metadata_file = data_dir / f"ml_metadata_trading_{regime}.json"
+    if metadata_file.exists():
+        with open(metadata_file) as f:
+            meta = json.load(f)
+        print(f"\n{regime.upper()} metadata:")
+        print(f"  use_binary_classification: {meta.get('use_binary_classification', 'NOT SET')}")
+        print(f"  train_accuracy: {meta.get('train_accuracy', 'N/A')}")  
+        print(f"  test_accuracy: {meta.get('test_accuracy', 'N/A')}")
+    else:
+        print(f"\n{regime.upper()} metadata: FILE NOT FOUND")

@@ -8,6 +8,8 @@ from ta.trend import MACD, EMAIndicator, ADXIndicator
 from ta.momentum import RSIIndicator, StochasticOscillator, WilliamsRIndicator
 from ta.volatility import BollingerBands
 from ta.volume import OnBalanceVolumeIndicator
+from typing import Optional, Dict, List, Tuple
+from datetime import datetime
 try:
     from ta.volume import MFIIndicator
     HAS_MFI = True
@@ -16,7 +18,7 @@ except ImportError:
     logger.warning("MFIIndicator not available in ta library, will calculate manually")
 import logging
 
-from algorithm_improvements import MarketRegimeDetector, VolumeWeightedLevels, MultiTimeframeAnalyzer, RelativeStrengthAnalyzer
+from algorithm_improvements import MarketRegimeDetector, VolumeWeightedLevels, MultiTimeframeAnalyzer, RelativeStrengthAnalyzer, StatisticalTargetCalibrator
 from pattern_recognition import PatternRecognizer
 from sector_momentum import SectorMomentumAnalyzer
 from catalyst_detector import CatalystDetector
@@ -37,6 +39,7 @@ class TradingAnalyzer:
         self.volume_levels_calculator = VolumeWeightedLevels()
         self.timeframe_analyzer = MultiTimeframeAnalyzer()
         self.relative_strength_analyzer = RelativeStrengthAnalyzer()
+        self.statistical_calibrator = StatisticalTargetCalibrator()
         self.pattern_recognizer = PatternRecognizer()
         self.pattern_recognizer = PatternRecognizer()
         self.sector_analyzer = SectorMomentumAnalyzer(data_fetcher)
@@ -49,7 +52,7 @@ class TradingAnalyzer:
         self._spy_data_cache = None
         self._spy_data_cache_time = None
     
-    def analyze(self, stock_data: dict, history_data: dict) -> dict:
+    def analyze(self, stock_data: dict, history_data: dict, current_date=None) -> dict:
         """
         Perform trading analysis on stock data
         Returns buy/sell recommendation with reasoning
@@ -64,29 +67,40 @@ class TradingAnalyzer:
             df.set_index('date', inplace=True)
             df = df.sort_index()
             
+            # CRITICAL FIX: Strict Date Slicing for Backtesting
+            # Ensure we NEVER see data beyond current_date (Data Leakage Prevention)
+            if current_date:
+                # Use string comparison or timestamp comparison depending on type
+                current_ts = pd.Timestamp(current_date)
+                df = df[df.index <= current_ts]
+                
+                if df.empty:
+                    return {"error": f"No data available up to {current_date}"}
+            
             # Get symbol for catalyst detection
             symbol = stock_data.get('symbol', stock_data.get('info', {}).get('symbol', ''))
             
             # Detect market regime (using SPY as market proxy)
-            market_regime = self._get_market_regime()
+            # Pass current_date to ensure we don't peek into the future during backtests
+            market_regime = self._get_market_regime(current_date)
             
             # Multi-timeframe analysis (daily, weekly, monthly trends)
             timeframe_analysis = self.timeframe_analyzer.analyze_timeframes(df)
             
             # Relative strength analysis (stock vs market)
-            relative_strength = self._calculate_relative_strength(df)
+            relative_strength = self._calculate_relative_strength(df, current_date)
             
             # Sector momentum analysis (stock vs sector ETF)
-            sector_analysis = self.sector_analyzer.analyze(stock_data, df)
+            sector_analysis = self.sector_analyzer.analyze(stock_data, df, current_date)
             
-            # Catalyst detection (earnings, dividends)
-            catalyst_info = self.catalyst_detector.detect_catalysts(symbol, stock_data)
+            # Catalyst detection (earnings, dividends) - Date Aware
+            catalyst_info = self.catalyst_detector.detect_catalysts(symbol, stock_data, as_of_date=current_date)
             
-            # Sentiment Analysis (News)
-            sentiment_info = self.sentiment_analyzer.analyze_sentiment(symbol)
+            # Sentiment Analysis (News) - Date Aware
+            sentiment_info = self.sentiment_analyzer.analyze_sentiment(symbol, as_of_date=current_date)
             
             # Macro Regime (VIX, TNX, DXY) - mostly cached
-            macro_info = self.macro_detector.analyze_regime()
+            macro_info = self.macro_detector.analyze_regime(current_date)
             
             # Calculate technical indicators
             indicators = self._calculate_indicators(df)
@@ -139,129 +153,181 @@ class TradingAnalyzer:
             return {"error": str(e)}
     
     def _calculate_indicators(self, df: pd.DataFrame) -> dict:
-        """Calculate technical indicators"""
+        """Calculate technical indicators (returns latest values as dict)"""
         indicators = {}
+        
+        try:
+            # Re-use the vectorized method to avoid code duplication
+            df_aug = self._calculate_indicators_vectorized(df)
+            
+            # Extract last row as scalars
+            last_row = df_aug.iloc[-1]
+            
+            # Map back to the expected dict structure
+            indicators = {
+                'rsi': float(last_row.get('rsi', 50)),
+                'rsi_prev': float(df_aug.iloc[-2].get('rsi', 50)) if len(df_aug) > 1 else 50.0,
+                'macd': float(last_row.get('macd', 0)),
+                'macd_signal': float(last_row.get('macd_signal', 0)),
+                'macd_diff': float(last_row.get('macd_diff', 0)),
+                'ema_20': float(last_row.get('ema_20', 0)),
+                'ema_50': float(last_row.get('ema_50', 0)),
+                'ema_200': float(last_row.get('ema_200', 0)),
+                'bb_upper': float(last_row.get('bb_upper', 0)),
+                'bb_lower': float(last_row.get('bb_lower', 0)),
+                'bb_middle': float(last_row.get('bb_middle', 0)),
+                'atr': float(last_row.get('atr', 0)),
+                'atr_percent': float(last_row.get('atr_percent', 0)),
+                'stoch_k': float(last_row.get('stoch_k', 50)),
+                'stoch_d': float(last_row.get('stoch_d', 50)),
+                'williams_r': float(last_row.get('williams_r', -50)),
+                'adx': float(last_row.get('adx', 25)),
+                'adx_pos': float(last_row.get('adx_pos', 0)),
+                'adx_neg': float(last_row.get('adx_neg', 0)),
+                'obv': float(last_row.get('obv', 0)),
+                'obv_trend': last_row.get('obv_trend', 'neutral'),
+                'mfi': float(last_row.get('mfi', 50)),
+                
+                # Booleans
+                'ema_20_above_50': bool(last_row.get('ema_20_above_50', False)),
+                'ema_50_above_200': bool(last_row.get('ema_50_above_200', False)),
+                'golden_cross': bool(last_row.get('golden_cross', False)),
+                'death_cross': bool(last_row.get('death_cross', False)),
+                'price_above_ema20': bool(last_row.get('price_above_ema20', False)),
+                'price_above_ema50': bool(last_row.get('price_above_ema50', False)),
+                'price_above_ema200': bool(last_row.get('price_above_ema200', False)),
+            }
+            
+            # Pattern analysis is not fully vectorized yet, keep as is
+            indicators['basic_candlestick'] = self._detect_candlestick_pattern(df)
+            pattern_analysis = self.pattern_recognizer.detect_all_patterns(df)
+            indicators['pattern_analysis'] = pattern_analysis
+            indicators['candlestick_pattern'] = pattern_analysis.get('primary_pattern', 'unknown')
+            
+        except Exception as e:
+            logger.error(f"Error calculating indicators: {e}")
+        
+        return indicators
+
+    def _calculate_indicators_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate technical indicators vectorially (returns augmented DataFrame)"""
+        # Work on a copy
+        df = df.copy()
         
         try:
             # RSI
             rsi_indicator = RSIIndicator(close=df['close'], window=14)
-            indicators['rsi'] = float(rsi_indicator.rsi().iloc[-1])
+            df['rsi'] = rsi_indicator.rsi()
             
             # MACD
             macd_indicator = MACD(close=df['close'])
-            indicators['macd'] = float(macd_indicator.macd().iloc[-1])
-            indicators['macd_signal'] = float(macd_indicator.macd_signal().iloc[-1])
-            indicators['macd_diff'] = float(macd_indicator.macd_diff().iloc[-1])
+            df['macd'] = macd_indicator.macd()
+            df['macd_signal'] = macd_indicator.macd_signal()
+            df['macd_diff'] = macd_indicator.macd_diff()
             
             # Moving Averages
             ema_20 = EMAIndicator(close=df['close'], window=20)
             ema_50 = EMAIndicator(close=df['close'], window=50)
             ema_200 = EMAIndicator(close=df['close'], window=200)
             
-            indicators['ema_20'] = float(ema_20.ema_indicator().iloc[-1])
-            indicators['ema_50'] = float(ema_50.ema_indicator().iloc[-1])
-            indicators['ema_200'] = float(ema_200.ema_indicator().iloc[-1])
+            df['ema_20'] = ema_20.ema_indicator()
+            df['ema_50'] = ema_50.ema_indicator()
+            df['ema_200'] = ema_200.ema_indicator()
             
             # Bollinger Bands
             bb = BollingerBands(close=df['close'], window=20, window_dev=2)
-            indicators['bb_upper'] = float(bb.bollinger_hband().iloc[-1])
-            indicators['bb_lower'] = float(bb.bollinger_lband().iloc[-1])
-            indicators['bb_middle'] = float(bb.bollinger_mavg().iloc[-1])
+            df['bb_upper'] = bb.bollinger_hband()
+            df['bb_lower'] = bb.bollinger_lband()
+            df['bb_middle'] = bb.bollinger_mavg()
             
-            # ATR (Average True Range) for volatility
+            # ATR
             high_low = df['high'] - df['low']
             high_close = np.abs(df['high'] - df['close'].shift())
             low_close = np.abs(df['low'] - df['close'].shift())
             ranges = pd.concat([high_low, high_close, low_close], axis=1)
             true_range = ranges.max(axis=1)
-            indicators['atr'] = float(true_range.rolling(14).mean().iloc[-1])
-            indicators['atr_percent'] = float((indicators['atr'] / df['close'].iloc[-1]) * 100)
+            df['atr'] = true_range.rolling(14).mean()
+            df['atr_percent'] = (df['atr'] / df['close']) * 100
             
-            # Stochastic Oscillator - Momentum indicator
+            # Stochastic
             try:
                 stoch = StochasticOscillator(high=df['high'], low=df['low'], close=df['close'])
-                indicators['stoch_k'] = float(stoch.stoch().iloc[-1])
-                indicators['stoch_d'] = float(stoch.stoch_signal().iloc[-1])
+                df['stoch_k'] = stoch.stoch()
+                df['stoch_d'] = stoch.stoch_signal()
             except:
-                indicators['stoch_k'] = 50
-                indicators['stoch_d'] = 50
+                df['stoch_k'] = 50
+                df['stoch_d'] = 50
             
-            # Williams %R - Momentum indicator
+            # Williams %R
             try:
                 williams = WilliamsRIndicator(high=df['high'], low=df['low'], close=df['close'])
-                indicators['williams_r'] = float(williams.williams_r().iloc[-1])
+                df['williams_r'] = williams.williams_r()
             except:
-                indicators['williams_r'] = -50
+                df['williams_r'] = -50
             
-            # ADX (Average Directional Index) - Trend strength
+            # ADX
             try:
                 adx = ADXIndicator(high=df['high'], low=df['low'], close=df['close'])
-                indicators['adx'] = float(adx.adx().iloc[-1])
-                indicators['adx_pos'] = float(adx.adx_pos().iloc[-1])
-                indicators['adx_neg'] = float(adx.adx_neg().iloc[-1])
+                df['adx'] = adx.adx()
+                df['adx_pos'] = adx.adx_pos()
+                df['adx_neg'] = adx.adx_neg()
             except:
-                indicators['adx'] = 25
-                indicators['adx_pos'] = 0
-                indicators['adx_neg'] = 0
+                df['adx'] = 25
+                df['adx_pos'] = 0
+                df['adx_neg'] = 0
             
-            # On-Balance Volume (OBV) - Volume momentum
+            # OBV
             try:
-                obv = OnBalanceVolumeIndicator(close=df['close'], volume=df['volume'])
-                obv_values = obv.on_balance_volume()
-                indicators['obv'] = float(obv_values.iloc[-1])
-                # OBV trend (increasing/decreasing)
-                if len(obv_values) >= 10:
-                    obv_trend = obv_values.iloc[-1] - obv_values.iloc[-10]
-                    indicators['obv_trend'] = 'bullish' if obv_trend > 0 else 'bearish'
-                else:
-                    indicators['obv_trend'] = 'neutral'
+                obv_ind = OnBalanceVolumeIndicator(close=df['close'], volume=df['volume'])
+                df['obv'] = obv_ind.on_balance_volume()
+                
+                # OBV Trend (Vectorized 10-day lookback)
+                # Compare current OBV with 10 days ago
+                df['obv_trend'] = np.where(df['obv'] > df['obv'].shift(10), 'bullish', 
+                                         np.where(df['obv'] < df['obv'].shift(10), 'bearish', 'neutral'))
             except:
-                indicators['obv'] = 0
-                indicators['obv_trend'] = 'neutral'
+                df['obv'] = 0
+                df['obv_trend'] = 'neutral'
             
-            # Money Flow Index (MFI) - Combines price and volume to identify overbought/oversold
+            # MFI
             try:
                 if HAS_MFI:
-                    mfi_indicator = MFIIndicator(high=df['high'], low=df['low'], close=df['close'], volume=df['volume'])
-                    indicators['mfi'] = float(mfi_indicator.money_flow_index().iloc[-1])
+                    mfi_ind = MFIIndicator(high=df['high'], low=df['low'], close=df['close'], volume=df['volume'])
+                    df['mfi'] = mfi_ind.money_flow_index()
                 else:
-                    # Calculate MFI manually
+                    # Manual Vectorized MFI
                     typical_price = (df['high'] + df['low'] + df['close']) / 3
-                    raw_money_flow = typical_price * df['volume']
-                    positive_flow = raw_money_flow.where(typical_price > typical_price.shift(1), 0)
-                    negative_flow = raw_money_flow.where(typical_price < typical_price.shift(1), 0)
-                    positive_mf = positive_flow.rolling(window=14).sum()
-                    negative_mf = negative_flow.rolling(window=14).sum()
-                    money_ratio = positive_mf / negative_mf.replace([np.inf, -np.inf, np.nan], 0)
-                    mfi_values = 100 - (100 / (1 + money_ratio.replace([np.inf, -np.inf, np.nan], 1)))
-                    indicators['mfi'] = float(mfi_values.iloc[-1]) if not pd.isna(mfi_values.iloc[-1]) else 50
-            except Exception as e:
-                logger.warning(f"Could not calculate MFI: {e}")
-                indicators['mfi'] = 50  # Neutral if calculation fails
+                    money_flow = typical_price * df['volume']
+                    
+                    # Positive/Negative flow
+                    # We need to compare specific rows, simpler to use shift
+                    tp_shift = typical_price.shift(1)
+                    pos_flow = np.where(typical_price > tp_shift, money_flow, 0)
+                    neg_flow = np.where(typical_price < tp_shift, money_flow, 0)
+                    
+                    # Rolling sum
+                    pos_mf = pd.Series(pos_flow, index=df.index).rolling(window=14).sum()
+                    neg_mf = pd.Series(neg_flow, index=df.index).rolling(window=14).sum()
+                    
+                    mfi_ratio = pos_mf / neg_mf.replace(0, 1e-9) # Avoid div by zero
+                    df['mfi'] = 100 - (100 / (1 + mfi_ratio))
+            except:
+                df['mfi'] = 50
+                
+            # Booleans and Crossovers
+            df['ema_20_above_50'] = df['ema_20'] > df['ema_50']
+            df['ema_50_above_200'] = df['ema_50'] > df['ema_200']
+            df['golden_cross'] = df['ema_20_above_50'] & df['ema_50_above_200']
+            df['death_cross'] = (~df['ema_20_above_50']) & (~df['ema_50_above_200'])
             
-            # Moving Average Crossovers
-            indicators['ema_20_above_50'] = indicators['ema_20'] > indicators['ema_50']
-            indicators['ema_50_above_200'] = indicators['ema_50'] > indicators['ema_200']
-            indicators['golden_cross'] = indicators['ema_20_above_50'] and indicators['ema_50_above_200']
-            indicators['death_cross'] = not indicators['ema_20_above_50'] and not indicators['ema_50_above_200']
-            
-            # Price position relative to EMAs
-            current_price = df['close'].iloc[-1]
-            indicators['price_above_ema20'] = current_price > indicators['ema_20']
-            indicators['price_above_ema50'] = current_price > indicators['ema_50']
-            indicators['price_above_ema200'] = current_price > indicators['ema_200']
-            
-            # Advanced pattern recognition (replaces basic candlestick detection)
-            pattern_analysis = self.pattern_recognizer.detect_all_patterns(df)
-            indicators['pattern_analysis'] = pattern_analysis
-            indicators['candlestick_pattern'] = pattern_analysis.get('primary_pattern', 'unknown')
-            # Keep old method for backward compatibility
-            indicators['basic_candlestick'] = self._detect_candlestick_pattern(df)
-            
-        except Exception as e:
-            logger.error(f"Error calculating indicators: {e}")
+            df['price_above_ema20'] = df['close'] > df['ema_20']
+            df['price_above_ema50'] = df['close'] > df['ema_50']
+            df['price_above_ema200'] = df['close'] > df['ema_200']
         
-        return indicators
+        except Exception as e:
+            logger.error(f"Error in vectorized indicator calculation: {e}")
+            
+        return df
     
     def _analyze_price_action(self, df: pd.DataFrame) -> dict:
         """Analyze price action and trends"""
@@ -593,11 +659,124 @@ class TradingAnalyzer:
             "current_distance_to_resistance": float((resistance - df['close'].iloc[-1]) / df['close'].iloc[-1] * 100) if df['close'].iloc[-1] > 0 else 0,
             "volume_weighted": False
         }
+
+    def _detect_divergence(self, df: pd.DataFrame) -> str:
+        """
+        Detect RSI Divergence (Bullish/Bearish)
+        Bearish: Price New High, RSI Lower High
+        Bullish: Price New Low, RSI Higher Low
+        """
+        try:
+            if len(df) < 30:
+                return "none"
+                
+            # Need RSI series - recalculate locally for divergence check
+            # (Fast enough for 14-period RSI on small DF)
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            rsi_series = 100 - (100 / (1 + rs))
+            
+            # Define windows
+            current_window = 5
+            lookback_window = 20
+            
+            # Get Peaks
+            curr_price_high = df['high'].iloc[-current_window:].max()
+            prev_price_high = df['high'].iloc[-(lookback_window+current_window):-current_window].max()
+            
+            curr_rsi_high = rsi_series.iloc[-current_window:].max()
+            prev_rsi_high = rsi_series.iloc[-(lookback_window+current_window):-current_window].max()
+            
+            # Bearish Divergence
+            # Price made new high (or close to it), but RSI is lower
+            if curr_price_high > prev_price_high and curr_rsi_high < prev_rsi_high:
+                # Filter weak divergence: RSI must have been significantly higher before
+                if prev_rsi_high > 65 and (prev_rsi_high - curr_rsi_high) > 5:
+                    return "bearish"
+            
+            # Get Troughs
+            curr_price_low = df['low'].iloc[-current_window:].min()
+            prev_price_low = df['low'].iloc[-(lookback_window+current_window):-current_window].min()
+            
+            curr_rsi_low = rsi_series.iloc[-current_window:].min()
+            prev_rsi_low = rsi_series.iloc[-(lookback_window+current_window):-current_window].min()
+            
+            # Bullish Divergence
+            # Price made new low, but RSI is higher
+            if curr_price_low < prev_price_low and curr_rsi_low > prev_rsi_low:
+                if prev_rsi_low < 35 and (curr_rsi_low - prev_rsi_low) > 5:
+                    return "bullish"
+                    
+            return "none"
+            
+        except Exception as e:
+            return "none"
     
-    def _get_market_regime(self) -> dict:
-        """Get current market regime by analyzing SPY (S&P 500)"""
-        # Cache regime for 1 hour to avoid excessive API calls
+    def _get_market_regime(self, current_date=None) -> dict:
+        """Get current market regime by analyzing SPY (S&P 500)
+        
+        Args:
+            current_date: Optional datetime object. If provided, checks regime AS OF this date.
+        """
+        # Cache logic needs to be date-aware or disabled for backtesting
         from datetime import datetime, timedelta
+        
+        # If backtesting (specific date provided), skip cache or use separate logic
+        if current_date:
+            # OPTIMIZATION: Check if we have pre-fetched SPY history for backtesting
+            if hasattr(self, 'backtest_spy_history') and self.backtest_spy_history is not None and not self.backtest_spy_history.empty:
+                try:
+                    # Filter for data up to current_date (and 2 years back to see REAL drawdown)
+                    # Look back 2 years from that date
+                    start_date_obj = current_date - timedelta(days=730)
+                    mask = (self.backtest_spy_history.index >= start_date_obj) & (self.backtest_spy_history.index <= current_date)
+                    spy_slice = self.backtest_spy_history.loc[mask]
+                    
+                    if spy_slice.empty or len(spy_slice) < 50:
+                        return {'regime': 'unknown', 'strength': 50, 'reason': 'Insufficient SPY backtest data'}
+                    
+                    # Detect regime on this historical slice
+                    return self.regime_detector.detect_regime(spy_slice[['close']])
+                except Exception as e:
+                    return {'regime': 'unknown', 'strength': 50, 'reason': f'Backtest SPY error: {e}'}
+
+            # Format date for data fetching
+            end_date_str = current_date.strftime('%Y-%m-%d')
+            # Look back 2 years from that date (Critical for drawdown detection)
+            start_date_obj = current_date - timedelta(days=730)
+            start_date_str = start_date_obj.strftime('%Y-%m-%d')
+            
+            if not self.data_fetcher:
+                return {'regime': 'unknown', 'strength': 50, 'reason': 'No data fetcher available'}
+                
+            try:
+                # Fetch HISTORICAL SPY data ending at current_date
+                spy_history = self.data_fetcher.fetch_stock_history(
+                    'SPY', start_date=start_date_str, end_date=end_date_str
+                )
+                
+                if not spy_history or 'error' in spy_history:
+                    return {'regime': 'unknown', 'strength': 50, 'reason': 'SPY history unavailable'}
+                
+                spy_df = pd.DataFrame(spy_history.get('data', []))
+                
+                if spy_df.empty or len(spy_df) < 50:
+                    return {'regime': 'unknown', 'strength': 50, 'reason': 'Insufficient SPY data'}
+                
+                spy_df['date'] = pd.to_datetime(spy_df['date'])
+                spy_df.set_index('date', inplace=True)
+                spy_df = spy_df.sort_index()
+                
+                # Detect regime on this historical slice
+                regime_info = self.regime_detector.detect_regime(spy_df[['close']])
+                return regime_info
+                
+            except Exception as e:
+                return {'regime': 'unknown', 'strength': 50, 'reason': f'Error: {str(e)}'}
+
+        # --- NORMAL REAL-TIME LOGIC ---
         if (self._market_regime_cache and self._market_regime_cache_time and 
             (datetime.now() - self._market_regime_cache_time) < timedelta(hours=1)):
             return self._market_regime_cache
@@ -613,7 +792,7 @@ class TradingAnalyzer:
                 logger.debug("Could not fetch SPY data for regime detection")
                 return {'regime': 'unknown', 'strength': 50, 'reason': 'SPY data unavailable'}
             
-            spy_history = self.data_fetcher.fetch_stock_history('SPY', period='1y')
+            spy_history = self.data_fetcher.fetch_stock_history('SPY', period='2y')
             if not spy_history or 'error' in spy_history:
                 logger.debug("Could not fetch SPY history for regime detection")
                 return {'regime': 'unknown', 'strength': 50, 'reason': 'SPY history unavailable'}
@@ -641,11 +820,18 @@ class TradingAnalyzer:
             logger.warning(f"Error detecting market regime: {e}")
             return {'regime': 'unknown', 'strength': 50, 'reason': f'Error: {str(e)}'}
     
-    def _get_spy_data(self) -> pd.DataFrame:
+    def _get_spy_data(self, as_of_date: Optional[datetime] = None) -> pd.DataFrame:
         """Get SPY (S&P 500) data for relative strength comparison"""
-        # Cache SPY data for 1 hour to avoid excessive API calls
+        # OPTIMIZATION: Check if we have pre-fetched SPY history for backtesting
+        if hasattr(self, 'backtest_spy_history') and self.backtest_spy_history is not None:
+             # If date provided, slice it
+             if as_of_date:
+                 return self.backtest_spy_history[self.backtest_spy_history.index <= pd.Timestamp(as_of_date)]
+             return self.backtest_spy_history
+
+        # Cache SPY data for 1 hour to avoid excessive API calls (only if NOT backtesting)
         from datetime import datetime, timedelta
-        if (self._spy_data_cache is not None and self._spy_data_cache_time and 
+        if (as_of_date is None and self._spy_data_cache is not None and self._spy_data_cache_time and 
             (datetime.now() - self._spy_data_cache_time) < timedelta(hours=1)):
             return self._spy_data_cache
         
@@ -653,7 +839,9 @@ class TradingAnalyzer:
             return None
         
         try:
-            spy_history = self.data_fetcher.fetch_stock_history('SPY', period='1y')
+            # For backtesting, we need it as of a specific date
+            end_date_str = as_of_date.strftime('%Y-%m-%d') if as_of_date else None
+            spy_history = self.data_fetcher.fetch_stock_history('SPY', period='1y', end_date=end_date_str)
             if not spy_history or 'error' in spy_history:
                 logger.debug("Could not fetch SPY history for relative strength")
                 return None
@@ -675,10 +863,10 @@ class TradingAnalyzer:
             logger.warning(f"Error fetching SPY data for relative strength: {e}")
             return None
     
-    def _calculate_relative_strength(self, stock_df: pd.DataFrame) -> dict:
+    def _calculate_relative_strength(self, stock_df: pd.DataFrame, as_of_date: Optional[datetime] = None) -> dict:
         """Calculate relative strength vs market (SPY)"""
         try:
-            spy_df = self._get_spy_data()
+            spy_df = self._get_spy_data(as_of_date)
             if spy_df is None or len(spy_df) < 20:
                 return {'rs_ratio': 1.0, 'outperformance': 0, 'trend': 'neutral', 
                        'stock_return': 0, 'market_return': 0, 'available': False}
@@ -722,16 +910,80 @@ class TradingAnalyzer:
         trend = price_action.get('trend', 'sideways')
         volume_ratio = volume_analysis.get('volume_ratio', 1)
         
-        # RSI analysis (enhanced with stronger penalties for extreme overbought)
+        # RSI analysis (Smarter "Confirmation" Logic)
+        rsi_prev = indicators.get('rsi_prev', 50)
+        
         if rsi < self.rsi_oversold:
-            score += 2
-            reasons.append("RSI indicates oversold condition")
-        elif rsi > 80:  # Extremely overbought
+            if rsi > rsi_prev:
+                # Rebounding from lows - Strong Signal
+                score += 2
+                reasons.append(f"RSI oversold and rebounding ({rsi:.1f}) - Confirmed Buy")
+            else:
+                # Still falling - Risky "Falling Knife"
+                score += 1 
+                reasons.append(f"RSI oversold but still falling ({rsi:.1f}) - Watch for reversal")
+        
+        # --- RSI DIVERGENCE CHECK (Pro Feature) ---
+        # Detect Bearish Divergence (Price Higher, RSI Lower) -> Top Signal
+        # Detect Bullish Divergence (Price Lower, RSI Higher) -> Bottom Signal
+        
+        # Helper to get local peaks
+        # Look back: Recent (last 5 candles) vs Historic (candles -20 to -5)
+        if len(df) > 25:
+            recent_price_high = df['high'].iloc[-5:].max()
+            historic_price_high = df['high'].iloc[-25:-5].max()
+            
+            # Need RSI series history (re-calculate or access if available)
+            # Since we only have current/prev RSI in vars, let's peek at indicators dict
+            # or approximate trend. Best to re-calc series slice if cheap.
+            # Assuming RSI series generated in _calculate_indicators can be accessed? 
+            # Indicators dict only has scalars. We need the series.
+            # We'll do a quick rough check using price trend vs RSI trend direction
+            # BUT for robustness, let's use the 'price_action' and 'indicators' data we have.
+            
+            # Actually, `trading_analyzer` doesn't pass the full RSI series to this specific method (it's in `df` if we added it, but likely not).
+            # To do this reliably without re-calculating RSI 1000 times, we'll try a simplified heuristic:
+            # If Price is at 20-day High, but RSI < 70 (and RSI was > 70 recently), that's divergence.
+            
+            # Simplified Bearish Divergence Logic:
+            price_at_high = current_price >= df['close'].iloc[-20:].max() * 0.98 # Close to highs
+            rsi_weakening = rsi < rsi_prev and rsi < 70 # RSI curling down and not super high
+            
+            # Better: use the divergence calculation method if we can add it. 
+            # I will inject a helper call here.
+            divergence = self._detect_divergence(df)
+            
+            if divergence == 'bearish':
+                score -= 3
+                reasons.append(f"⚠️ BEARISH DIVERGENCE: Price making highs but RSI weakening - Tech Sell")
+            elif divergence == 'bullish':
+                score += 2
+                reasons.append(f"🔥 BULLISH DIVERGENCE: Price making lows but RSI strengthening - Strong Buy")
+        
+        # ------------------------------------------
+
+        # --- DIP BUYING LOGIC (ADDED) ---
+        elif 30 <= rsi <= 55 and trend == "uptrend":
+             score += 1.5
+             reasons.append(f"Values Zone: Buying the dip in Uptrend (RSI {rsi:.1f})")
+             
+        elif rsi > 85:  # EXTREME overbought (Raised from 80)
             score -= 3
             reasons.append(f"RSI extremely overbought ({rsi:.2f}) - strong sell signal")
+            
         elif rsi > self.rsi_overbought:
-            score -= 2
-            reasons.append(f"RSI indicates overbought condition ({rsi:.2f})")
+            if trend == "uptrend" and rsi > rsi_prev:
+                 # Momentum is strong, don't sell yet
+                 score += 0.5 
+                 reasons.append(f"Strong Momentum in Uptrend (RSI {rsi:.1f}) - Ride the wave")
+            elif rsi < rsi_prev:
+                # Cooling off from highs - Strong Sell
+                score -= 2
+                reasons.append(f"RSI overbought and correcting ({rsi:.1f})")
+            else:
+                # Still pumping - could go higher
+                score -= 0.5 # Relaxed from -1
+                reasons.append(f"RSI overbought but trending up ({rsi:.1f})")
         
         # MACD analysis
         if macd_diff > 0:
@@ -1175,6 +1427,15 @@ class TradingAnalyzer:
             # 2. TARGET PRICE: Resistance (Potential Reversal Top)
             if resistance and resistance > current_price:
                 target_price = resistance
+                # [FIX] UNREALISTIC UPSIDE CAP: Cap at 5.0 * ATR for short-term swing
+                # This prevents +25% targets for 7-15 day windows on stable stocks
+                atr = indicators.get('atr', 0)
+                if atr > 0:
+                    max_upside = current_price + (atr * 5.0)
+                    if target_price > max_upside:
+                        target_price = max_upside
+                        # Don't add to reasons yet, it's a technical refinement
+                        
                 # If resistance is too close (<5% upside), aim higher (breakout)
                 if (target_price - current_price) / current_price < 0.05:
                      target_price = current_price * 1.10
@@ -1196,6 +1457,19 @@ class TradingAnalyzer:
                     # Adjust target to reflect the minimum viable reversal trade (Greedy Target)
                     target_price = current_price + (potential_risk * 2.5)
                     reasons.append("🎯 Target adjusted for >2.0 R:R Ratio")
+
+            # 4. ESTIMATED TIMEFRAME (Dynamic)
+            # Logic: Distance / (Daily ATR * Efficiency Factor)
+            # Efficiency Factor: 0.5 (Price moves towards target 50% of the time net of noise)
+            atr = indicators.get('atr', 0)
+            if atr > 0:
+                dist = abs(target_price - current_price)
+                # Raw days = how many full ATR candles to bridge the gap
+                raw_days = dist / atr
+                # Reality check: Markets zig-zag. Multiplier 2.5x is realistic for swing trades.
+                estimated_days = max(2, int(raw_days * 2.5))
+            else:
+                estimated_days = 7 # Default week
 
         elif action == "SELL":
             # SELL / SHORT STRATEGY
@@ -1226,11 +1500,35 @@ class TradingAnalyzer:
                 target_price = current_price - (risk * 3)
             
             entry_price = current_price
+            
+            # 4. ESTIMATED TIMEFRAME (Dynamic)
+            atr = indicators.get('atr', 0)
+            if atr > 0:
+                dist = abs(current_price - target_price)
+                raw_days = dist / atr
+                # Down moves are faster (fear), so multiplier is lower (1.8x)
+                estimated_days = max(2, int(raw_days * 1.8))
+            else:
+                estimated_days = 5 # Default short week for shorts
         
         else: # HOLD
              entry_price = current_price
              target_price = current_price
              stop_loss = current_price
+             estimated_days = 0 
+        
+        # APPLY STATISTICAL CALIBRATION (Realism Filter)
+        if action != "HOLD":
+            atr = indicators.get('atr', 0)
+            # Use macro regime if available, fallback to general regime
+            regime = macro_info.get('regime', 'unknown') if macro_info else 'unknown'
+            calibration = self.statistical_calibrator.calibrate(
+                current_price, target_price, estimated_days, atr, market_regime=regime
+            )
+            
+            if not calibration['is_realistic']:
+                target_price = calibration['target_price']
+                reasons.append(f"⚖️ {calibration['reason']}")
         
         # Calculate explicit Risk-to-Reward ratio
         if action == "BUY":
@@ -1283,39 +1581,11 @@ class TradingAnalyzer:
             "entry_price": float(entry_price),
             "target_price": float(target_price),
             "stop_loss": float(stop_loss),
-            "risk_reward_ratio": round(rr_ratio, 2),
-            "rr_quality": rr_quality,
-            "score": score,
-            "reasons": reasons,
-            "estimated_days": self._calculate_estimated_days(entry_price, target_price, indicators.get('atr', 0))
+            "estimated_days": estimated_days,
+            "rr_ratio": float(rr_ratio),
+            "reasoning": reasons
         }
 
-    def _calculate_estimated_days(self, entry: float, target: float, atr: float) -> int:
-        """
-        Calculate estimated days to reach target based on ATR (Volatility).
-        Formula: Days = (Distance / ATR) * Safety_Factor
-        """
-        if atr <= 0 or entry <= 0:
-            return 10  # Fallback default
-            
-        distance = abs(target - entry)
-        if distance == 0:
-            return 10
-            
-        # Raw days needed if price moved perfectly linearly (impossible)
-        raw_days = distance / atr
-        
-        # Safety factor: Price rarely moves in a straight line. 
-        # 1.5 = Aggressive trend
-        # 2.0 = Normal trend (zig-zag)
-        # 3.0 = Slow/Choppy trend
-        safety_factor = 2.0
-        
-        estimated_days = int(raw_days * safety_factor)
-        
-        # Clamp result to prevent absurd values, but give "full freedom" as requested
-        # Allow anywhere from 1 day to 1 year based on pure math/volatility
-        return max(1, min(365, estimated_days))
     
     def _generate_reasoning(self, recommendation: dict, indicators: dict,
                            price_action: dict, volume_analysis: dict,
@@ -1439,7 +1709,7 @@ class TradingAnalyzer:
             regime = market_regime.get('regime', 'unknown')
             strength = market_regime.get('strength', 50)
             regime_emoji = "📈" if regime == 'bull' else "📉" if regime == 'bear' else "↔️"
-            reasoning += f"{regime_emoji} Market Regime: {regime.upper()} (Strength: {strength:.0f}%)\n"
+            reasoning += f"{regime_emoji} Global Market Regime (SPY): {regime.upper()} (Strength: {strength:.0f}%)\n"
             if regime == 'bull':
                 reasoning += "   • Bull market conditions - favorable for long positions\n"
             elif regime == 'bear':

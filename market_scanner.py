@@ -100,6 +100,15 @@ class MarketScanner:
             except Exception as e:
                 logger.warning(f"Could not initialize hybrid predictors: {e}, using basic analyzers")
                 self.hybrid_predictors = {}
+
+        # Initialize Topology Analyzer (Market Graph)
+        try:
+            from topology_analyzer import TopologyAnalyzer
+            self.topology_analyzer = TopologyAnalyzer(data_fetcher)
+            logger.info("Topology Analyzer initialized (Market Graph enabled)")
+        except ImportError:
+            self.topology_analyzer = None
+            logger.warning("Topology Analyzer not available")
     
     def scan_market(self, strategy: str, max_results: int = 10, 
                    predictions_tracker=None, custom_tickers: List[str] = None,
@@ -127,9 +136,65 @@ class MarketScanner:
         
         total_stocks = len(stocks_to_scan)
         
+        # Start scanning loop
         for idx, symbol in enumerate(stocks_to_scan):
             if progress_callback:
                 progress_callback(idx + 1, total_stocks, symbol, len(recommendations))
+
+        # TOPOLOGY ANALYSIS (Global Context)
+        # Pre-scan the market to build the graph and find mispricings
+        laplacian_scores = {}
+        if self.topology_analyzer and len(stocks_to_scan) > 5 and not is_custom_scan:
+             try:
+                 logger.info("Building Market Graph for topological analysis...")
+                 # We need batch history. Fetching 3mo history for all stocks.
+                 # This might be slow, so we do it in parallel
+                 # Using data_fetcher.fetch_batch but asking for history via check_quality=True logic
+                 # Or better: just assume we iterate and build as we go? No, need simultaneous data.
+                 # Optimization: Only do this for "Popular Stocks" scan, not custom
+                 
+                 # Create a dataframe of returns
+                 import pandas as pd
+                 import numpy as np
+                 
+                 # We need to fetch history efficiently. 
+                 # Let's skip the expensive pre-fetch for now and build it progressively or use a cached approach?
+                 # Better: Use the `dataset_fetcher` style if available, or just fetch batch.
+                 # For now, to ensure speed, we might skip this step if list is huge.
+                 # But user wants "everything integrated".
+                 
+                 # Let's try to fetch batch history for the top 50 stocks to build a "Core Graph"
+                 # Limit to first 50 stocks for graph building to save time
+                 graph_stocks = stocks_to_scan[:50] 
+                 batch_results = self.data_fetcher.fetch_batch(graph_stocks, max_workers=20, check_quality=True)
+                 
+                 # Extract standard returns
+                 price_data = {}
+                 for sym, data in batch_results.items():
+                     if 'history' in data and data['history']:
+                         # Create series
+                         hist = data['history']
+                         # Filter to last 60 days
+                         df = pd.DataFrame(hist)
+                         if 'date' in df.columns and 'close' in df.columns:
+                             df['date'] = pd.to_datetime(df['date'])
+                             df.set_index('date', inplace=True)
+                             # Calculate returns
+                             price_data[sym] = df['close'].pct_change()
+                 
+                 if price_data:
+                     returns_df = pd.DataFrame(price_data)
+                     # Build graph
+                     if self.topology_analyzer.build_market_graph(returns_df):
+                         # Compute residuals for latest timeframe
+                         latest_returns = returns_df.iloc[-1]
+                         laplacian_scores = self.topology_analyzer.compute_laplacian_score(latest_returns)
+                         logger.info(f"✅ Market Graph Built. Calculated {len(laplacian_scores)} residual scores.")
+             except Exception as e:
+                 logger.warning(f"Topology analysis failed: {e}")
+
+        for idx, symbol in enumerate(stocks_to_scan):
+            # ... loop continues ...
 
             # Skip stocks that already have active predictions ONLY if this is a general market scan
             # If we are scanning specific tickers (e.g. existing predictions), we want to re-analyze them
@@ -148,6 +213,14 @@ class MarketScanner:
                 stock_data = self.data_fetcher.fetch_stock_data(symbol)
                 if not stock_data or 'error' in stock_data:
                     continue
+                
+                # INJECT TOPOLOGY SCORE
+                # If we have a mispricing score for this stock, add it to data
+                if symbol in laplacian_scores:
+                    stock_data['laplacian_score'] = laplacian_scores[symbol]
+                    # Log if significant
+                    if abs(laplacian_scores[symbol]) > 0.02: # arbitrarily threshold
+                         logger.info(f"Topology Signal for {symbol}: Residual {laplacian_scores[symbol]:.4f}")
                 
                 history_data = self.data_fetcher.fetch_stock_history(symbol)
                 if not history_data or 'error' in history_data:
@@ -198,9 +271,15 @@ class MarketScanner:
                 confidence = recommendation.get('confidence', 0)
                 
                 # Only include recommendations with decent confidence
-                # STANDARD LOGIC: BUY is the bullish/entry signal
-                # For custom scans (existing predictions), include EVERYTHING (even HOLD)
-                if is_custom_scan or (action == 'BUY' and confidence >= 50):
+                # --- TIERED UI SYNC: Only show signals that meet Standard or Elite Tiers ---
+                from config import STANDARD_CONF_RANGE
+                min_ui_conf = STANDARD_CONF_RANGE[0] # Usually 70.0
+                
+                if is_custom_scan or (action == 'BUY' and confidence >= min_ui_conf):
+                    # Get timing metadata robustly
+                    est_days = recommendation.get('estimated_days') or analysis.get('estimated_days') or 7
+                    est_date = recommendation.get('estimated_target_date') or analysis.get('estimated_target_date')
+                    
                     recommendations.append({
                         'symbol': symbol,
                         'name': stock_data.get('name', symbol),
@@ -210,7 +289,9 @@ class MarketScanner:
                         'entry_price': recommendation.get('entry_price', 0),
                         'target_price': recommendation.get('target_price', 0),
                         'stop_loss': recommendation.get('stop_loss', 0),
-                        'estimated_days': recommendation.get('estimated_days'), # Pass dynamic date
+                        'estimated_days': est_days,
+                        'estimated_target_date': est_date,
+                        'market_regime': analysis.get('market_regime', 'unknown'),
                         'reasoning': analysis.get('reasoning', '')[:200]  # Truncate
                     })
                 
@@ -344,9 +425,15 @@ class MarketScanner:
                     distance_from_ema = ((ema20 - current_price) / ema20) * 100 if ema20 > 0 else 0
                     
                     # Calculate targets
+                    from config import MIN_PROFIT_TARGET_PCT
                     entry_price = current_price
-                    target_price = ema20  # Target: return to EMA20
-                    stop_loss = current_price * 0.95  # 5% stop loss
+                    
+                    # Target: Return to EMA20, but ensure at least MIN_PROFIT_TARGET_PCT
+                    base_target = ema20
+                    min_target = entry_price * (1 + MIN_PROFIT_TARGET_PCT/100)
+                    
+                    target_price = max(base_target, min_target)
+                    stop_loss = current_price * 0.95  # 5% stop loss (wide for catching falling knives)
                     
                     potential_gain = ((target_price - entry_price) / entry_price) * 100
                     

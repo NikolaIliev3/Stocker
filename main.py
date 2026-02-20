@@ -13,12 +13,20 @@ import time
 import subprocess
 import sys
 import socket
+import socket
 import os
+import webbrowser
 import matplotlib  # pyright: ignore[reportMissingImports]
 matplotlib.use('TkAgg')
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # pyright: ignore[reportMissingImports]
 from matplotlib.figure import Figure  # pyright: ignore[reportMissingImports]
 import matplotlib.pyplot as plt  # pyright: ignore[reportMissingImports]
+import warnings
+
+# Suppress annoying sklearn warnings about feature names
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
+warnings.filterwarnings("ignore", message="`sklearn.utils.parallel.delayed` should be used")
 
 from config import APP_DATA_DIR, INITIAL_BALANCE
 from data_fetcher import StockDataFetcher
@@ -53,6 +61,8 @@ from price_move_predictor import PriceMovePredictor
 from holdings_tracker import HoldingsTracker
 from potentials_tracker import PotentialsTracker
 from market_dashboard import MarketDashboard
+from prediction_service import PredictionService
+from backend_manager import BackendManager
 
 # Import new modules
 try:
@@ -64,6 +74,13 @@ except ImportError as e:
     logger = logging.getLogger(__name__)
     logger.warning(f"New modules not available: {e}")
     HAS_NEW_MODULES = False
+
+# Import Smart Model Selector
+try:
+    from smart_model_selector import select_best_strategy
+    HAS_SMART_SELECTOR = True
+except ImportError:
+    HAS_SMART_SELECTOR = False
 
 # Configure logging
 logging.basicConfig(
@@ -152,12 +169,15 @@ class StockerApp:
         self.hybrid_predictors = {
             'trading': HybridStockPredictor(APP_DATA_DIR, 'trading', 
                                             trading_analyzer=self.trading_analyzer,
+                                            data_fetcher=self.data_fetcher,
                                             seeker_ai=seeker_ai_instance),
             'mixed': HybridStockPredictor(APP_DATA_DIR, 'mixed',
                                          mixed_analyzer=self.mixed_analyzer,
+                                         data_fetcher=self.data_fetcher,
                                          seeker_ai=seeker_ai_instance),
             'investing': HybridStockPredictor(APP_DATA_DIR, 'investing',
                                             investing_analyzer=self.investing_analyzer,
+                                            data_fetcher=self.data_fetcher,
                                             seeker_ai=seeker_ai_instance)
         }
         self.training_manager = MLTrainingPipeline(self.data_fetcher, APP_DATA_DIR, app=self)
@@ -188,8 +208,8 @@ class StockerApp:
         try:
             from ml_scheduler import MLScheduler
             self.ml_scheduler = MLScheduler(self, APP_DATA_DIR)
-            self.ml_scheduler.start()
-            logger.info("ML Scheduler initialized and started")
+            # self.ml_scheduler.start()
+            logger.info("ML Scheduler initialized (AUTO-START DISABLED)")
         except Exception as e:
             logger.warning(f"Could not initialize ML Scheduler: {e}")
             self.ml_scheduler = None
@@ -231,17 +251,34 @@ class StockerApp:
         else:
             self.seeker_ai = None
         
-        # Backend server process
-        self.backend_process = None
-        
-        # Start backend server automatically
-        self._start_backend_server()
+        # Seeker AI (legacy config preservation)
         
         # Load preferences and store as instance variables
         self.saved_language = self.preferences.get_language()
         self.saved_currency = self.preferences.get_currency()
         self.saved_theme = self.preferences.get_theme()
         self.saved_strategy = self.preferences.get_strategy()
+        
+        # Smart Model Selection (Robustness Check)
+        # Automatically switch to a more robust model if the saved one is potentially overfit (e.g., 'mixed' with few samples)
+        if HAS_SMART_SELECTOR:
+            try:
+                recommended_strategy = select_best_strategy(APP_DATA_DIR)
+                if self.saved_strategy == 'mixed' and recommended_strategy == 'trading':
+                    logger.info(f"🛡️ Smart Selection: Overriding saved strategy '{self.saved_strategy}' with more robust '{recommended_strategy}' model")
+                    self.saved_strategy = recommended_strategy
+                elif self.saved_strategy == 'trading' and recommended_strategy == 'mixed':
+                    logger.info(f"✅ Smart Selection: Upgrading saved strategy '{self.saved_strategy}' to high-performance '{recommended_strategy}' model")
+                    self.saved_strategy = recommended_strategy
+                    # Auto-save this upgrade preference so backtester picks it up
+                    self.preferences.set_strategy(recommended_strategy)
+                    # Also update backtest strategies to include the winner
+                    current_backtest_strats = self.preferences.get_backtest_strategies()
+                    if 'mixed' not in current_backtest_strats:
+                        current_backtest_strats.append('mixed')
+                        self.preferences.set_backtest_strategies(current_backtest_strats)
+            except Exception as e:
+                logger.error(f"Error in smart model selection: {e}")
         
         self.localization = Localization(language=self.saved_language, currency=self.saved_currency)
         
@@ -264,6 +301,17 @@ class StockerApp:
         # Load portfolio balance
         self._update_portfolio_display()
         
+        # Initialize Prediction Service (Decoupled Logic) - MUST BE BEFORE VERIFICATION
+        self.prediction_service = PredictionService(
+            self.predictions_tracker,
+            self.data_fetcher,
+            self.learning_tracker
+        )
+        # Wire up callbacks (Use root.after for Thread Safety!)
+        self.prediction_service.on_verification_complete = lambda preds: self.root.after(0, self._on_verification_complete_ui, preds)
+        self.prediction_service.on_auto_train_trigger = lambda: self.root.after(0, self._trigger_auto_training)
+        self.prediction_service.on_status_update = lambda: self.root.after(0, lambda: (self._update_predictions_display(), self._update_ml_status()))
+
         # Verify predictions on startup
         self._verify_predictions_on_startup()
         
@@ -295,10 +343,10 @@ class StockerApp:
         self._schedule_auto_training()
         
         # Check for auto-training on startup (after delay)
-        self.root.after(5000, self.auto_training.check_and_train)
+        # self.root.after(5000, self.auto_training.check_and_train)
         
         # Start automatic self-learning (scans stocks and makes predictions automatically)
-        self.root.after(10000, self.auto_learner.start)  # Start after 10 seconds
+        # self.root.after(10000, self.auto_learner.start)  # Start after 10 seconds
         
         # Start continuous backtesting (tests algorithm on random historical points)
         # DISABLED: Backtesting now runs manually via "Run Backtest" button
@@ -326,122 +374,56 @@ class StockerApp:
         
         # Start periodic portfolio snapshot updates (daily)
         self._schedule_portfolio_snapshots()
+
+        # Initialize Prediction Service (Decoupled Logic)
+        self.prediction_service = PredictionService(
+            self.predictions_tracker,
+            self.data_fetcher,
+            self.learning_tracker
+        )
+        # Wire up callbacks (Use root.after for Thread Safety!)
+        self.prediction_service.on_verification_complete = lambda preds: self.root.after(0, self._on_verification_complete_ui, preds)
+        self.prediction_service.on_auto_train_trigger = lambda: self.root.after(0, self._trigger_auto_training)
+        self.prediction_service.on_status_update = lambda: self.root.after(0, lambda: (self._update_predictions_display(), self._update_ml_status()))
         
         # Handle cleanup on window close
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         
-        # Start periodic backend health check
-        self._start_backend_health_check()
+        # Initialize Backend Manager (Decoupled Logic)
+        self.backend_manager = BackendManager()
+        self.backend_manager.start()
+        
+        # Start periodic health status check for UI (just monitoring, logic is in manager)
+        self._schedule_backend_monitor()
     
-    def _is_backend_running(self) -> bool:
-        """Check if backend server is already running on port 5000"""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2)  # Increased timeout
-            result = sock.connect_ex(('127.0.0.1', 5000))  # Use 127.0.0.1 instead of localhost
-            sock.close()
-            return result == 0
-        except Exception as e:
-            logger.debug(f"Error checking backend status: {e}")
-            return False
-    
-    def _start_backend_health_check(self):
-        """Periodically check if backend is running and restart if needed"""
-        def check_backend():
+    def _schedule_backend_monitor(self):
+        """Periodically check backend status for the UI"""
+        def check_status():
             try:
-                if not self._is_backend_running():
-                    # Backend is not running, try to start it
-                    if self.backend_process is None or (self.backend_process.poll() is not None):
-                        logger.info("Backend server not running, attempting to start...")
-                        self._start_backend_server()
-                else:
-                    # Backend is running, check if our process is still alive
-                    if self.backend_process and self.backend_process.poll() is not None:
-                        # Process died but port is still open (maybe another instance?)
-                        logger.info("Backend process died but port is still open")
-                        self.backend_process = None
+                if not self.backend_manager.is_running():
+                    logger.warning("Backend server down, attempting restart via manager...")
+                    self.backend_manager.start()
             except Exception as e:
-                logger.error(f"Error in backend health check: {e}")
+                logger.error(f"Error in backend monitor: {e}")
+            self.root.after(30000, check_status)
             
-            # Schedule next check in 30 seconds
-            self.root.after(30000, check_backend)
-        
-        # Start first check after 10 seconds
-        self.root.after(10000, check_backend)
-    
-    def _start_backend_server(self):
-        """Start the backend server automatically if not already running"""
-        def start_in_background():
+        self.root.after(10000, check_status)
+
+    def _on_closing(self):
+        """Handle application shutdown"""
+        if messagebox.askokcancel("Quit", "Do you want to quit?"):
             try:
-                # Check if backend is already running
-                if self._is_backend_running():
-                    logger.info("Backend server is already running on port 5000")
-                    return
-                
-                logger.info("Starting backend server automatically...")
-                
-                # Check if Flask is installed
-                try:
-                    import flask
-                except ImportError:
-                    logger.warning("Flask is not installed. Backend server cannot start. Install with: pip install flask flask-cors")
-                    return
-                
-                # Get the path to backend_proxy.py
-                backend_script = Path(__file__).parent / "backend_proxy.py"
-                
-                if not backend_script.exists():
-                    logger.error(f"Backend script not found at {backend_script}")
-                    return
-                
-                # Start backend in a separate process
-                # Use CREATE_NO_WINDOW on Windows to hide the console window
-                # Don't pipe stdout/stderr so we can see errors, but redirect to devnull to suppress normal output
-                if sys.platform == 'win32':
-                    self.backend_process = subprocess.Popen(
-                        [sys.executable, str(backend_script)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                        creationflags=subprocess.CREATE_NO_WINDOW
-                    )
-                else:
-                    self.backend_process = subprocess.Popen(
-                        [sys.executable, str(backend_script)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE
-                    )
-                
-                # Wait a bit for server to start
-                time.sleep(5)  # Increased wait time
-                
-                # Check if process is still running
-                if self.backend_process.poll() is not None:
-                    # Process has terminated
-                    stderr_output = self.backend_process.stderr.read().decode('utf-8', errors='ignore')
-                    logger.error(f"Backend server process terminated immediately. Error: {stderr_output}")
-                    self.backend_process = None
-                    return
-                
-                # Verify it started by checking the port
-                if self._is_backend_running():
-                    logger.info("✅ Backend server started successfully on port 5000")
-                else:
-                    # Check for errors in stderr
-                    try:
-                        stderr_output = self.backend_process.stderr.read().decode('utf-8', errors='ignore')
-                        if stderr_output:
-                            logger.warning(f"Backend server may not have started properly. Error output: {stderr_output[:500]}")
-                    except (IOError, OSError, AttributeError) as e:
-                        logger.debug(f"Could not read backend stderr: {e}")
-                    logger.warning("Backend server may not have started properly - port 5000 not responding")
-                    
+                # Stop backend via manager
+                if hasattr(self, 'backend_manager'):
+                    self.backend_manager.stop()
             except Exception as e:
-                logger.error(f"Error starting backend server: {e}", exc_info=True)
-                logger.info("App will continue using direct yfinance fallback")
-        
-        # Start in background thread to avoid blocking UI
-        thread = threading.Thread(target=start_in_background)
-        thread.daemon = True
+                logger.error(f"Error checking backend status: {e}")
+            
+            # Stop recurring tasks
+            self.is_running = False
+            
+            # Close the main window
+            self.root.destroy()
         thread.start()
     
     def _on_closing(self):
@@ -464,76 +446,24 @@ class StockerApp:
         self.root.destroy()
     
     def _verify_predictions_on_startup(self):
-        """Verify all active predictions when app starts - only checks predictions that have reached their target date"""
-        def verify_in_background():
-            try:
-                logger.info("Verifying predictions that have reached their target date...")
-                # Only verify predictions that have reached their estimated target date
-                result = self.predictions_tracker.verify_all_active_predictions(self.data_fetcher, check_all=False)
-                if result['verified'] > 0:
-                    newly_verified = result.get('newly_verified', [])
-                    # Record learning events for verified predictions
-                    for pred in newly_verified:
-                        if pred.get('was_correct') is not None:
-                            self.learning_tracker.record_verified_prediction(
-                                pred.get('was_correct', False),
-                                pred.get('strategy', 'trading')
-                            )
-                    self.root.after(0, self._show_verification_results, result, newly_verified)
-                    # Trigger auto-training on verified predictions
-                    self.root.after(0, self._trigger_auto_training)
-            except Exception as e:
-                logger.error(f"Error verifying predictions: {e}")
-        
-        thread = threading.Thread(target=verify_in_background)
-        thread.daemon = True
-        thread.start()
+        """Verify all active predictions when app starts"""
+        # Run a single task immediately
+        self.prediction_service.run_verification_task()
     
     def _start_periodic_verification(self):
         """Start periodic automatic verification of predictions"""
         # Check every hour (3600000 milliseconds)
-        check_interval_ms = 3600000  # 1 hour
+        check_interval_ms = 3600000 
         
-        def periodic_check():
-            def verify_in_background():
-                try:
-                    logger.info("Periodic verification of predictions...")
-                    result = self.predictions_tracker.verify_all_active_predictions(self.data_fetcher)
-                    if result['verified'] > 0:
-                        newly_verified = result.get('newly_verified', [])
-                        # Record learning events for verified predictions
-                        for pred in newly_verified:
-                            if pred.get('was_correct') is not None:
-                                # Create outcome dict
-                                outcome = {
-                                    'was_correct': pred.get('was_correct', False),
-                                    'actual_price_change': pred.get('actual_price_change', 0.0),
-                                    'target_hit': pred.get('was_correct', False) and pred.get('action') in ['BUY', 'SELL'],
-                                }
-                                self.learning_tracker.record_verified_prediction(
-                                    pred.get('was_correct', False),
-                                    pred.get('strategy', 'trading'),
-                                    prediction_data=pred,
-                                    actual_outcome=outcome
-                                )
-                        self.root.after(0, self._show_verification_notifications, newly_verified)
-                        self.root.after(0, self._update_predictions_display)
-                        # Trigger auto-training
-                        self.root.after(0, self._trigger_auto_training)
-                        # Update ML status
-                        self.root.after(0, self._update_ml_status)
-                except Exception as e:
-                    logger.error(f"Error in periodic verification: {e}")
-            
-            thread = threading.Thread(target=verify_in_background)
-            thread.daemon = True
-            thread.start()
-            
-            # Schedule next check
-            self.root.after(check_interval_ms, periodic_check)
-        
-        # Start first check after 1 hour
-        self.root.after(check_interval_ms, periodic_check)
+        # Use the service's scheduler with Tkinter's root.after
+        self.prediction_service.start_periodic_verification(
+            interval_ms=check_interval_ms,
+            scheduler_func=self.root.after
+        )
+
+    def _on_verification_complete_ui(self, newly_verified):
+        """Callback for UI updates after verification"""
+        self._show_verification_notifications(newly_verified)
     
     def _start_trend_change_verification(self):
         """Start periodic automatic verification of trend change predictions"""
@@ -1786,6 +1716,21 @@ class StockerApp:
         settings_frame = tk.Frame(top_bar, bg=theme['secondary_bg'])
         settings_frame.pack(side=tk.RIGHT, padx=25, pady=15)
         
+        # Open Dashboard Button
+        dashboard_btn = tk.Button(settings_frame,
+                            text="🌐 Open Dashboard",
+                            command=self._open_dashboard,
+                            bg=theme['accent'],
+                            fg=theme['button_fg'],
+                            font=('Segoe UI', 9, 'bold'),
+                            relief=tk.FLAT,
+                            padx=15,
+                            pady=8,
+                            cursor='hand2',
+                            activebackground=theme['accent_hover'],
+                            activeforeground=theme['button_fg'])
+        dashboard_btn.pack(side=tk.LEFT, padx=(0, 10))
+
         # About button
         about_btn = tk.Button(settings_frame,
                             text="ℹ️ About",
@@ -2962,6 +2907,13 @@ class StockerApp:
         
         recommendation = self.current_analysis.get('recommendation', {})
         action = recommendation.get('action', 'HOLD')
+        
+        # HOLD/AVOID are vetoes — not actionable predictions
+        if action in ('HOLD', 'AVOID'):
+            messagebox.showinfo(self.localization.t('info'),
+                              f"Analysis returned {action} for {symbol} \u2014 no actionable signal to save.")
+            return
+        
         old_entry_price = recommendation.get('entry_price', current_price_usd)
         old_target_price = recommendation.get('target_price', current_price_usd)
         old_stop_loss = recommendation.get('stop_loss', current_price_usd)
@@ -3767,8 +3719,10 @@ class StockerApp:
                     target_date_str = "N/A"
             
             # Format prices in USD
-            entry_usd = f"${pred['entry_price']:,.2f}"
-            target_usd = f"${pred['target_price']:,.2f}"
+            entry_price = pred.get('entry_price', 0)
+            target_price = pred.get('target_price', 0)
+            entry_usd = f"${entry_price:,.2f}"
+            target_usd = f"${target_price:,.2f}"
             
             values = (
                 pred['id'],
@@ -4083,6 +4037,12 @@ class StockerApp:
                     confidence = recommendation.get('confidence', 0)
                     reasoning = analysis.get('reasoning', '')
                     
+                    # HOLD/AVOID are vetoes — skip them
+                    if action in ('HOLD', 'AVOID'):
+                        self.root.after(0, self._append_firing_result,
+                                      f"⏭️ {symbol}: {action} (veto, skipped)\n")
+                        continue
+                    
                     # Calculate targets based on strategy
                     if action == "BUY":
                         if strategy == "trading":
@@ -4121,6 +4081,10 @@ class StockerApp:
                         else:  # investing
                             estimated_days = 547
                     
+                    # Normalize types to avoid numpy JSON serialization issues
+                    confidence = float(confidence or 0)
+                    estimated_days = int(estimated_days or 0)
+                    
                     # Save prediction
                     prediction = self.predictions_tracker.add_prediction(
                         symbol, strategy, action, current_price,
@@ -4128,7 +4092,7 @@ class StockerApp:
                     )
                     predictions_created += 1
                     self.root.after(0, self._append_firing_result, 
-                                  f"✅ {symbol}: Prediction #{prediction['id']} ({action}, {confidence:.1f}%)\n")
+                                  f"✅ {symbol}: Prediction #{prediction['id']} ({action}, {(confidence or 0):.1f}%)\n")
                     
                     # Generate trend change predictions (if trading or mixed strategy)
                     if strategy in ['trading', 'mixed']:
@@ -4152,13 +4116,17 @@ class StockerApp:
                                 if trend_predictions and len(trend_predictions) > 0:
                                     # Store trend change predictions
                                     for pred in trend_predictions:
+                                        # Normalize types to avoid numpy JSON serialization issues
+                                        p_confidence = float(pred.get('confidence', 0) or 0)
+                                        p_est_days = int(pred.get('estimated_days', 0) or 0)
+                                        
                                         stored_pred = self.trend_change_tracker.add_prediction(
                                             symbol=pred['symbol'],
                                             current_trend=pred['current_trend'],
                                             predicted_change=pred['predicted_change'],
-                                            estimated_days=pred['estimated_days'],
+                                            estimated_days=p_est_days,
                                             estimated_date=pred['estimated_date'],
-                                            confidence=pred['confidence'],
+                                            confidence=p_confidence,
                                             reasoning=pred['reasoning'],
                                             key_indicators=pred.get('key_indicators', {})
                                         )
@@ -4167,13 +4135,13 @@ class StockerApp:
                                         self.learning_tracker.record_trend_change_prediction(
                                             symbol=pred['symbol'],
                                             predicted_change=pred['predicted_change'],
-                                            estimated_days=pred['estimated_days'],
-                                            confidence=pred['confidence']
+                                            estimated_days=p_est_days,
+                                            confidence=p_confidence
                                         )
                                         
                                         trend_predictions_created += 1
                                         self.root.after(0, self._append_firing_result,
-                                                      f"  📊 Trend change prediction #{stored_pred['id']}: {pred['predicted_change']} ({pred['confidence']:.1f}%)\n")
+                                                      f"  📊 Trend change prediction #{stored_pred['id']}: {pred['predicted_change']} ({(p_confidence):.1f}%)\n")
                                 else:
                                     # No trend predictions generated (might be normal - not all stocks have trend changes)
                                     logger.debug(f"No trend change predictions generated for {symbol} (may be normal)")
@@ -5177,11 +5145,11 @@ SELL SIGNALS:
             change_display = trend_emojis.get(change_type, change_type.replace('_', ' ').title())
             
             # Visual confidence bar
-            conf = pred.get('confidence', 0)
+            conf = float(pred.get('confidence', 0) or 0)
             bar_len = 10
             filled = int((conf / 100) * bar_len)
             conf_bar = "█" * filled + "░" * (bar_len - filled)
-            conf_display = f"{conf_bar} {conf}%"
+            conf_display = f"{conf_bar} {conf:.0f}%"
             
             # Determine Status Display
             status = pred.get('status', 'active').title()
@@ -8770,6 +8738,16 @@ Confidence: {prediction['confidence']:.0f}%
         self.potential_text.delete(1.0, tk.END)
         self.potential_text.insert(tk.END, output)
     
+    def _open_dashboard(self):
+        """Open the web dashboard in the default browser"""
+        try:
+            url = "http://127.0.0.1:5001"
+            logger.info(f"Opening dashboard at {url}")
+            webbrowser.open(url)
+        except Exception as e:
+            logger.error(f"Error opening dashboard: {e}")
+            messagebox.showerror("Error", f"Could not open dashboard: {e}")
+
     def _show_about(self):
         """Show About dialog with disclaimer"""
         theme = self.theme_manager.get_theme()
@@ -9012,14 +8990,20 @@ By using this application, you acknowledge that you understand and accept these 
                             fg=theme['text_secondary']
                         )
                 
-                self.root.after(0, update_ui)
+                try:
+                    self.root.after(0, update_ui)
+                except RuntimeError:
+                    pass # Ignore if main loop is not running (e.g. headless)
                 
             except Exception as e:
                 logger.error(f"Error updating S&P 500 comparison: {e}")
-                self.root.after(0, lambda: self.sp500_label.config(
-                    text="S&P 500: Error",
-                    fg=self.theme_manager.get_theme()['text_secondary']
-                ))
+                try:
+                    self.root.after(0, lambda: self.sp500_label.config(
+                        text="S&P 500: Error",
+                        fg=self.theme_manager.get_theme()['text_secondary']
+                    ))
+                except RuntimeError:
+                    pass
         
         # Run in background thread to avoid blocking UI
         thread = threading.Thread(target=update_in_background, daemon=True)
@@ -9062,7 +9046,15 @@ By using this application, you acknowledge that you understand and accept these 
         from secure_ml_storage import SecureMLStorage
         storage = SecureMLStorage(self.data_dir)
         ml_model_file = f"ml_model_{strategy}.pkl"
+        
+        # Check if main model exists OR if regime models exist
         ml_trained = storage.model_exists(ml_model_file)
+        if not ml_trained:
+            # Check for regime models
+            for regime in ['bull', 'bear', 'sideways']:
+                if storage.model_exists(f"ml_model_{strategy}_{regime}.pkl"):
+                    ml_trained = True
+                    break
         
         hybrid_predictor = self.hybrid_predictors.get(strategy)
         
@@ -10228,27 +10220,32 @@ By using this application, you acknowledge that you understand and accept these 
         btn_frame.pack(pady=10)
         
         def start_training():
-            symbols = [s.strip().upper() for s in symbols_entry.get().split(',')]
-            start_date = start_entry.get()
-            end_date = end_entry.get()
-            strategy = strategy_var.get()
-            retrain_from_verified = retrain_var.get()
-            
-            # Save symbols for next time
-            symbols_str = ','.join(symbols)
-            self.preferences.set_training_symbols(strategy, symbols_str)
-            
-            status_text.delete(1.0, tk.END)
-            status_text.delete(1.0, tk.END)
-            status_text.insert(tk.END, f"Starting training for {strategy} strategy...\n")
-            status_text.insert(tk.END, f"Symbols: {', '.join(symbols)}\n")
-            status_text.insert(tk.END, f"Period: {start_date} to {end_date}\n")
-            if retrain_from_verified:
-                status_text.insert(tk.END, f"🔄 Will also retrain from verified predictions\n")
-            status_text.insert(tk.END, "\n")
-            status_text.insert(tk.END, "💡 You can minimize this window and continue using the app!\n")
-            status_text.insert(tk.END, "Training runs in the background and won't block the UI.\n\n")
-            status_text.update()
+            try:
+                symbols = [s.strip().upper() for s in symbols_entry.get().split(',')]
+                start_date = start_entry.get()
+                end_date = end_entry.get()
+                strategy = strategy_var.get()
+                retrain_from_verified = retrain_var.get()
+                
+                # Save symbols for next time
+                symbols_str = ','.join(symbols)
+                self.preferences.set_training_symbols(strategy, symbols_str)
+                
+                status_text.delete(1.0, tk.END)
+                status_text.delete(1.0, tk.END)
+                status_text.insert(tk.END, f"Starting training for {strategy} strategy...\\n")
+                status_text.insert(tk.END, f"Symbols: {', '.join(symbols)}\\n")
+                status_text.insert(tk.END, f"Period: {start_date} to {end_date}\\n")
+                if retrain_from_verified:
+                    status_text.insert(tk.END, f"🔄 Will also retrain from verified predictions\\n")
+                status_text.insert(tk.END, "\\n")
+                status_text.insert(tk.END, "💡 You can minimize this window and continue using the app!\\n")
+                status_text.insert(tk.END, "Training runs in the background and won't block the UI.\\n\\n")
+                status_text.update()
+            except Exception as e:
+                messagebox.showerror("Error Starting Training", f"Could not start training: {e}")
+                logger.error(f"Error starting training: {e}", exc_info=True)
+                return
             
             # Helper function to safely update status text (handles destroyed widgets)
             def safe_insert(text):
@@ -10260,15 +10257,60 @@ By using this application, you acknowledge that you understand and accept these 
                 except (tk.TclError, AttributeError):
                     pass  # Widget was destroyed, ignore
             
+            if not hasattr(self, 'training_manager') or self.training_manager is None:
+                messagebox.showerror("Error", "Training manager not initialized!")
+                return
+
+            # Create a custom logging handler to redirect logs to the text widget
+            class GuiLogHandler(logging.Handler):
+                def __init__(self, text_widget, dialog_ref):
+                    super().__init__()
+                    self.text_widget = text_widget
+                    self.dialog_ref = dialog_ref
+                
+                def emit(self, record):
+                    msg = self.format(record)
+                    # Schedule update on main thread
+                    try:
+                        self.dialog_ref.after(0, lambda m=msg: self._safe_insert(m))
+                    except:
+                        pass
+                
+                def _safe_insert(self, text):
+                    try:
+                        if self.dialog_ref.winfo_exists():
+                            self.text_widget.insert(tk.END, text + "\n")
+                            self.text_widget.see(tk.END)
+                    except:
+                        pass
+
+            # Setup handler
+            gui_handler = GuiLogHandler(status_text, dialog)
+            gui_handler.setLevel(logging.INFO)
+            formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S')
+            gui_handler.setFormatter(formatter)
+            
+            # Attach to root logger
+            root_logger = logging.getLogger()
+            root_logger.addHandler(gui_handler)
+            
+            # Ensure handler is removed when dialog closes
+            def on_dialog_close():
+                root_logger.removeHandler(gui_handler)
+                dialog.destroy()
+            
+            dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
+
             # Run training in background
             def train():
                 try:
                     # First, train on historical data
+                    # progress_callback is redundant for INFO logs now, but kept for specific status/error messages
                     result = self.training_manager.train_on_symbols(
                         symbols, start_date, end_date, strategy,
-                        progress_callback=lambda msg: dialog.after(0, lambda: safe_insert(msg))
+                        progress_callback=lambda msg: dialog.after(0, lambda m=msg: safe_insert(m))
                     )
-                    
+                
                     if 'error' in result:
                         dialog.after(0, lambda: safe_insert(f"\n✗ Error: {result['error']}"))
                     else:
@@ -10311,8 +10353,8 @@ By using this application, you acknowledge that you understand and accept these 
                         
                         dialog.after(0, self._update_ml_status)
                 except Exception as e:
-                    error_msg = str(e)  # Capture error message in local variable
-                    dialog.after(0, lambda msg=error_msg: safe_insert(f"\n✗ Error: {msg}"))
+                    error_msg = str(e)
+                    dialog.after(0, lambda msg=error_msg: safe_insert(f"\n✗ Critical Error during training: {msg}"))
             
             thread = threading.Thread(target=train)
             thread.daemon = True

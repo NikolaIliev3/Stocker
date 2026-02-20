@@ -1,0 +1,22 @@
+{
+  "AMZN": "consumer",
+  "MCD": "consumer",
+  "MSFT": "technology",
+  "DIS": "communication",
+  "XOM": "energy",
+  "JNJ": "healthcare",
+  "AAPL": "technology",
+  "JPM": "financial",
+  "KO": "consumer",
+  "NKE": "consumer",
+  "CAT": "industrials",
+  "META": "communication",
+  "WMT": "consumer",
+  "BA": "industrials",
+  "MA": "financial",
+  "V": "financial",
+  "GOOGL": "communication",
+  "NVDA": "technology",
+  "PG": "consumer",
+  "HD": "consumer"
+}

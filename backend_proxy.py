@@ -41,6 +41,12 @@ import requests
 
 # Suppress SSL warnings
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
+warnings.filterwarnings('ignore', message='.*Timestamp.utcnow is deprecated.*')
+try:
+    from pandas.errors import Pandas4Warning
+    warnings.filterwarnings('ignore', category=Pandas4Warning)
+except ImportError:
+    pass
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Workaround for Windows SSL certificate issues with yfinance/curl

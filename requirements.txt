@@ -16,6 +16,11 @@ scikit-learn==1.3.0
 joblib==1.3.0
 scipy==1.11.0
 
+# ML Data Quality Tools (free, open-source)
+evidently==0.4.0
+cleanlab>=2.6.0
+pyarrow>=14.0.0
+
 # Optional: For dependency vulnerability scanning
 # safety>=2.3.0
 

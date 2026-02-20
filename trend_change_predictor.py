@@ -121,18 +121,18 @@ class TrendChangePredictor:
                     estimated_date = datetime.now() + timedelta(days=int(avg_recovery_days))
                     # Adjust confidence based on how oversold (lower RSI = higher confidence)
                     if current_rsi < 30:
-                        confidence = min(85, 50 + (30 - current_rsi) * 2)  # Very oversold
+                        confidence = max(0, min(85, 50 + (30 - current_rsi) * 2))  # Very oversold
                     else:
-                        confidence = min(70, 40 + (35 - current_rsi) * 2)  # Approaching oversold
+                        confidence = max(0, min(70, 40 + (35 - current_rsi) * 2))  # Approaching oversold
                     
                     return {
                         'current_trend': current_trend,
                         'predicted_change': 'bullish_reversal',
                         'estimated_days': int(avg_recovery_days),
                         'estimated_date': estimated_date.isoformat(),
-                        'confidence': confidence,
+                        'confidence': float(confidence),
                         'reasoning': f"RSI {'oversold' if current_rsi < 30 else 'approaching oversold'} ({current_rsi:.1f}) in downtrend - historical patterns suggest bullish reversal in ~{int(avg_recovery_days)} days",
-                        'key_indicators': {'rsi': current_rsi, 'rsi_status': 'oversold' if current_rsi < 30 else 'approaching_oversold'}
+                        'key_indicators': {'rsi': float(current_rsi), 'rsi_status': 'oversold' if current_rsi < 30 else 'approaching_oversold'}
                     }
             
             elif current_trend == 'uptrend' and current_rsi > 65:
@@ -144,18 +144,18 @@ class TrendChangePredictor:
                     estimated_date = datetime.now() + timedelta(days=int(avg_reversal_days))
                     # Adjust confidence based on how overbought (higher RSI = higher confidence)
                     if current_rsi > 70:
-                        confidence = min(85, 50 + (current_rsi - 70) * 2)  # Very overbought
+                        confidence = max(0, min(85, 50 + (current_rsi - 70) * 2))  # Very overbought
                     else:
-                        confidence = min(70, 40 + (current_rsi - 65) * 2)  # Approaching overbought
+                        confidence = max(0, min(70, 40 + (current_rsi - 65) * 2))  # Approaching overbought
                     
                     return {
                         'current_trend': current_trend,
                         'predicted_change': 'bearish_reversal',
                         'estimated_days': int(avg_reversal_days),
                         'estimated_date': estimated_date.isoformat(),
-                        'confidence': confidence,
+                        'confidence': float(confidence),
                         'reasoning': f"RSI {'overbought' if current_rsi > 70 else 'approaching overbought'} ({current_rsi:.1f}) in uptrend - historical patterns suggest bearish reversal in ~{int(avg_reversal_days)} days",
-                        'key_indicators': {'rsi': current_rsi, 'rsi_status': 'overbought' if current_rsi > 70 else 'approaching_overbought'}
+                        'key_indicators': {'rsi': float(current_rsi), 'rsi_status': 'overbought' if current_rsi > 70 else 'approaching_overbought'}
                     }
             
             return None
@@ -201,18 +201,18 @@ class TrendChangePredictor:
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
                     # Higher confidence if closer to crossover
                     if macd_diff_abs < 0.1:
-                        confidence = min(75, 40 + (0.1 - macd_diff_abs) * 350)
+                        confidence = max(0, min(75, 40 + (0.1 - macd_diff_abs) * 350))
                     else:
-                        confidence = min(65, 35 + (0.5 - macd_diff_abs) * 60)
+                        confidence = max(0, min(65, 35 + (0.5 - macd_diff_abs) * 60))
                     
                     return {
                         'current_trend': current_trend,
                         'predicted_change': 'bullish_reversal',
-                        'estimated_days': estimated_days,
+                        'estimated_days': int(estimated_days),
                         'estimated_date': estimated_date.isoformat(),
-                        'confidence': confidence,
+                        'confidence': float(confidence),
                         'reasoning': f"MACD {'converging with' if is_converging else 'near'} signal line (diff: {macd_diff:.3f}) - potential bullish crossover in ~{estimated_days} days",
-                        'key_indicators': {'macd': macd, 'macd_signal': macd_signal, 'macd_diff': macd_diff}
+                        'key_indicators': {'macd': float(macd), 'macd_signal': float(macd_signal), 'macd_diff': float(macd_diff)}
                     }
             
             elif current_trend == 'uptrend' and macd_diff > 0 and (macd_diff_abs < 0.5 or is_converging):
@@ -228,18 +228,18 @@ class TrendChangePredictor:
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
                     # Higher confidence if closer to crossover
                     if macd_diff_abs < 0.1:
-                        confidence = min(75, 40 + (0.1 - macd_diff_abs) * 350)
+                        confidence = max(0, min(75, 40 + (0.1 - macd_diff_abs) * 350))
                     else:
-                        confidence = min(65, 35 + (0.5 - macd_diff_abs) * 60)
+                        confidence = max(0, min(65, 35 + (0.5 - macd_diff_abs) * 60))
                     
                     return {
                         'current_trend': current_trend,
                         'predicted_change': 'bearish_reversal',
-                        'estimated_days': estimated_days,
+                        'estimated_days': int(estimated_days),
                         'estimated_date': estimated_date.isoformat(),
-                        'confidence': confidence,
+                        'confidence': float(confidence),
                         'reasoning': f"MACD {'converging with' if is_converging else 'near'} signal line (diff: {macd_diff:.3f}) - potential bearish crossover in ~{estimated_days} days",
-                        'key_indicators': {'macd': macd, 'macd_signal': macd_signal, 'macd_diff': macd_diff}
+                        'key_indicators': {'macd': float(macd), 'macd_signal': float(macd_signal), 'macd_diff': float(macd_diff)}
                     }
             
             return None
@@ -293,18 +293,18 @@ class TrendChangePredictor:
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
                     # Higher confidence if closer together
                     if abs(ema_diff_pct) < 2:
-                        confidence = min(80, 50 + (2 - abs(ema_diff_pct)) * 15)
+                        confidence = max(0, min(80, 50 + (2 - abs(ema_diff_pct)) * 15))
                     else:
-                        confidence = min(65, 40 + (5 - abs(ema_diff_pct)) * 5)
+                        confidence = max(0, min(65, 40 + (5 - abs(ema_diff_pct)) * 5))
                     
                     return {
                         'current_trend': current_trend,
                         'predicted_change': 'bullish_reversal',
-                        'estimated_days': estimated_days,
+                        'estimated_days': int(estimated_days),
                         'estimated_date': estimated_date.isoformat(),
-                        'confidence': confidence,
+                        'confidence': float(confidence),
                         'reasoning': f"EMA 20 {'approaching' if abs(ema_diff_pct) < 2 else 'converging towards'} EMA 50 (Golden Cross potential, {abs(ema_diff_pct):.1f}% apart) - estimated ~{estimated_days} days",
-                        'key_indicators': {'ema_20': ema_20, 'ema_50': ema_50, 'ema_diff_pct': ema_diff_pct}
+                        'key_indicators': {'ema_20': float(ema_20), 'ema_50': float(ema_50), 'ema_diff_pct': float(ema_diff_pct)}
                     }
             
             # Death Cross potential (EMA 20 crossing below EMA 50)
@@ -320,18 +320,18 @@ class TrendChangePredictor:
                     estimated_date = datetime.now() + timedelta(days=estimated_days)
                     # Higher confidence if closer together
                     if abs(ema_diff_pct) < 2:
-                        confidence = min(80, 50 + (2 - abs(ema_diff_pct)) * 15)
+                        confidence = max(0, min(80, 50 + (2 - abs(ema_diff_pct)) * 15))
                     else:
-                        confidence = min(65, 40 + (5 - abs(ema_diff_pct)) * 5)
+                        confidence = max(0, min(65, 40 + (5 - abs(ema_diff_pct)) * 5))
                     
                     return {
                         'current_trend': current_trend,
                         'predicted_change': 'bearish_reversal',
-                        'estimated_days': estimated_days,
+                        'estimated_days': int(estimated_days),
                         'estimated_date': estimated_date.isoformat(),
-                        'confidence': confidence,
+                        'confidence': float(confidence),
                         'reasoning': f"EMA 20 {'approaching' if abs(ema_diff_pct) < 2 else 'converging towards'} EMA 50 (Death Cross potential, {abs(ema_diff_pct):.1f}% apart) - estimated ~{estimated_days} days",
-                        'key_indicators': {'ema_20': ema_20, 'ema_50': ema_50, 'ema_diff_pct': ema_diff_pct}
+                        'key_indicators': {'ema_20': float(ema_20), 'ema_50': float(ema_50), 'ema_diff_pct': float(ema_diff_pct)}
                     }
             
             return None
@@ -368,9 +368,9 @@ class TrendChangePredictor:
                     return {
                         'current_trend': current_trend,
                         'predicted_change': 'bearish_reversal',
-                        'estimated_days': estimated_days,
+                        'estimated_days': int(estimated_days),
                         'estimated_date': estimated_date.isoformat(),
-                        'confidence': 65,
+                        'confidence': float(65),
                         'reasoning': "Bearish divergence detected - price rising but momentum weakening, potential reversal in ~10 days",
                         'key_indicators': {'divergence_type': 'bearish'}
                     }
@@ -391,9 +391,9 @@ class TrendChangePredictor:
                     return {
                         'current_trend': current_trend,
                         'predicted_change': 'bullish_reversal',
-                        'estimated_days': estimated_days,
+                        'estimated_days': int(estimated_days),
                         'estimated_date': estimated_date.isoformat(),
-                        'confidence': 65,
+                        'confidence': float(65),
                         'reasoning': "Bullish divergence detected - price falling but momentum improving, potential reversal in ~10 days",
                         'key_indicators': {'divergence_type': 'bullish'}
                     }
@@ -429,11 +429,11 @@ class TrendChangePredictor:
                 return {
                     'current_trend': current_trend,
                     'predicted_change': 'bullish_reversal',
-                    'estimated_days': estimated_days,
+                    'estimated_days': int(estimated_days),
                     'estimated_date': estimated_date.isoformat(),
-                    'confidence': confidence,
+                    'confidence': float(confidence),
                     'reasoning': f"Price {'near' if distance_to_support < 2 else 'approaching'} support level ({distance_to_support:.1f}% away) - potential bounce in ~{estimated_days} days",
-                    'key_indicators': {'distance_to_support': distance_to_support}
+                    'key_indicators': {'distance_to_support': float(distance_to_support)}
                 }
             
             # If very close to resistance in uptrend, potential rejection
@@ -448,11 +448,11 @@ class TrendChangePredictor:
                 return {
                     'current_trend': current_trend,
                     'predicted_change': 'bearish_reversal',
-                    'estimated_days': estimated_days,
+                    'estimated_days': int(estimated_days),
                     'estimated_date': estimated_date.isoformat(),
-                    'confidence': confidence,
+                    'confidence': float(confidence),
                     'reasoning': f"Price {'near' if distance_to_resistance < 2 else 'approaching'} resistance level ({distance_to_resistance:.1f}% away) - potential rejection in ~{estimated_days} days",
-                    'key_indicators': {'distance_to_resistance': distance_to_resistance}
+                    'key_indicators': {'distance_to_resistance': float(distance_to_resistance)}
                 }
             
             return None
@@ -486,11 +486,11 @@ class TrendChangePredictor:
                     return {
                         'current_trend': current_trend,
                         'predicted_change': 'continuation',
-                        'estimated_days': estimated_days,
+                        'estimated_days': int(estimated_days),
                         'estimated_date': estimated_date.isoformat(),
-                        'confidence': confidence,
+                        'confidence': float(confidence),
                         'reasoning': f"Strong uptrend continuation expected - RSI {rsi:.1f}, MACD bullish, price above EMAs - estimated ~{estimated_days} days",
-                        'key_indicators': {'rsi': rsi, 'macd_diff': macd_diff, 'trend_strength': 'strong'}
+                        'key_indicators': {'rsi': float(rsi), 'macd_diff': float(macd_diff), 'trend_strength': 'strong'}
                     }
             
             # Strong downtrend continuation
@@ -509,11 +509,11 @@ class TrendChangePredictor:
                     return {
                         'current_trend': current_trend,
                         'predicted_change': 'continuation',
-                        'estimated_days': estimated_days,
+                        'estimated_days': int(estimated_days),
                         'estimated_date': estimated_date.isoformat(),
-                        'confidence': confidence,
+                        'confidence': float(confidence),
                         'reasoning': f"Strong downtrend continuation expected - RSI {rsi:.1f}, MACD bearish, price below EMAs - estimated ~{estimated_days} days",
-                        'key_indicators': {'rsi': rsi, 'macd_diff': macd_diff, 'trend_strength': 'strong'}
+                        'key_indicators': {'rsi': float(rsi), 'macd_diff': float(macd_diff), 'trend_strength': 'strong'}
                     }
             
             return None

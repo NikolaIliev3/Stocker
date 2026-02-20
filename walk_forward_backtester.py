@@ -82,8 +82,11 @@ class WalkForwardBacktester:
             start_idx += step_size_days
         
         if not windows:
+            logger.warning(f"Insufficient data for walk-forward test. Need at least {train_window_days + test_window_days} days of data.")
             return {"error": "Insufficient data for walk-forward test. Need at least {} days of data.".format(train_window_days + test_window_days)}
         
+        logger.info(f"Created {len(windows)} walk-forward windows for {symbol}")
+
         # Run backtest for each window
         window_results = []
         for i, window in enumerate(windows):
@@ -93,12 +96,15 @@ class WalkForwardBacktester:
                 window_predictions = self._generate_predictions_for_window(
                     df, window, predictor, symbol, strategy, lookforward_days
                 )
+                logger.info(f"Window {i}: Generated {len(window_predictions)} predictions")
             
             window_result = self._test_window(df, window, window_predictions, i, lookforward_days)
+            logger.info(f"Window {i}: Tested {window_result['predictions_tested']} valid predictions")
             window_results.append(window_result)
         
         # Aggregate results
         aggregated = self._aggregate_results(window_results)
+        logger.info(f"Total aggregated predictions: {aggregated.get('total_predictions', 0)}")
         
         # Save results
         self.results['walk_forward_tests'] = window_results
@@ -148,19 +154,40 @@ class WalkForwardBacktester:
                 }
                 
                 # Generate prediction
-                prediction = predictor.predict(stock_data, history_dict, {})
+                # CRITICAL SYNC FIX: Pass current_date=test_date to prevent "Future Snoop"
+                prediction = predictor.predict(
+                    stock_data, 
+                    history_dict, 
+                    {}, 
+                    current_date=test_date,
+                    is_backtest=True
+                )
                 
-                if prediction and 'action' in prediction:
+                # Support both flat and nested (Hybrid) response formats
+                action = None
+                confidence = 0.0
+                
+                if prediction:
+                    if 'recommendation' in prediction and 'action' in prediction['recommendation']:
+                        # Nested format (Hybrid)
+                        action = prediction['recommendation']['action']
+                        confidence = prediction['recommendation'].get('confidence', 0)
+                    elif 'action' in prediction:
+                        # Flat format (Simple)
+                        action = prediction['action']
+                        confidence = prediction.get('confidence', 0)
+
+                if action:
                     predictions.append({
                         'date': test_date.strftime('%Y-%m-%d'),
-                        'action': prediction.get('action', 'HOLD'),
-                        'confidence': prediction.get('confidence', 0),
+                        'action': action,
+                        'confidence': confidence,
                         'lookforward_days': lookforward_days,
                         'entry_price': current_price,
                         'strategy': strategy  # Include strategy for correct evaluation
                     })
             except Exception as e:
-                logger.debug(f"Error generating prediction for {test_date}: {e}")
+                logger.error(f"Error generating prediction for {test_date}: {e}", exc_info=True)
                 continue
         
         return predictions
@@ -185,19 +212,8 @@ class WalkForwardBacktester:
                 # If no date, assume it's for this window
                 window_predictions.append(p)
         
-        # If no predictions provided, generate test points from test data
-        if not window_predictions:
-            # Sample every 5 days in test period
-            test_dates = test_data['date'].iloc[::5].tolist()
-            for test_date in test_dates:
-                test_row = test_data[test_data['date'] == test_date]
-                if not test_row.empty:
-                    window_predictions.append({
-                        'date': test_date.strftime('%Y-%m-%d'),
-                        'action': 'HOLD',  # Default action
-                        'lookforward_days': lookforward_days,
-                        'entry_price': float(test_row.iloc[0]['close'])
-                    })
+        # If no predictions provided, skip this window (no test points to evaluate)
+        # We don't generate default HOLD predictions because HOLD is a veto, not a signal.
         
         # Calculate metrics
         correct = 0
@@ -240,6 +256,11 @@ class WalkForwardBacktester:
                 
                 # Check if prediction was correct
                 action = pred.get('action', 'HOLD')
+                
+                # HOLD/AVOID are vetoes — skip them entirely
+                if action in ('HOLD', 'AVOID'):
+                    continue
+                
                 price_change_pct = ((future_price - entry_price) / entry_price) * 100  # Convert to percentage
                 
                 # NOTE: Algorithm uses INVERTED logic:
@@ -252,17 +273,6 @@ class WalkForwardBacktester:
                 elif action == 'SELL':
                     # SELL (bullish signals) is correct if price went UP (so you can sell at profit)
                     is_correct = price_change_pct > 0
-                elif action == 'HOLD':
-                    # HOLD is correct if price didn't move much (strategy-specific thresholds)
-                    # Get strategy from prediction or use default
-                    strategy = pred.get('strategy', 'trading')
-                    if strategy == "trading":
-                        is_correct = abs(price_change_pct) < 3
-                    elif strategy == "mixed":
-                        is_correct = abs(price_change_pct) < 5
-                    else:  # investing
-                        # For investing (1.5 year lookforward), allow up to 20% movement for HOLD
-                        is_correct = abs(price_change_pct) < 20
                 else:
                     is_correct = False  # Unknown action
                 
@@ -303,8 +313,9 @@ class WalkForwardBacktester:
         
         total_correct = sum(r.get('correct', 0) for r in window_results)
         total_incorrect = sum(r.get('incorrect', 0) for r in window_results)
+        total_predictions = total_correct + total_incorrect
         
-        overall_accuracy = total_correct / (total_correct + total_incorrect) if (total_correct + total_incorrect) > 0 else 0
+        overall_accuracy = total_correct / total_predictions if total_predictions > 0 else 0
         mean_accuracy = np.mean(accuracies) if accuracies else 0
         std_accuracy = np.std(accuracies) if accuracies else 0
         min_accuracy = min(accuracies) if accuracies else 0
@@ -321,6 +332,7 @@ class WalkForwardBacktester:
         
         return {
             'windows': len(window_results),
+            'total_predictions': total_predictions,
             'overall_accuracy': overall_accuracy,
             'mean_accuracy': mean_accuracy,
             'std_accuracy': std_accuracy,

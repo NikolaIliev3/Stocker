@@ -9,6 +9,12 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+from config import ML_LABEL_THRESHOLD
+# Import Quant Settings
+try:
+    from quant_config import IS_QUANT_MODE
+except ImportError:
+    IS_QUANT_MODE = False
 import logging
 import threading
 import ssl
@@ -18,6 +24,7 @@ from data_fetcher import StockDataFetcher
 from ml_training import StockPredictionML, FeatureExtractor
 from adaptive_weight_adjuster import AdaptiveWeightAdjuster
 from predictions_tracker import PredictionsTracker
+from pattern_matcher import PatternMatcher
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +47,93 @@ class TrainingDataGenerator:
         self.data_fetcher = data_fetcher
         self.feature_extractor = feature_extractor
         self._patch_yfinance_ssl()
+        
+        # Initialize analyzers
+        from algorithm_improvements import MarketRegimeDetector, RelativeStrengthAnalyzer
+        from macro_regime import MacroRegimeDetector
+        self.regime_detector = MarketRegimeDetector()
+        self.relative_strength_analyzer = RelativeStrengthAnalyzer()
+        self.macro_detector = MacroRegimeDetector(data_fetcher)
+        
+        # Cache SPY data for market regime/relative strength
+        self.spy_history = None
+        self._fetch_spy_data()
+        
+        # Cache Sector ETF data
+        self.sector_data_cache = {}
+
+        # Cache Macro history
+        self.macro_history = None
+        self._fetch_macro_data()
+
+    def _fetch_spy_data(self):
+        """Fetch SPY data once for market regime calculations"""
+        try:
+            logger.info("Fetching SPY data for market regime analysis...")
+            # Fetch long history for SPY
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            start_date = (datetime.now() - timedelta(days=365*10)).strftime('%Y-%m-%d')
+            
+            # Use same logic as generate_training_samples to safely fetch
+            # Try 1: data_fetcher
+            spy_data = self.data_fetcher.fetch_stock_history('SPY', period='10y')
+            if spy_data and spy_data.get('data'):
+                self.spy_history = pd.DataFrame(spy_data['data'])
+            
+            # Try 2: yfinance direct
+            if self.spy_history is None or self.spy_history.empty:
+                import yfinance as yf
+                self.spy_history = yf.download('SPY', start=start_date, end=end_date, progress=False)
+            
+            # Process SPY data
+            if self.spy_history is not None and not self.spy_history.empty:
+                if 'date' in self.spy_history.columns:
+                    self.spy_history['date'] = pd.to_datetime(self.spy_history['date'])
+                    self.spy_history.set_index('date', inplace=True)
+                
+                # Normalize columns
+                self.spy_history.columns = [col.capitalize() for col in self.spy_history.columns]
+                if 'Close' not in self.spy_history.columns and 'close' in self.spy_history.columns:
+                     self.spy_history.rename(columns={'close': 'Close', 'volume': 'Volume'}, inplace=True)
+                
+                logger.info(f"Cached {len(self.spy_history)} rows of SPY data")
+            else:
+                logger.warning("Failed to fetch SPY data - Market Regime features will be neutral")
+        except Exception as e:
+            logger.error(f"Error fetching SPY data: {e}")
+            
+    def _fetch_macro_data(self):
+        """Fetch historical macro data (VIX, TNX, DXY) for training"""
+        try:
+            logger.info("Fetching Macro data (VIX, TNX, DXY) for training...")
+            import yfinance as yf
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=365*10)
+            
+            # Usingtickers from MacroRegimeDetector
+            tickers = ['^VIX', '^TNX', 'DX-Y.NYB']
+            data = yf.download(tickers, start=start_date, end=end_date, progress=False, auto_adjust=True)
+            
+            if not data.empty:
+                # Standardize columns
+                if isinstance(data.columns, pd.MultiIndex):
+                    try:
+                        closes = data['Close']
+                    except KeyError:
+                        closes = data['Adj Close']
+                else:
+                    closes = data
+                
+                # Map to internal names
+                mapping = {'^VIX': 'VIX', '^TNX': 'TNX', 'DX-Y.NYB': 'DXY'}
+                self.macro_history = closes.rename(columns=mapping)
+                self.macro_history.index.name = 'date'
+                
+                logger.info(f"Cached {len(self.macro_history)} rows of Macro data")
+            else:
+                logger.warning("Failed to fetch Macro data")
+        except Exception as e:
+            logger.error(f"Error fetching Macro data: {e}")
     
     def _patch_yfinance_ssl(self):
         """Patch yfinance to work around SSL certificate issues"""
@@ -78,370 +172,260 @@ class TrainingDataGenerator:
     
     def generate_training_samples(self, symbol: str, start_date: str, end_date: str,
                                  strategy: str = "trading", lookforward_days: int = 10) -> List[Dict]:
-        """Generate training samples from historical data"""
-        logger.info(f"🔍 Starting sample generation for {symbol} (strategy: {strategy}, lookforward: {lookforward_days} days)")
+        """Generate training samples from historical data (Optimized/Vectorized)"""
+        logger.info(f"Starting sample generation for {symbol} (strategy: {strategy}, lookforward: {lookforward_days} days)")
         try:
-            logger.info(f"📥 Fetching data for {symbol} from {start_date} to {end_date}")
+            # 1. FETCH DATA (Full History)
+            # ------------------------------------------------------------------
+            # Calculate period needed (max 15 years to be safe)
+            fetch_start = (datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=365)).strftime('%Y-%m-%d')
             
-            # Use data_fetcher which has better SSL handling
+            # Fetch Stock Data
             hist = None
             try:
-                # Calculate period needed (max 10 years)
-                start_dt = datetime.strptime(start_date, '%Y-%m-%d')
-                end_dt = datetime.strptime(end_date, '%Y-%m-%d')
-                days_diff = (end_dt - start_dt).days
-                if days_diff > 3650:  # More than 10 years
-                    period = "10y"
-                elif days_diff > 1825:  # More than 5 years
-                    period = "5y"
-                elif days_diff > 730:  # More than 2 years
-                    period = "2y"
-                else:
-                    period = "1y"
-                
-                # Try using data_fetcher first (has SSL workarounds)
-                history_data = self.data_fetcher.fetch_stock_history(symbol, period=period)
+                # Use fetch_stock_history which handles SSL/caching
+                history_data = self.data_fetcher.fetch_stock_history(
+                    symbol, 
+                    start_date=fetch_start, 
+                    end_date=end_date,
+                    period=None
+                )
                 if history_data and history_data.get('data'):
-                    # Convert to DataFrame format
-                    df_data = history_data['data']
-                    hist = pd.DataFrame(df_data)
+                    hist = pd.DataFrame(history_data['data'])
                     if 'date' in hist.columns:
                         hist['date'] = pd.to_datetime(hist['date'])
                         hist.set_index('date', inplace=True)
-                        # Filter to date range
-                        start_dt = pd.to_datetime(start_date)
-                        end_dt = pd.to_datetime(end_date)
-                        hist = hist[(hist.index >= start_dt) & (hist.index <= end_dt)]
-                        # Rename columns to match yfinance format
-                        hist.columns = [col.capitalize() for col in hist.columns]
-                        if 'Close' not in hist.columns and 'close' in hist.columns:
-                            hist.rename(columns={'close': 'Close', 'open': 'Open', 
-                                                'high': 'High', 'low': 'Low', 'volume': 'Volume'}, inplace=True)
-                    logger.info(f"✅ Fetched {len(hist)} rows of data for {symbol} (method: data_fetcher)")
-            except Exception as df_error:
-                logger.debug(f"data_fetcher method failed for {symbol}: {df_error}")
-            
-            # Fallback to direct yfinance if data_fetcher fails
+                        hist.columns = [col.lower() for col in hist.columns]
+            except Exception as e:
+                logger.debug(f"Data fetch error: {e}")
+
             if hist is None or hist.empty:
-                try:
-                    ticker = yf.Ticker(symbol.upper())
-                    
-                    # Try download() method first (more reliable with SSL issues)
-                    try:
-                        logger.info(f"   Trying yfinance.download() for {symbol}...")
-                        hist = yf.download(symbol.upper(), start=start_date, end=end_date, 
-                                         progress=False, show_errors=False, timeout=60)
-                        if not hist.empty:
-                            # Download returns multi-index DataFrame, convert to single index
-                            if isinstance(hist.columns, pd.MultiIndex):
-                                hist = hist.droplevel(0, axis=1)
-                            logger.info(f"✅ Fetched {len(hist)} rows of data for {symbol} (method: download)")
-                    except Exception as e1:
-                        logger.debug(f"download() failed for {symbol}: {e1}")
-                        
-                        # Try history() method
-                        try:
-                            logger.info(f"   Trying ticker.history() for {symbol}...")
-                            hist = ticker.history(start=start_date, end=end_date, timeout=60)
-                            if not hist.empty:
-                                logger.info(f"✅ Fetched {len(hist)} rows of data for {symbol} (method: history)")
-                        except Exception as e2:
-                            logger.error(f"❌ All yfinance methods failed for {symbol}")
-                            logger.error(f"   download() error: {str(e1)[:150]}")
-                            logger.error(f"   history() error: {str(e2)[:150]}")
-                            return []
-                except Exception as yf_error:
-                    logger.error(f"❌ yfinance initialization failed for {symbol}: {yf_error}")
+                # Fallback to direct yfinance
+                import yfinance as yf
+                hist = yf.download(symbol.upper(), start=fetch_start, end=end_date, progress=False)
+                if not hist.empty:
+                     # Standardize
+                    if isinstance(hist.columns, pd.MultiIndex):
+                        hist = hist.droplevel(0, axis=1)
+                    hist.columns = [col.lower() for col in hist.columns]
+            
+            if hist is None or hist.empty or len(hist) < 200:
+                logger.error(f"Insufficient data for {symbol}")
+                return []
+
+            # Ensure we have required columns
+            required_cols = ['close', 'open', 'high', 'low', 'volume']
+            for col in required_cols:
+                if col not in hist.columns:
+                    logger.error(f"Missing column {col} in data for {symbol}")
                     return []
+
+            # 2. PRE-CALCULATE FEATURES (Vectorized)
+            # ------------------------------------------------------------------
+            logger.info("   Pre-calculating features vectorially...")
             
-            if hist is None or hist.empty:
-                logger.error(f"❌ No historical data returned for {symbol} (date range: {start_date} to {end_date})")
-                return []
+            # Use TradingAnalyzer to calc indicators on FULL DF
+            from trading_analyzer import TradingAnalyzer
+            if not hasattr(self, '_cached_analyzer'):
+                self._cached_analyzer = TradingAnalyzer(data_fetcher=None)
             
-            if hist.empty:
-                logger.error(f"❌ No historical data returned for {symbol} (date range: {start_date} to {end_date})")
-                # Try to get info about the ticker
+            # This adds indicator columns to the DataFrame or returns a dict of Series
+            # We want them in the DataFrame for easy row extraction
+            indicators_df = self._cached_analyzer._calculate_indicators_vectorized(hist)
+            
+            # Macro Regime (Vectorized join)
+            if self.macro_history is not None:
+                # Reindex macro to match hist index (ffill)
+                macro_aligned = self.macro_history.reindex(hist.index, method='ffill')
+                indicators_df['VIX'] = macro_aligned['VIX']
+                indicators_df['TNX'] = macro_aligned['TNX']
+                indicators_df['DXY'] = macro_aligned['DXY']
+            
+            # Market Regime (Vectorized join)
+            if self.spy_history is not None:
                 try:
-                    info = ticker.info
-                    logger.info(f"ℹ️ Ticker info available: {info.get('symbol', 'N/A')}")
-                except:
-                    pass
-                return []
+                    regime_df = self.regime_detector.compute_regimes_vectorized(self.spy_history)
+                    # Reindex to match stock data
+                    regime_aligned = regime_df.reindex(hist.index, method='ffill')
+                    indicators_df['market_regime'] = regime_aligned['Regime']
+                except Exception as e:
+                    logger.warning(f"Vectorized regime sync failed: {e}")
+                    indicators_df['market_regime'] = 'sideways'
             
-            if len(hist) < 50:
-                logger.error(f"❌ Insufficient data for {symbol}: {len(hist)} days (need at least 50)")
-                return []
+            # Sector Analysis (Vectorized)
+            sector_etf = self.data_fetcher.get_sector_etf(symbol)
+            if sector_etf and sector_etf != 'SPY':
+                if sector_etf not in self.sector_data_cache:
+                     s_data = self.data_fetcher.fetch_sector_data(sector_etf, days=365*10)
+                     if s_data is not None:
+                         if 'date' in s_data.columns:
+                             s_data['date'] = pd.to_datetime(s_data['date'])
+                             s_data.set_index('date', inplace=True)
+                         self.sector_data_cache[sector_etf] = s_data
+                
+                if sector_etf in self.sector_data_cache:
+                    s_hist = self.sector_data_cache[sector_etf]
+                    # Calculate sector momentum
+                    col = 'close' if 'close' in s_hist.columns else 'Close'
+                    s_mom = s_hist[col].pct_change(20)
+                    # Align
+                    s_mom_aligned = s_mom.reindex(hist.index, method='ffill')
+                    indicators_df['sector_momentum_20d'] = s_mom_aligned
+
+            # 3. SAMPLE GENERATION LOOP (Simplified)
+            # ------------------------------------------------------------------
+            # Filter to requested start/end date
+            mask = (hist.index >= pd.to_datetime(start_date)) & (hist.index <= pd.to_datetime(end_date))
+            target_indices = np.where(mask)[0]
             
-            # Need enough data for lookback + lookforward
-            min_required = 50 + lookforward_days
-            if len(hist) < min_required:
-                logger.error(f"❌ Insufficient data for {symbol}: {len(hist)} days (need at least {min_required} for {lookforward_days} day lookforward)")
-                return []
+            # Step size
+            step = 5
+            valid_indices = target_indices[::step]
             
             samples = []
-            dates = hist.index.tolist()
+            dates = hist.index
+            prices = hist['close'].values
+            highs = hist['high'].values
+            lows = hist['low'].values
+            opens = hist['open'].values
             
-            logger.info(f"📊 Processing {symbol}: {len(hist)} days of data, generating samples with {lookforward_days} day lookforward")
+            logger.info(f"   Extracting {len(valid_indices)} samples...")
             
-            # Use sliding window - need at least 50 days history + lookforward_days future
-            # Sample every 5 days to avoid too many samples and speed up training
-            step = 5
-            error_count = 0
-            success_count = 0
-            loop_count = 0
-            
-            # Calculate how many iterations we'll do
-            start_idx = 50
-            end_idx = len(dates) - lookforward_days
-            total_iterations = len(range(start_idx, end_idx, step))
-            logger.info(f"🔄 Will process {total_iterations} potential samples (range: {start_idx} to {end_idx}, step: {step})")
-            
-            for i in range(start_idx, end_idx, step):
-                loop_count += 1
-                current_date = dates[i]
-                current_price = float(hist.iloc[i]['Close'])
-                
-                # Get historical data up to current date
-                hist_to_date = hist.iloc[:i+1]
-                
-                # Convert to format expected by analyzers
-                # Make sure we have enough data points
-                if len(hist_to_date) < 20:
-                    error_count += 1
+            for idx in valid_indices:
+                # Ensure we have lookforward space
+                if idx + lookforward_days >= len(hist):
                     continue
+                    
+                current_date = dates[idx]
+                current_price = prices[idx]
                 
-                history_data = {
-                    'data': [
-                        {
-                            'date': date.strftime('%Y-%m-%d'),
-                            'open': float(row['Open']),
-                            'high': float(row['High']),
-                            'low': float(row['Low']),
-                            'close': float(row['Close']),
-                            'volume': int(row['Volume']) if not pd.isna(row['Volume']) else 0
-                        }
-                        for date, row in hist_to_date.iterrows()
-                    ]
+                if current_price <= 0: continue
+
+                if current_price <= 0: continue
+                
+                # Get window for MAX PROFIT calculation
+                window_end = min(idx + lookforward_days + 1, len(hist))
+                future_highs = highs[idx+1 : window_end]
+                
+                max_price = 0
+                max_profit_pct = 0.0
+                if len(future_highs) > 0:
+                    max_price = np.max(future_highs)
+                    if current_price > 0:
+                        max_profit_pct = ((max_price - current_price) / current_price) * 100
+
+                # --- TERMINAL SUCCESS LABELING (3% HURDLE) ---
+                # A trade is a success if it is >= 3% above entry at EXPRTY.
+                # Mid-period drops and stop-losses are IGNORED (Patient Sniper Mode).
+                
+                from config import ML_LABEL_THRESHOLD
+                success_threshold = ML_LABEL_THRESHOLD / 100.0
+                
+                # Check price at the EXACT end of the lookforward period (Expiry)
+                expiry_idx = min(idx + lookforward_days, len(prices) - 1)
+                expiry_price = prices[expiry_idx]
+                
+                price_change = (expiry_price - current_price) / current_price
+                
+                if price_change >= success_threshold:
+                    label = 'BUY' # Terminal Winner
+                else:
+                    label = 'HOLD' # Failed to hit 3% at expiry
+                
+                if strategy == "investing":
+                     # Simple return based - strict 10% gain required for BUY
+                     ret = (prices[min(idx+lookforward_days, len(prices)-1)] - current_price) / current_price
+                     if ret > 0.10: 
+                        label = 'BUY'
+                     else: 
+                        label = 'HOLD'
+
+                # --- FEATURE EXTRACTION (O(1) Lookup) ---
+                # We simply grab the row from indicators_df and format it
+                # The feature extractor expects a specific format, so we might need
+                # to manually construct the feature vector to match exactly what the model expects.
+                # However, to be safe and consistent, we can pass the PRE-CALCULATED dict to the extractor.
+                
+                # Construct indicators dict from the row
+                row_data = indicators_df.iloc[idx]
+                
+                # We need to map the flat DF row back to the nested structure FeatureExtractor expects?
+                # Actually, FeatureExtractor takes `indicators` dict. We can just pass the row as dict.
+                row_dict = row_data.to_dict()
+                
+                # EXTRACT KEY PATTERN FEATURES FOR SAVING
+                pattern_features = {
+                    'rsi': float(row_dict.get('rsi', 50)),
+                    'atr_percent': float(row_dict.get('atr_percent', 0)),
+                    'sma50_dist': float((current_price / row_dict.get('ema_50', current_price) - 1) * 100) if row_dict.get('ema_50') else 0.0
                 }
                 
-                # Validate history_data
-                if not history_data.get('data') or len(history_data['data']) < 20:
-                    error_count += 1
-                    if error_count <= 3:
-                        logger.debug(f"Insufficient history_data for {symbol} at {current_date}: {len(history_data.get('data', []))} points")
-                    continue
+                # Market Regime features
+                m_regime = row_dict.get('market_regime', 'sideways')
+                regime_dict = {'regime': m_regime, 'strength': 50} # Simplified
                 
-                stock_data = {
-                    'symbol': symbol,
-                    'price': current_price,
-                    'info': {}
-                }
+                # Macro
+                macro_dict = {'regime': 'neutral'} # Simplified
                 
-                # Get future price
-                future_idx = min(i + lookforward_days, len(dates) - 1)
-                future_price = float(hist.iloc[future_idx]['Close'])
-                price_change_pct = ((future_price - current_price) / current_price) * 100
+                 # Sector
+                sector_dict = None
+                if 'sector_momentum_20d' in row_dict and not pd.isna(row_dict['sector_momentum_20d']):
+                     s_mom = row_dict['sector_momentum_20d']
+                     # Stock mom
+                     stock_mom = (current_price - prices[idx-20])/prices[idx-20] if idx >= 20 else 0
+                     rel = stock_mom - s_mom
+                     sector_dict = {
+                         'available': True,
+                         'stock_vs_sector': rel * 100,
+                         'sector_trend': 'uptrend' if s_mom > 0 else 'downtrend'
+                     }
+
+                # Prepare history slice for TS features (Need ~50 days for MA/Vol features)
+                # This ensures Training features match Prediction features (which use full history)
+                # Mismatch (0 vs 50M) caused Scaler to fail.
+                hist_slice_start = max(0, idx - 60)
+                hist_slice = hist.iloc[hist_slice_start:idx+1] # Include current row
                 
-                # Label based on strategy (Trend Following)
-                # - Price going UP → BUY (Signal to Enter/Long)
-                # - Price going DOWN → SELL (Signal to Exit/Short)
-                if strategy == "trading":
-                    if price_change_pct >= 3:
-                        label = "BUY"
-                    elif price_change_pct <= -3:
-                        label = "SELL"
-                    else:
-                        label = "HOLD"
-                elif strategy == "investing":
-                    if price_change_pct >= 10:
-                        label = "BUY"
-                    elif price_change_pct <= -10:
-                        label = "SELL"
-                    else:
-                        label = "HOLD"
-                else:  # mixed
-                    if price_change_pct >= 5:
-                        label = "BUY"
-                    elif price_change_pct <= -5:
-                        label = "SELL"
-                    else:
-                        label = "HOLD"
-                
-                # Extract features - try to calculate indicators, but fallback to defaults if it fails
-                indicators = {}
-                try:
-                    # Calculate technical indicators using the analyzer
-                    # Reuse analyzer instance to avoid recreating it for each sample (saves API calls)
-                    if not hasattr(self, '_cached_analyzer'):
-                        from trading_analyzer import TradingAnalyzer
-                        self._cached_analyzer = TradingAnalyzer(data_fetcher=None)  # No data_fetcher to avoid SPY API calls during training
-                    
-                    temp_analyzer = self._cached_analyzer
-                    
-                    # Initialize enhanced features variables (skip market regime/relative strength for training to avoid API calls)
-                    market_regime = None
-                    timeframe_analysis = None
-                    relative_strength = None
-                    support_resistance = None
-                    
-                    # Convert history_data to DataFrame for direct indicator calculation
-                    if history_data and history_data.get('data') and len(history_data['data']) >= 20:
-                        # Create DataFrame from history_data
-                        hist_df = pd.DataFrame(history_data['data'])
-                        if 'date' in hist_df.columns:
-                            hist_df['date'] = pd.to_datetime(hist_df['date'])
-                            hist_df.set_index('date', inplace=True)
-                        
-                        # Ensure columns are lowercase (analyzer expects lowercase)
-                        column_mapping = {}
-                        for col in hist_df.columns:
-                            col_lower = col.lower()
-                            if col_lower in ['close', 'open', 'high', 'low', 'volume']:
-                                column_mapping[col] = col_lower
-                        if column_mapping:
-                            hist_df.rename(columns=column_mapping, inplace=True)
-                        
-                        # Ensure we have required columns
-                        required_cols = ['close', 'open', 'high', 'low', 'volume']
-                        missing_cols = [col for col in required_cols if col not in hist_df.columns]
-                        if missing_cols:
-                            if error_count < 3:
-                                logger.debug(f"Missing columns for {symbol} at {current_date}: {missing_cols}")
-                        else:
-                            # Calculate indicators directly without full analysis (avoids SPY API calls)
-                            try:
-                                indicators = temp_analyzer._calculate_indicators(hist_df)
-                                price_action = temp_analyzer._analyze_price_action(hist_df)
-                                timeframe_analysis = temp_analyzer.timeframe_analyzer.analyze_timeframes(hist_df)
-                                support_resistance = temp_analyzer._identify_levels(hist_df)
-                            except Exception as calc_error:
-                                if error_count < 3:
-                                    logger.debug(f"Indicator calculation failed for {symbol} at {current_date}: {calc_error}")
-                    else:
-                        if error_count < 3:
-                            logger.debug(f"Insufficient history data for {symbol} at {current_date}: {len(history_data.get('data', []))} days, using defaults")
-                except Exception as analyzer_error:
-                    # Analyzer failed, but we can still extract features with defaults
-                    if error_count < 3:
-                        logger.debug(f"Analyzer exception for {symbol} at {current_date}, using default indicators: {analyzer_error}")
-                    # Initialize variables in case of exception
-                    market_regime = None
-                    timeframe_analysis = None
-                    relative_strength = None
-                    support_resistance = None
-                
-                # Calculate volume analysis for liquidity features (no API calls needed)
-                volume_analysis = None
-                if history_data and history_data.get('data') and len(history_data['data']) >= 20:
-                    try:
-                        hist_df = pd.DataFrame(history_data['data'])
-                        if 'close' in hist_df.columns and 'volume' in hist_df.columns:
-                            avg_volume = hist_df['volume'].tail(20).mean()
-                            avg_price = hist_df['close'].tail(20).mean()
-                            avg_dollar_volume = avg_volume * avg_price
-                            current_volume = hist_df['volume'].iloc[-1] if len(hist_df) > 0 else 0
-                            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
-                            
-                            # Calculate volume trend (last vs 10 days ago)
-                            if len(hist_df) >= 10:
-                                volume_trend = "increasing" if hist_df['volume'].iloc[-1] > hist_df['volume'].iloc[-10] else "decreasing"
-                            else:
-                                volume_trend = "neutral"
-                                
-                            is_high_volume = volume_ratio > 1.5
-                            
-                            # Liquidity grade based on daily dollar volume
-                            if avg_dollar_volume >= 50_000_000:
-                                liquidity_grade = 'high'
-                            elif avg_dollar_volume >= 10_000_000:
-                                liquidity_grade = 'medium'
-                            elif avg_dollar_volume >= 1_000_000:
-                                liquidity_grade = 'low'
-                            else:
-                                liquidity_grade = 'very_low'
-                            
-                            volume_analysis = {
-                                'volume_ratio': float(volume_ratio),
-                                'avg_dollar_volume': float(avg_dollar_volume),
-                                'liquidity_grade': liquidity_grade,
-                                'volume_trend': volume_trend,
-                                'is_high_volume': is_high_volume
-                            }
-                    except Exception as vol_error:
-                        pass  # Use default if calculation fails
-                
-                # Extract features with enhanced analysis data (will use defaults if not available)
+                # Convert slice to dict format expected by extractor
+                # We reset index to make it JSON-serializable list of dicts
+                hist_data_dict = {'data': hist_slice.reset_index().to_dict(orient='records')}
+
+                # CALL EXTRACTOR
                 try:
                     features = self.feature_extractor.extract_features(
-                        stock_data, history_data, None, indicators if indicators else None,
-                        market_regime, timeframe_analysis, relative_strength, support_resistance,
-                        None,  # news_data
-                        None,  # sector_analysis (requires API, skip during training)
-                        None,  # catalyst_info (requires API, skip during training)
-                        volume_analysis  # liquidity features (calculated from history)
+                        stock_data={'price': current_price},
+                        history_data=hist_data_dict, # Pass valid history slice
+                        indicators=row_dict, # PASS PRE-CALCED INDICATORS
+                        market_regime=regime_dict,
+                        sector_analysis=sector_dict,
+                        macro_analysis=macro_dict,
+                        as_of_date=current_date
                     )
-                except Exception as feat_error:
-                    error_count += 1
-                    if error_count <= 5:
-                        logger.error(f"FeatureExtractor failed for {symbol} at {current_date}: {feat_error}", exc_info=True)
-                    continue
-                
-                # Validate features (moved outside except block - was unreachable before!)
-                if features is None:
-                    error_count += 1
-                    if error_count <= 3:
-                        logger.warning(f"None features returned for {symbol} at {current_date}")
-                    continue
-                
-                # Convert to numpy array if needed
-                if not isinstance(features, np.ndarray):
-                    features = np.array(features)
-                
-                if len(features) == 0:
-                    error_count += 1
-                    if error_count <= 3:
-                        logger.warning(f"Empty features array for {symbol} at {current_date}")
-                    continue
-                
-                # Check for invalid values and fix them
-                if np.any(np.isnan(features)) or np.any(np.isinf(features)):
-                    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-                
-                samples.append({
-                    'features': features.tolist(),
-                    'label': label,
-                    'price_change_pct': price_change_pct,
-                    'date': current_date.strftime('%Y-%m-%d'),
-                    'symbol': symbol,
-                    'sample_weight': 1.0  # Historical samples = baseline weight
-                })
-                success_count += 1
-                
-                # Log progress every 50 samples
-                if success_count % 50 == 0:
-                    logger.info(f"   ✓ {symbol}: Generated {success_count} samples so far...")
+                    
+                    # Sanitize
+                    if np.any(np.isnan(features)):
+                         features = np.nan_to_num(features)
+                         
+                    samples.append({
+                        'features': features.tolist(),
+                        'label': label,
+                        'meta_label': 1 if label != 'HOLD' else 0, # Simplified meta
+                        'rule_action': label, # Using label as proxy for rule action in fast mode
+                        'price_change_pct': float(price_change * 100), # Terminal profit
+                        'max_profit_pct': float(max_profit_pct), # PEAK profit (New for Phase 5)
+                        'pattern_features': pattern_features, # RSI, ATR, etc. (New for Phase 5)
+                        'date': current_date.strftime('%Y-%m-%d'),
+                        'symbol': symbol,
+                        'sample_weight': 1.0
+                    })
+                except Exception as e:
+                    pass
             
-            logger.info(f"✅ Completed processing {symbol}: Generated {len(samples)} samples (success: {success_count}, errors: {error_count}, loops: {loop_count})")
-            
-            if len(samples) == 0:
-                logger.error(f"❌❌❌ CRITICAL: No samples generated for {symbol}! ❌❌❌")
-                logger.error(f"   📅 Total dates in history: {len(dates)}")
-                logger.error(f"   📅 Date range: {dates[0] if dates else 'N/A'} to {dates[-1] if dates else 'N/A'}")
-                logger.error(f"   🔢 Loop iterations: {loop_count}")
-                logger.error(f"   🔢 Success count: {success_count}")
-                logger.error(f"   ❌ Error count: {error_count}")
-                logger.error(f"   📊 Valid range for sampling: indices {start_idx} to {end_idx} (step {step})")
-                if loop_count == 0:
-                    logger.error(f"   ⚠️ LOOP NEVER EXECUTED! Check range calculation.")
-                elif error_count == 0 and success_count == 0:
-                    logger.error(f"   ⚠️ Loop executed but no samples added - all iterations were skipped silently")
-                else:
-                    logger.error(f"   ⚠️ Check logs above for specific error details")
-            
+            logger.info(f"Generated {len(samples)} samples for {symbol}")
             return samples
-        
+
         except Exception as e:
-            logger.error(f"Error generating training samples for {symbol}: {e}", exc_info=True)
+            logger.error(f"Error generating samples for {symbol}: {e}", exc_info=True)
             return []
 
 
@@ -456,18 +440,22 @@ class MLTrainingPipeline:
         self.feature_extractor = FeatureExtractor(data_fetcher=data_fetcher)
         self.data_generator = TrainingDataGenerator(data_fetcher, self.feature_extractor)
     
-    def train_on_symbols(self, symbols: List[str], start_date: str, end_date: str,
-                        strategy: str = "trading", progress_callback=None) -> Dict:
+    def train_on_symbols(self, symbols: List[str], start_date: str = "2020-01-01", end_date: str = None,
+                        strategy: str = "trading", progress_callback=None, **kwargs) -> Dict:
         """Train ML model on multiple symbols"""
         logger.info(f"Training ML model for {strategy} on {len(symbols)} symbols...")
         
         # Determine lookforward_days based on strategy
         if strategy == "trading":
-            lookforward_days = 10
+            lookforward_days = 15  # Expanded from 10 to allow 3% targets to develop
         elif strategy == "investing":
-            lookforward_days = 547  # ~1.5 years
+            lookforward_days = 60  # 3 months
         else:  # mixed
             lookforward_days = 21  # ~3 weeks
+
+        if end_date is None:
+            from datetime import datetime
+            end_date = datetime.now().strftime("%Y-%m-%d")
         
         all_samples = []
         
@@ -506,7 +494,7 @@ class MLTrainingPipeline:
                         # PREPEND verified samples so they survive duplicate removal (which keeps first occurrence)
                         # This works because np.unique with return_index keeps the first index
                         all_samples = verified_samples + all_samples
-                        logger.info(f"✨ Merged {len(verified_samples)} verified predictions into training set with BOOSTER weight (20x)")
+                        logger.info(f"Merged {len(verified_samples)} verified predictions into training set with BOOSTER weight (20x)")
             except Exception as e:
                 logger.error(f"Error merging verified predictions: {e}")
         
@@ -536,7 +524,7 @@ class MLTrainingPipeline:
         # Binary mode removes ambiguous HOLD class and focuses on clear UP/DOWN signals
         # Apply saved config parameters if available, otherwise use defaults
         train_kwargs = {
-            'use_hyperparameter_tuning': training_params.get('use_hyperparameter_tuning', False),  # DISABLED: HP tuning can cause overfitting
+            'use_hyperparameter_tuning': training_params.get('use_hyperparameter_tuning', True),  # ENABLED: Dynamic tuning for better accuracy
             'use_binary_classification': training_params.get('use_binary_classification', True),
             'use_regime_models': training_params.get('use_regime_models', True),
             'feature_selection_method': training_params.get('feature_selection_method', 'importance'),
@@ -552,10 +540,86 @@ class MLTrainingPipeline:
             if training_params.get(param) is not None:
                 train_kwargs[param] = training_params[param]
         
+        # Override with any explicit kwargs passed to the function
+        train_kwargs.update(kwargs)
+        
         results = ml_model.train(
             all_samples,
             **train_kwargs
         )
+        
+        # Phase 3 Meta-Labeling: Train second model on signal correctness
+        # This helps the hybrid predictor filter out rule violations.
+        if 'error' not in results:
+            if progress_callback:
+                progress_callback("Training Meta-Classifier...")
+            
+            # Prepare meta-samples: only those where rule_action was non-HOLD and we have a meta_label
+            meta_samples = [s for s in all_samples if s.get('rule_action') != 'HOLD' and 'meta_label' in s]
+            if len(meta_samples) >= 30:
+                # Meta-train expects 'label' key to contain the target (1 or 0)
+                # Ensure we don't modify original samples indefinitely by using a shallow copy for the dict
+                pipeline_meta_samples = []
+                for s in meta_samples:
+                    meta_s = s.copy()
+                    meta_s['label'] = s.get('meta_label', 0)
+                    pipeline_meta_samples.append(meta_s)
+                
+                ml_model.train_meta(pipeline_meta_samples)
+                logger.info(f"Trained Meta-Classifier on {len(pipeline_meta_samples)} rule-based signals.")
+            else:
+                logger.warning(f"Skipping Meta-Classifier: Insufficient valid signals ({len(meta_samples)}).")
+        
+        # ===== PHASE 5: HISTORICAL UPSIDE ANALYSIS =====
+        if 'error' not in results:
+            try:
+                if progress_callback:
+                    progress_callback("Indexing Historical Patterns...")
+                
+                # 1. Get Confidence Scores for ALL samples (Batch Prediction)
+                feature_vectors = [s['features'] for s in all_samples]
+                
+                # Predict (Returns probabilities [N, 3])
+                probs = ml_model.predict_batch(feature_vectors)
+                
+                # Find BUY index
+                classes = ml_model.label_encoder.classes_
+                buy_idx = -1
+                if 'BUY' in classes:
+                    buy_idx = list(classes).index('BUY')
+                elif 'UP' in classes: # Binary mode
+                    buy_idx = list(classes).index('UP')
+                
+                if buy_idx != -1:
+                    # Collect patterns
+                    patterns_to_save = []
+                    for i, sample in enumerate(all_samples):
+                        # Only save if we have pattern_features (added in Phase 5)
+                        if 'pattern_features' not in sample:
+                            continue
+                            
+                        # Get Confidence for BUY
+                        conf = float(probs[i][buy_idx] * 100)
+                        
+                        # Prepare simplified record
+                        pat = {
+                            **sample['pattern_features'], # rsi, atr, etc.
+                            'confidence': conf, # The confidence the model ASSIGNS to this pattern
+                            'max_profit_pct': sample.get('max_profit_pct', 0.0), # The ACTUAL outcome
+                            'date': sample.get('date'),
+                            'symbol': sample.get('symbol')
+                        }
+                        patterns_to_save.append(pat)
+                    
+                    # Save using PatternMatcher
+                    pm = PatternMatcher(self.data_dir)
+                    pm.save_patterns(patterns_to_save)
+                    logger.info(f"Indexed {len(patterns_to_save)} historical patterns for Upside Analysis")
+                else:
+                    logger.warning("Could not identify BUY class for pattern indexing")
+                    
+            except Exception as e:
+                logger.error(f"Error indexing patterns: {e}")
         
         results['total_samples'] = len(all_samples)
         results['symbols_used'] = symbols
@@ -582,7 +646,7 @@ class MLTrainingPipeline:
             test_acc = results.get('test_accuracy', 0) * 100
             samples = results.get('total_samples', 0)
             
-            message = f"✅ ML Training Complete!\n\n"
+            message = f"ML Training Complete!\n\n"
             message += f"Strategy: {strategy.title()}\n"
             message += f"Training Samples: {samples:,}\n"
             message += f"Training Accuracy: {train_acc:.1f}%\n"
@@ -627,29 +691,34 @@ class MLTrainingPipeline:
                 # Calculate actual price change
                 price_change_pct = ((actual_price - entry_price) / entry_price) * 100
                 
+                # --- QUANT MODE LABELING --
+                threshold_buy = 3.0
+                threshold_sell = -3.0
+                
+                if IS_QUANT_MODE:
+                     # Calculate ATR for dynamic labeling at prediction time
+                     # Requirement: We need hist up to pred_date
+                     # This will be handled inside the history fetch block below
+                     pass # We'll set labels after fetching hist
+                
                 # Determine correct label based on actual outcome and strategy
-                # STANDARD LOGIC (fixed from inverted):
-                # Price went UP → model should have said BUY (bullish)
-                # Price went DOWN → model should have said SELL (bearish)
+                # STRICT BINARY LOGIC: Only BUY or HOLD. No SELL.
                 if strategy == "trading":
-                    if price_change_pct >= 3:
-                        label = "BUY"  # Price went UP → Correct action was BUY
-                    elif price_change_pct <= -3:
-                        label = "SELL"  # Price went DOWN → Correct action was SELL
+                    if not IS_QUANT_MODE:
+                        if price_change_pct >= 3:
+                            label = "BUY"
+                        else:
+                            label = "HOLD"
                     else:
-                        label = "HOLD"
+                        label = None # To be determined after hist/ATR
                 elif strategy == "investing":
                     if price_change_pct >= 10:
-                        label = "BUY"  # Price went UP significantly → Correct action was BUY
-                    elif price_change_pct <= -10:
-                        label = "SELL"  # Price went DOWN significantly → Correct action was SELL
+                        label = "BUY"
                     else:
                         label = "HOLD"
                 else:  # mixed
                     if price_change_pct >= 5:
-                        label = "BUY"  # Price went UP → Correct action was BUY
-                    elif price_change_pct <= -5:
-                        label = "SELL"  # Price went DOWN → Correct action was SELL
+                        label = "BUY"
                     else:
                         label = "HOLD"
                 
@@ -712,6 +781,30 @@ class MLTrainingPipeline:
                 # Get current price at prediction time (last close price)
                 current_price = float(hist.iloc[-1]['Close'])
                 
+                # Assign labels if in Quant Mode (after ATR calculation)
+                if IS_QUANT_MODE and strategy == "trading" and label is None:
+                    try:
+                        # Calculate ATR(14) locally from 'hist'
+                        df_tr = hist.copy()
+                        df_tr['tr1'] = df_tr['High'] - df_tr['Low']
+                        df_tr['tr2'] = abs(df_tr['High'] - df_tr['Close'].shift())
+                        df_tr['tr3'] = abs(df_tr['Low'] - df_tr['Close'].shift())
+                        df_tr['tr'] = df_tr[['tr1', 'tr2', 'tr3']].max(axis=1)
+                        atr = df_tr['tr'].rolling(14).mean().iloc[-1]
+                        
+                        # Dynamic Threshold: 2.0 * ATR
+                        atr_pct = (atr / current_price) * 100
+                        t_buy = max(2.0 * atr_pct, 1.5)
+                        t_sell = min(-2.0 * atr_pct, -1.5)
+                        
+                        if price_change_pct >= t_buy:
+                            label = "BUY"
+                        else:
+                            label = "HOLD"
+                    except Exception as e:
+                        # Fallback to 3% if ATR fails
+                        label = "BUY" if price_change_pct >= 3 else "HOLD"
+                
                 stock_data = {
                     'symbol': symbol,
                     'price': current_price,
@@ -767,20 +860,40 @@ class MLTrainingPipeline:
                     except:
                         pass
                 
-                # Extract features with enhanced analysis data
+                # Fetch macro analysis data
+                macro_analysis = None
+                if hasattr(self.data_generator, 'macro_detector'):
+                    try:
+                        # CRITICAL SYNC FIX: Use pred_date, NOT hist.index[-1]
+                        # This prevents "Future Snoop" where 2018 samples see 2026 macro levels.
+                        macro_slice = self.data_generator.macro_history[self.data_generator.macro_history.index <= pred_date]
+                        if len(macro_slice) >= 50:
+                            data_dict = {
+                                'VIX': macro_slice['VIX'],
+                                'TNX': macro_slice['TNX'],
+                                'DXY': macro_slice['DXY']
+                            }
+                            macro_analysis = self.data_generator.macro_detector.analyze_regime_from_data(data_dict)
+                    except Exception as e:
+                        logger.debug(f"Error fetching macro analysis for {symbol} at {pred_date}: {e}")
+
+                # Initialize other potential data sources to None if not fetched
+                financials_data = None
+                sector_analysis = None
+                catalyst_info = None
+                
                 try:
+                    # Extract features with enhanced analysis data (Date-Aware)
                     features = self.feature_extractor.extract_features(
-                        stock_data, history_data, None, indicators if indicators else None,
+                        stock_data, history_data, financials_data, indicators,
                         market_regime, timeframe_analysis, relative_strength, support_resistance,
-                        None,  # news_data
-                        None,  # sector_analysis
-                        None,  # catalyst_info
-                        volume_analysis
+                        None, sector_analysis, catalyst_info, volume_analysis, macro_analysis,
+                        as_of_date=pred_date
                     )
                     
                     if features is None or len(features) == 0:
                         continue
-                    
+                        
                     # Convert to numpy array and handle invalid values
                     if not isinstance(features, np.ndarray):
                         features = np.array(features)
