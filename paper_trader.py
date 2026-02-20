@@ -295,18 +295,21 @@ class PaperTrader:
                 active_preds = self.tracker.get_active_predictions()
                 if not any(p['symbol'] == symbol for p in active_preds):
                     rec = prediction.get('recommendation', {})
-                    self.tracker.add_prediction(
-                        symbol=symbol,
-                        strategy='trading',
-                        action=rec.get('action', 'HOLD'),
-                        entry_price=rec.get('entry_price', current_price),
-                        target_price=rec.get('target_price', current_price * 1.05),
-                        stop_loss=rec.get('stop_loss', current_price * 0.95),
-                        confidence=rec.get('confidence', 0),
-                        reasoning=prediction.get('reasoning', 'Live analysis'),
-                        estimated_days=prediction.get('estimated_days'),
-                        market_regime=prediction.get('market_regime', 'unknown')
-                    )
+                    rec_action = rec.get('action', 'HOLD')
+                    # HOLD/AVOID are vetoes — don't store them
+                    if rec_action not in ('HOLD', 'AVOID'):
+                        self.tracker.add_prediction(
+                            symbol=symbol,
+                            strategy='trading',
+                            action=rec_action,
+                            entry_price=rec.get('entry_price', current_price),
+                            target_price=rec.get('target_price', current_price * 1.05),
+                            stop_loss=rec.get('stop_loss', current_price * 0.95),
+                            confidence=rec.get('confidence', 0),
+                            reasoning=prediction.get('reasoning', 'Live analysis'),
+                            estimated_days=prediction.get('estimated_days'),
+                            market_regime=prediction.get('market_regime', 'unknown')
+                        )
 
                 action = prediction['recommendation']['action']
                 confidence = prediction['recommendation']['confidence']
@@ -380,18 +383,21 @@ class PaperTrader:
                 active_preds = self.tracker.get_active_predictions()
                 if not any(p['symbol'] == symbol for p in active_preds):
                     rec = prediction.get('recommendation', {})
-                    self.tracker.add_prediction(
-                        symbol=symbol,
-                        strategy='trading',
-                        action=rec.get('action', 'HOLD'),
-                        entry_price=rec.get('entry_price', current_price),
-                        target_price=rec.get('target_price', current_price * 1.05),
-                        stop_loss=rec.get('stop_loss', current_price * 0.95),
-                        confidence=rec.get('confidence', 0),
-                        reasoning=prediction.get('reasoning', 'Live scan'),
-                        estimated_days=prediction.get('estimated_days'),
-                        market_regime=prediction.get('market_regime', 'unknown')
-                    )
+                    rec_action = rec.get('action', 'HOLD')
+                    # HOLD/AVOID are vetoes — don't store them
+                    if rec_action not in ('HOLD', 'AVOID'):
+                        self.tracker.add_prediction(
+                            symbol=symbol,
+                            strategy='trading',
+                            action=rec_action,
+                            entry_price=rec.get('entry_price', current_price),
+                            target_price=rec.get('target_price', current_price * 1.05),
+                            stop_loss=rec.get('stop_loss', current_price * 0.95),
+                            confidence=rec.get('confidence', 0),
+                            reasoning=prediction.get('reasoning', 'Live scan'),
+                            estimated_days=prediction.get('estimated_days'),
+                            market_regime=prediction.get('market_regime', 'unknown')
+                        )
 
                 action = prediction['recommendation']['action']
                 confidence = prediction['recommendation']['confidence']

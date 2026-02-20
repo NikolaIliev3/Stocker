@@ -212,19 +212,8 @@ class WalkForwardBacktester:
                 # If no date, assume it's for this window
                 window_predictions.append(p)
         
-        # If no predictions provided, generate test points from test data
-        if not window_predictions:
-            # Sample every 5 days in test period
-            test_dates = test_data['date'].iloc[::5].tolist()
-            for test_date in test_dates:
-                test_row = test_data[test_data['date'] == test_date]
-                if not test_row.empty:
-                    window_predictions.append({
-                        'date': test_date.strftime('%Y-%m-%d'),
-                        'action': 'HOLD',  # Default action
-                        'lookforward_days': lookforward_days,
-                        'entry_price': float(test_row.iloc[0]['close'])
-                    })
+        # If no predictions provided, skip this window (no test points to evaluate)
+        # We don't generate default HOLD predictions because HOLD is a veto, not a signal.
         
         # Calculate metrics
         correct = 0
@@ -267,6 +256,11 @@ class WalkForwardBacktester:
                 
                 # Check if prediction was correct
                 action = pred.get('action', 'HOLD')
+                
+                # HOLD/AVOID are vetoes — skip them entirely
+                if action in ('HOLD', 'AVOID'):
+                    continue
+                
                 price_change_pct = ((future_price - entry_price) / entry_price) * 100  # Convert to percentage
                 
                 # NOTE: Algorithm uses INVERTED logic:
@@ -279,17 +273,6 @@ class WalkForwardBacktester:
                 elif action == 'SELL':
                     # SELL (bullish signals) is correct if price went UP (so you can sell at profit)
                     is_correct = price_change_pct > 0
-                elif action == 'HOLD':
-                    # HOLD is correct if price didn't move much (strategy-specific thresholds)
-                    # Get strategy from prediction or use default
-                    strategy = pred.get('strategy', 'trading')
-                    if strategy == "trading":
-                        is_correct = abs(price_change_pct) < 3
-                    elif strategy == "mixed":
-                        is_correct = abs(price_change_pct) < 5
-                    else:  # investing
-                        # For investing (1.5 year lookforward), allow up to 20% movement for HOLD
-                        is_correct = abs(price_change_pct) < 20
                 else:
                     is_correct = False  # Unknown action
                 

@@ -170,6 +170,12 @@ class AutoLearner:
                         try:
                             symbol = rec['symbol']
                             action = rec.get('action', 'BUY')
+                            
+                            # HOLD/AVOID are vetoes — skip them
+                            if action in ('HOLD', 'AVOID'):
+                                logger.debug(f"Skipping {action} for {symbol} — veto signal")
+                                continue
+                            
                             entry_price = rec.get('entry_price', rec.get('price', 0))
                             target_price = rec.get('target_price', 0)
                             stop_loss = rec.get('stop_loss', 0)

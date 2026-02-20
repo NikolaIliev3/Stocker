@@ -2907,6 +2907,13 @@ class StockerApp:
         
         recommendation = self.current_analysis.get('recommendation', {})
         action = recommendation.get('action', 'HOLD')
+        
+        # HOLD/AVOID are vetoes — not actionable predictions
+        if action in ('HOLD', 'AVOID'):
+            messagebox.showinfo(self.localization.t('info'),
+                              f"Analysis returned {action} for {symbol} \u2014 no actionable signal to save.")
+            return
+        
         old_entry_price = recommendation.get('entry_price', current_price_usd)
         old_target_price = recommendation.get('target_price', current_price_usd)
         old_stop_loss = recommendation.get('stop_loss', current_price_usd)
@@ -4029,6 +4036,12 @@ class StockerApp:
                     action = recommendation.get('action', 'HOLD')
                     confidence = recommendation.get('confidence', 0)
                     reasoning = analysis.get('reasoning', '')
+                    
+                    # HOLD/AVOID are vetoes — skip them
+                    if action in ('HOLD', 'AVOID'):
+                        self.root.after(0, self._append_firing_result,
+                                      f"⏭️ {symbol}: {action} (veto, skipped)\n")
+                        continue
                     
                     # Calculate targets based on strategy
                     if action == "BUY":

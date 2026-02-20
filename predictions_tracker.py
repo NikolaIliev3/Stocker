@@ -72,7 +72,11 @@ class PredictionsTracker:
         """Load predictions from file safely"""
         with self.lock:
             data = self.storage.load(default={})
-            self.predictions = data.get('predictions', [])
+            # Handle both dict format {"predictions": [...]} and raw list format [...]
+            if isinstance(data, list):
+                self.predictions = data
+            else:
+                self.predictions = data.get('predictions', [])
     
     def save(self):
         """Save predictions to file safely"""
@@ -88,7 +92,7 @@ class PredictionsTracker:
                       entry_price: float, target_price: float, 
                       stop_loss: float, confidence: float, reasoning: str,
                       estimated_days: int = None, predicted_move_pct: float = None,
-                      market_regime: str = "unknown") -> Dict:
+                      market_regime: str = "unknown") -> Optional[Dict]:
         """Add a new prediction with estimated target date
         
         Args:
@@ -96,7 +100,16 @@ class PredictionsTracker:
                           If None, calculated based on strategy.
             predicted_move_pct: Predicated magnitude of the move in percentage (absolute)
             market_regime: Market regime at the time of prediction (bull, bear, etc.)
+            
+        Returns:
+            Dict with the prediction data, or None if action is HOLD/AVOID (veto).
         """
+        # HOLD/AVOID are vetoes — they are not actionable predictions.
+        # Do not store, track, or verify them.
+        if action in ("HOLD", "AVOID"):
+            logger.info(f"⏭️ Skipping {action} for {symbol} — veto signal, not stored.")
+            return None
+        
         # Calculate estimated target date based on strategy if not provided
         if estimated_days is None:
             if strategy == "trading":
@@ -205,8 +218,15 @@ class PredictionsTracker:
             logger.error(f"Error syncing to paper_state: {e}")
     
 
-    def verify_prediction(self, prediction_id: int, current_price: float) -> Optional[Dict]:
-        """Verify if a prediction came true"""
+    def verify_prediction(self, prediction_id: int, current_price: float, high: float = None, low: float = None) -> Optional[Dict]:
+        """Verify if a prediction came true
+        
+        Args:
+            prediction_id: ID of the prediction to verify
+            current_price: Current market price
+            high: High price since prediction (optional, for retroactive check)
+            low: Low price since prediction (optional, for retroactive check)
+        """
         with self.lock:
             prediction = self.get_prediction_by_id(prediction_id)
             if not prediction or prediction['status'] != 'active':
@@ -241,62 +261,68 @@ class PredictionsTracker:
 
             if action == "BUY":
                 # PATIENT SNIPER VERIFICATION:
-                # 1. Intra-period drops (e.g. -10%) are IGNORED.
-                # 2. Intra-period target hits are IGNORED (must hold until expiry/limit).
-                # 3. Success is defined ONLY at Expiry (Deadline).
+                # 1. Retroactive High/Low Check (prioritized)
+                #    If High >= Target -> WIN
                 
-                if is_expired:
+                # Check High (Win)
+                if high is not None and high >= target_price:
+                    was_correct = True
+                    current_price = high  # Record ACTUAL high, not target (for auditing)
+                    logger.info(f"🔍 Retroactive HIT for {prediction.get('symbol')} #{prediction_id}: "
+                                f"High={high:.2f} >= Target={target_price:.2f}, "
+                                f"EntryDate={prediction['timestamp'][:10]}")
+                # Check Current Price (Snapshot fallback)
+                elif current_price >= target_price:
+                    was_correct = True
+                
+                # NOTE: Stop Loss hits are IGNORED until Expiry.
+                # We allow the trade to breathe even if it dips below stop.
+                
+                # 2. Expiry Check (if no levels hit)
+                elif is_expired:
                     from config import MIN_PROFIT_TARGET_PCT
                     price_change = ((current_price - entry_price) / entry_price) * 100
                     
-                    # USER REQUEST: "at least we hit 3% in profits. if we did, then the prediction is considered TRUE"
                     if price_change >= MIN_PROFIT_TARGET_PCT:
                         was_correct = True
                         logger.info(f"✅ Prediction {prediction_id} SUCCESS (Terminal Profit): {price_change:.2f}% >= {MIN_PROFIT_TARGET_PCT}%")
                     else:
                         was_correct = False 
-                        logger.info(f"❌ Prediction {prediction_id} FAILURE (Stagnant/Loss at Expiry): {price_change:.2f}% < {MIN_PROFIT_TARGET_PCT}%")
+                        logger.info(f"❌ Prediction {prediction_id} FAILURE (Expired without hitting target): {price_change:.2f}% < {MIN_PROFIT_TARGET_PCT}%")
                 else:
-                    # Still within lifespan, wait for expiry
+                    # Still within lifespan, wait for level hit or expiry
                     return None
                         
             elif action == "SELL":
-                if current_price <= target_price:
+                # Retroactive High/Low Check
+                # Check Low (Win for Short)
+                if low is not None and low <= target_price:
                     was_correct = True
-                elif current_price >= stop_loss:
-                    was_correct = False
+                    current_price = low  # Record ACTUAL low, not target (for auditing)
+                    logger.info(f"🔍 Retroactive HIT for {prediction.get('symbol')} #{prediction_id}: "
+                                f"Low={low:.2f} <= Target={target_price:.2f}, "
+                                f"EntryDate={prediction['timestamp'][:10]}")
+                # Snapshot fallback
+                elif current_price <= target_price:
+                    was_correct = True
+                
+                # NOTE: Stop Loss hits are IGNORED until Expiry.
+                
                 elif is_expired:
                     from config import MIN_PROFIT_TARGET_PCT
-                    price_change = ((current_price - entry_price) / entry_price) * 100
                     # For SELL, price_change needs to be negative (drop)
                     # Example: Entry 100, Current 90 -> -10%. We want <= -3.0%
+                    price_change = ((current_price - entry_price) / entry_price) * 100
+                    
                     if price_change <= -MIN_PROFIT_TARGET_PCT:
                          was_correct = True
                     else:
                          was_correct = False
             elif action in ["HOLD", "AVOID"]:
-                # For HOLD/AVOID, we check if price moved in expected direction
-                price_change = ((current_price - entry_price) / entry_price) * 100
-                strategy = prediction.get('strategy', 'trading')
-                
-                if is_expired:
-                    if action == "HOLD":
-                        # Strategy-specific thresholds for HOLD (same as backtest evaluation)
-                        if strategy == "trading":
-                            was_correct = abs(price_change) < 3
-                        elif strategy == "mixed":
-                            was_correct = abs(price_change) < 5
-                        else:  # investing
-                            # For investing (1.5 year timeframe), allow up to 20% movement
-                            was_correct = abs(price_change) < 20
-                    elif action == "AVOID":
-                        # AVOID (legacy) is correct if price went down
-                        was_correct = price_change < -5
-                    else:
-                        was_correct = False
-                else:
-                    # Not expired yet, keep active
-                    return None
+                # HOLD/AVOID are vetoes — they should never have been stored.
+                # If one exists (legacy data), skip verification entirely.
+                logger.warning(f"⚠️ Found legacy HOLD/AVOID prediction #{prediction_id} — skipping verification.")
+                return None
             
             # KEY CHANGE: If was_correct is still None (neither Target nor Stop hit), 
             # do NOT verify. Keep it active until it hits a level.
@@ -368,151 +394,7 @@ class PredictionsTracker:
             
             self.save()
             return prediction
-            
-        # GRACE PERIOD CHECK:
-        # Don't verify predictions made in the last 15 minutes.
-        # This prevents "instant" failures due to bid/ask spread, volatility, or slight data delays.
-        try:
-            pred_timestamp = datetime.fromisoformat(prediction['timestamp'])
-            minutes_since_creation = (datetime.now() - pred_timestamp).total_seconds() / 60
-            if minutes_since_creation < 15:
-                # Too new, skip verification
-                return None
-        except Exception as e:
-            logger.debug(f"Error checking grace period for prediction {prediction_id}: {e}")
-        
-        action = prediction['action']
-        entry_price = prediction['entry_price']
-        target_price = prediction['target_price']
-        stop_loss = prediction['stop_loss']
-        
-        was_correct = None
-        
-        # Check for time-based expiry
-        estimated_date_str = prediction.get('estimated_target_date')
-        is_expired = False
-        if estimated_date_str:
-            try:
-                is_expired = datetime.now() >= datetime.fromisoformat(estimated_date_str)
-            except:
-                pass
 
-        if action == "BUY":
-            # BUY prediction is correct if price reached target before stop loss
-            if current_price >= target_price:
-                was_correct = True
-            elif current_price <= stop_loss:
-                was_correct = False
-            elif is_expired:
-                # Expired without hitting levels: correct if price reached significant move (3% threshold)
-                price_change = ((current_price - entry_price) / entry_price) * 100
-                was_correct = price_change >= 3.0
-        elif action == "SELL":
-            # SELL prediction is correct if price reached target before stop loss
-            if current_price <= target_price:
-                was_correct = True
-            elif current_price >= stop_loss:
-                was_correct = False
-            elif is_expired:
-                # Expired without hitting levels: correct if price reached significant move (-3% threshold)
-                price_change = ((current_price - entry_price) / entry_price) * 100
-                was_correct = price_change <= -3.0
-        elif action in ["HOLD", "AVOID"]:
-            # For HOLD/AVOID, we check if price moved in expected direction
-            price_change = ((current_price - entry_price) / entry_price) * 100
-            strategy = prediction.get('strategy', 'trading')
-            
-            if is_expired:
-                if action == "HOLD":
-                    # Strategy-specific thresholds for HOLD (same as backtest evaluation)
-                    if strategy == "trading":
-                        was_correct = abs(price_change) < 3
-                    elif strategy == "mixed":
-                        was_correct = abs(price_change) < 5
-                    else:  # investing
-                        # For investing (1.5 year timeframe), allow up to 20% movement
-                        was_correct = abs(price_change) < 20
-                elif action == "AVOID":
-                    # AVOID (legacy) is correct if price went down
-                    was_correct = price_change < -5
-                else:
-                    was_correct = False
-            else:
-                # Not expired yet, keep active
-                return None
-        
-        # KEY CHANGE: If was_correct is still None (neither Target nor Stop hit), 
-        # do NOT verify. Keep it active until it hits a level.
-        if was_correct is None:
-            return None
-            
-        # Calculate price change
-        price_change = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
-        
-        # Update prediction
-        prediction['verified'] = True
-        prediction['status'] = 'verified'
-        prediction['was_correct'] = was_correct
-        prediction['actual_price_at_target'] = current_price
-        prediction['verification_date'] = datetime.now().isoformat()
-        prediction['actual_price_change'] = price_change
-        
-        # Calculate days since prediction
-        pred_date = datetime.fromisoformat(prediction['timestamp'])
-        days_diff = (datetime.now() - pred_date).days
-        prediction['days_to_target'] = days_diff
-
-        # -------------------------------------------------------------------------
-        # MEGAMIND LEARNING INJECTION
-        # -------------------------------------------------------------------------
-        # If we have a price_move_predictor and this prediction has a predicted move,
-        # teach the system!
-        if getattr(self, 'price_move_predictor', None) and 'predicted_move_pct' in prediction:
-            try:
-                predicted_pct = prediction['predicted_move_pct']
-                actual_abs_pct = abs(price_change)
-                # Learn from this specific outcome
-                self.price_move_predictor.learn_from_outcome(
-                    predicted_pct=predicted_pct,
-                    actual_pct=actual_abs_pct,
-                    signal_type=action
-                )
-                logger.info(f"🧠 Fed prediction result to PriceMovePredictor: Pred {predicted_pct}%, Actual {actual_abs_pct}%")
-            except Exception as e:
-                logger.error(f"Failed to feed data to PriceMovePredictor: {e}")
-        # -------------------------------------------------------------------------
-        
-        # Record outcome in production monitor
-        strategy = prediction.get('strategy', 'trading')
-        if strategy in self.production_monitors:
-            try:
-                self.production_monitors[strategy].record_outcome(
-                    symbol=prediction['symbol'],
-                    action=action,
-                    was_correct=was_correct,
-                    actual_price_change=price_change
-                )
-            except Exception as e:
-                logger.debug(f"Error recording outcome in production monitor: {e}")
-        
-        # Record outcome in performance attribution
-        if self.performance_attribution:
-            try:
-                outcome_dict = {
-                    'was_correct': was_correct,
-                    'actual_price_change': price_change
-                }
-                # Add market regime and sector if available
-                prediction_with_metadata = prediction.copy()
-                self.performance_attribution.record_prediction_outcome(
-                    prediction=prediction_with_metadata,
-                    outcome=outcome_dict
-                )
-            except Exception as e:
-                logger.debug(f"Error recording outcome in performance attribution: {e}")
-        
-        self.save()
-        return prediction
     
     def verify_all_active_predictions(self, data_fetcher, check_all: bool = False) -> Dict:
         """Verify all active predictions by fetching current prices
@@ -534,17 +416,66 @@ class PredictionsTracker:
         for prediction in active_predictions:
                 # ALWAYS check price conditions for active predictions.
                 # We want to know if Target or Stop was hit immediately.
-                # We no longer wait for the 'date' to expire to check for success.
-                # We also don't auto-fail if date expires but levels aren't hit (handled in verify_prediction).
                 
                 try:
-                    # Fetch current price
-                    stock_data = data_fetcher.fetch_stock_data(prediction['symbol'])
+                    # Fetch current price AND history for retroactive check
+                    # We need history to catch hits that happened between scans or while app was off
+                    stock_data = data_fetcher.fetch_stock_data(prediction['symbol'], check_quality=False)
                     current_price = stock_data.get('price', 0)
+                    
+                    # EXTRACT HISTORY FOR RETROACTIVE CHECK
+                    high_since_entry = None
+                    low_since_entry = None
+                    
+                    if 'history' in stock_data and stock_data['history']:
+                        try:
+                            # 1. Parse prediction timestamp
+                            pred_ts = datetime.fromisoformat(prediction['timestamp'])
+                            
+                            # 2. Filter history for candles AFTER prediction time
+                            # We look for any candle that opened/closed/high/low AFTER the prediction
+                            relevant_candles = []
+                            for candle in stock_data['history']:
+                                candle_date_str = candle.get('date') # YYYY-MM-DD
+                                if not candle_date_str: continue
+                                
+                                # Basic date comparison (assuming candles are daily or have timestamps)
+                                # If daily candles (YYYY-MM-DD), we include the day of prediction and after
+                                candle_date = datetime.strptime(candle_date_str, '%Y-%m-%d')
+                                
+                                # If candle is from same day or later, include it
+                                # (Note: This might include price action before the specific *time* of prediction
+                                # on the same day, but for daily candles that's the best we can do without 1m data.
+                                # Given "Patient Sniper" logic, confirming a hit on the same day is acceptable
+                                # as long as it hit the target price.)
+                                if candle_date.date() > pred_ts.date():
+                                    relevant_candles.append(candle)
+                            
+                            if relevant_candles:
+                                # 3. Find Max High and Min Low in the relevant period
+                                highs = [c.get('high', -1) for c in relevant_candles if c.get('high')]
+                                lows = [c.get('low', 999999999) for c in relevant_candles if c.get('low')]
+                                
+                                if highs: high_since_entry = max(highs)
+                                if lows: low_since_entry = min(lows)
+                                
+                                # Log detection for debugging
+                                # logger.debug(f"Retroactive check for {prediction['symbol']}: High={high_since_entry}, Low={low_since_entry}")
+                                
+                        except Exception as e:
+                            logger.debug(f"Error processing history for {prediction['symbol']}: {e}")
+
                     
                     if current_price > 0:
                         # self.verify_prediction handles its own locking
-                        result = self.verify_prediction(prediction['id'], current_price)
+                        # Pass the retroactive High/Low values
+                        result = self.verify_prediction(
+                            prediction['id'], 
+                            current_price, 
+                            high=high_since_entry, 
+                            low=low_since_entry
+                        )
+                        
                         if result:
                             # If verify_prediction returns a result, it means it was verified (Target/Stop hit)
                             verified_count += 1

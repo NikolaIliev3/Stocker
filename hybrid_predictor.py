@@ -1294,18 +1294,21 @@ class HybridStockPredictor:
                     final_stop = current_price
         
         # === DYNAMIC TARGET PRICING Integration ===
-        # GOAL: Maximine Profit % (Conservative but not limited)
+        # GOAL: Maximize Profit % (Conservative but realistic, NOT capped at 3%)
         # Minimum: 3.0% (Hard Floor)
-        # Maximum: Determined by Volatility (ATR) and ML/Technical Confluence
+        # Maximum: Determined by Volatility (ATR), Technical Levels, and ML Confluence
+        # Strategy: Use CONSERVATIVE MEDIAN of all valid targets
         
         # 1. Start with the Base Technical Target from Rule Analysis
         base_target = final_target # From support/resistance
         
         # 2. Calculate Volatility-Based Potentials
         # Conservative: 2.0x ATR
-        # Enthusiastic: 3.0x ATR (Upper limit for "Conservative" request)
+        # Moderate: 3.0x ATR  
+        # Sanity Cap: 5.0x ATR (absolute max)
         atr_target_conservative = current_price + (2.0 * atr) if final_action == 'BUY' else current_price - (2.0 * atr)
-        atr_target_enthusiastic = current_price + (3.0 * atr) if final_action == 'BUY' else current_price - (3.0 * atr)
+        atr_target_moderate = current_price + (3.0 * atr) if final_action == 'BUY' else current_price - (3.0 * atr)
+        atr_target_max = current_price + (5.0 * atr) if final_action == 'BUY' else current_price - (5.0 * atr)
         
         # 3. Get ML Target (Regression)
         ml_target_price = 0.0
@@ -1313,7 +1316,7 @@ class HybridStockPredictor:
              ml_target_price = ml_pred['target_price']
 
         # 4. Determine Dynamic Target
-        # Logic: We want the highest target that is "Realistically Achievable"
+        # Collect ALL realistic target candidates
         
         potential_targets = []
         
@@ -1321,65 +1324,71 @@ class HybridStockPredictor:
         if base_target > 0:
             potential_targets.append(('Technical', base_target))
             
-        # C. Volatility Extension (Physics)
+        # B. Volatility Extension (Physics)
         potential_targets.append(('ATR_2x', atr_target_conservative))
-        potential_targets.append(('ATR_3x', atr_target_enthusiastic)) # User Request: "Highest possible profit"
+        potential_targets.append(('ATR_3x', atr_target_moderate))
         
-        # D. ML Regression (Statistical)
+        # C. ML Regression (Statistical)
         if final_action == 'BUY' and ml_target_price > current_price:
             potential_targets.append(('ML_Regression', ml_target_price))
         elif final_action == 'SELL' and ml_target_price < current_price:
             potential_targets.append(('ML_Regression', ml_target_price))
             
-        # Select the BEST target that satisfies the user's "Highest Conservative" wish
-        # Logic: Minimum 3.0% Hurdle. If met, pick the MAX realistic target.
+        # Select target using CONSERVATIVE MEDIAN approach:
+        # - Use all targets (no arbitrary 3x ATR cap)
+        # - Pick the MEDIAN target (conservative: not min, not max)
+        # - Sanity cap: must be within 5x ATR of current price
         
         best_target = base_target
         best_source = "Technical"
         
+        from config import MIN_PROFIT_TARGET_PCT
+        
         if final_action == 'BUY':
-             sorted_targets = sorted(potential_targets, key=lambda x: x[1], reverse=True)
-             # Filter out targets that are too far (> 3x ATR) as "Too Enthusiastic"
-             valid_targets = [t for t in sorted_targets if t[1] <= atr_target_enthusiastic]
-             if not valid_targets: 
-                 valid_targets = [('ATR_Max_Clamp', atr_target_enthusiastic)]
-                 
-             # Pick the highest realistic target
-             best_source, best_target = valid_targets[0]
+             # Sort ascending to find median
+             sorted_vals = sorted(potential_targets, key=lambda x: x[1])
              
-             # USER-DRIVEN "PATIENT SNIPER" RULES:
-             # 1. Mandatory 3% Entry Barrier
-             # 2. No Stop Loss (Ignore intra-period drops)
+             # Sanity filter: remove anything beyond 5x ATR (unrealistic)
+             sane_targets = [(s, t) for s, t in sorted_vals if t <= atr_target_max]
+             if not sane_targets:
+                 sane_targets = [('ATR_Max_Clamp', atr_target_max)]
              
-             from config import MIN_PROFIT_TARGET_PCT
-             min_threshold = (current_price * (1 + (MIN_PROFIT_TARGET_PCT / 100.0)))
+             # Pick the MEDIAN (conservative middle ground)
+             mid_idx = len(sane_targets) // 2
+             best_source, best_target = sane_targets[mid_idx]
+              
+             # Enforce 3% FLOOR (never below, but allow above)
+             min_threshold = current_price * (1 + (MIN_PROFIT_TARGET_PCT / 100.0))
              
              if best_target < min_threshold:
-                 # If even our best target doesn't hit the 3% barrier, check if 3% is realistic
-                 if min_threshold <= atr_target_enthusiastic:
-                     # 3% is realistic within volatility, so enforce it as floor
+                 # If 3% is achievable within 5x ATR, enforce it as floor
+                 if min_threshold <= atr_target_max:
                      best_target = min_threshold
-                     best_source = "Strict_3pct_Floor"
+                     best_source = "Min_3pct_Floor"
                  else:
                      # 3% is not realistic for this stock's current volatility
-                     logger.info(f"🛡️ SNIPER VETO: {symbol} cannot realistically hit 3% target (MaxATR={atr_target_enthusiastic:.2f})")
+                     logger.info(f"🛡️ SNIPER VETO: {symbol} cannot realistically hit {MIN_PROFIT_TARGET_PCT}% target (MaxATR={atr_target_max:.2f})")
                      final_action = 'HOLD'
                      final_confidence = 50.0
-                     reasoning += f"🛡️ SNIPER VETO: Realistically achievable target ({atr_target_enthusiastic:.2f}) is below the {MIN_PROFIT_TARGET_PCT}% mandatory threshold.\n"
+                     reasoning += f"🛡️ SNIPER VETO: Max realistic target ({atr_target_max:.2f}) is below the {MIN_PROFIT_TARGET_PCT}% mandatory threshold.\n"
 
              # Finalize Patient Sniper BUY parameters
              final_target = best_target
              final_stop = 0.0  # PATIENT SNIPER: No stop-loss interference
-             reasoning += f"🎯 PATIENT SNIPER: Target {final_target:.2f} ({best_source}), No Stop-Loss.\n"
              
+             # Calculate achieved profit for logging
+             achieved_pct = ((best_target - current_price) / current_price) * 100 if current_price > 0 else 0
+             reasoning += f"🎯 PATIENT SNIPER: Target {final_target:.2f} ({best_source}, +{achieved_pct:.1f}%), No Stop-Loss.\n"
+              
         elif final_action == 'SELL':
-             # Keep existing SELL logic (inverted)
+             # Keep existing SELL logic (inverted, conservative)
              sorted_targets = sorted(potential_targets, key=lambda x: x[1], reverse=False)
-             valid_targets = [t for t in sorted_targets if t[1] >= atr_target_enthusiastic]
-             if not valid_targets:
-                 valid_targets = [('ATR_Max_Clamp', atr_target_enthusiastic)]
+             sane_targets = [(s, t) for s, t in sorted_targets if t >= (current_price - (5.0 * atr))]
+             if not sane_targets:
+                 sane_targets = [('ATR_Max_Clamp', atr_target_max)]
              
-             best_source, best_target = valid_targets[0]
+             mid_idx = len(sane_targets) // 2
+             best_source, best_target = sane_targets[mid_idx]
              final_target = best_target
              final_stop = current_price + (abs(current_price - best_target) / 2)
         
@@ -1388,10 +1397,7 @@ class HybridStockPredictor:
         logger.info(f"🔍 TGT TRACE {symbol}: Candidates={potential_targets}")
         logger.info(f"🔍 TGT TRACE {symbol}: Selected={best_source} @ {best_target:.2f}")
         
-        # 5. VERIFY MINIMUM PROFIT THRESHOLD (Do not force, just filter)
-        from config import MIN_PROFIT_TARGET_PCT
-        min_pct = MIN_PROFIT_TARGET_PCT
-        
+        # 5. VERIFY MINIMUM PROFIT THRESHOLD (Final safety net)
         calculated_profit_pct = 0.0
         if current_price > 0:
             if final_action == 'BUY':
@@ -1400,13 +1406,10 @@ class HybridStockPredictor:
                 calculated_profit_pct = ((current_price - best_target) / current_price) * 100
         
         # If the BEST realistic target is still less than our minimum 3%, we discard the trade
-        # "If the profit is less than 3%, then the prediction is automatically false."
-        if calculated_profit_pct < min_pct and final_action != 'HOLD': # Only apply if not already handled by Patient Sniper
-            # CHECK EXCEPTION: If we are in "Sniper Mode" (High Confidence > 80%), maybe we allow 2.5%?
-            # User said: "3% is the MINIMUM". So we stick to it.
-            logger.info(f"📉 REJECTING {symbol}: Best Target {calculated_profit_pct:.2f}% < {min_pct}% Minimum")
+        if calculated_profit_pct < MIN_PROFIT_TARGET_PCT and final_action != 'HOLD':
+            logger.info(f"📉 REJECTING {symbol}: Best Target {calculated_profit_pct:.2f}% < {MIN_PROFIT_TARGET_PCT}% Minimum")
             final_action = 'HOLD'
-            reasoning += f"📉 Target Too Low: Best calculated target ({best_source}: {calculated_profit_pct:.2f}%) is below {min_pct}% minimum.\n"
+            reasoning += f"📉 Target Too Low: Best calculated target ({best_source}: {calculated_profit_pct:.2f}%) is below {MIN_PROFIT_TARGET_PCT}% minimum.\n"
         else:
             reasoning += f"🎯 Target Selected: {best_source} (+{calculated_profit_pct:.1f}%)\n"
             
