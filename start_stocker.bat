@@ -1,5 +1,6 @@
 @echo off
 title Stocker - Starting...
+cd /d "%~dp0"
 echo ========================================
 echo   Stocker - Stock Trading App
 echo ========================================

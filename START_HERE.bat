@@ -1,5 +1,6 @@
 @echo off
 title Stocker - Quick Start
+cd /d "%~dp0"
 color 0A
 cls
 echo.
