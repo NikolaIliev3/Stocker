@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 REM Check for admin rights
 net session >nul 2>&1
 if %errorLevel% neq 0 (
