@@ -3,12 +3,46 @@ Configuration file for Stocker App
 Contains API endpoints, security settings, and app configuration
 """
 import os
+import shutil
+import logging
 from pathlib import Path
 
 # App Configuration
 APP_NAME = "Stocker"
 APP_VERSION = "1.0.0"
 APP_DATA_DIR = Path.home() / ".stocker"
+
+# --- Auto-seed pretrained models on first run ---
+# If no ML model exists in APP_DATA_DIR, copy bundled pretrained models
+def _seed_pretrained_models():
+    """Copy pretrained models from repo into user data dir on first run."""
+    pretrained_dir = Path(__file__).parent / "pretrained_models"
+    if not pretrained_dir.exists():
+        return  # No bundled models (e.g., dev environment without them)
+    
+    # Check if any model already exists (don't overwrite user-retrained models)
+    existing_models = list(APP_DATA_DIR.glob("ml_model_*.pkl"))
+    if existing_models:
+        return  # User already has models, skip seeding
+    
+    # Create data dir if needed
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    
+    _logger = logging.getLogger(__name__)
+    _logger.info("First run detected — seeding pretrained ML models...")
+    
+    seeded = 0
+    for src_file in pretrained_dir.iterdir():
+        if src_file.suffix in ('.pkl', '.json'):
+            dst_file = APP_DATA_DIR / src_file.name
+            if not dst_file.exists():
+                shutil.copy2(src_file, dst_file)
+                seeded += 1
+    
+    if seeded > 0:
+        _logger.info(f"Seeded {seeded} pretrained model files into {APP_DATA_DIR}")
+
+_seed_pretrained_models()
 
 # Centralized File Paths (Decoupling)
 PREDICTIONS_FILE = APP_DATA_DIR / "predictions.json"
