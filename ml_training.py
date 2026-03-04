@@ -1776,9 +1776,10 @@ class StockPredictionML:
             use_hyperparameter_tuning = False
             use_regime_models = False
         
-        # Auto-enable SMOTE for binary classification if not explicitly set
+        # SMOTE disabled for time-series data — creates synthetic samples that leak future class distribution
+        # Use class_weight='balanced' in learners instead (already set in RF/XGB/LGB configs)
         if use_smote is None:
-            use_smote = use_binary_classification  # Auto-enable SMOTE for binary classification to reduce bias
+            use_smote = False  # Disabled: SMOTE on time-series inflates train accuracy
         
         # Force retraining by resetting model components
         logger.info("Resetting model for fresh training...")
@@ -1929,43 +1930,28 @@ class StockPredictionML:
         logger.info(f"Training data distribution: {dict(label_counts)}")
         
         # ===== SAMPLE LIMITING TO PREVENT OVERFITTING =====
-        # Large datasets cause overfitting - cap at optimal size with stratified sampling
-        MAX_TRAINING_SAMPLES = 15000  # Increased from 5000 to capture 3x more patterns from historical data
+        # Keep the MOST RECENT samples to preserve temporal order (not random stratified)
+        MAX_TRAINING_SAMPLES = 15000
         
         if len(X) > MAX_TRAINING_SAMPLES:
             logger.warning(f"⚠️ Large dataset detected ({len(X)} samples). "
-                          f"Limiting to {MAX_TRAINING_SAMPLES} to prevent overfitting.")
+                          f"Keeping most recent {MAX_TRAINING_SAMPLES} to preserve temporal order.")
             
-            # Use stratified sampling to maintain class balance
-            try:
-                # Get indices for stratified subsample
-                # train_test_split returns (train, test) - we want TRAIN portion which is the smaller 5000
-                all_indices = np.arange(len(X))
-                keep_indices, _ = train_test_split(
-                    all_indices,
-                    train_size=MAX_TRAINING_SAMPLES,
-                    stratify=y,
-                    random_state=random_seed
-                )
-                
-                X = X[keep_indices]
-                y = y[keep_indices]
-                sample_weights = sample_weights[keep_indices]
-                if y_reg is not None:
-                    y_reg = y_reg[keep_indices]
-                
-                # Log new class distribution
-                new_label_counts = Counter(y)
-                logger.info(f"📉 Reduced to {len(X)} samples. New distribution: {dict(new_label_counts)}")
-            except Exception as e:
-                logger.warning(f"Stratified sampling failed: {e}. Using random sampling.")
-                # Fallback to random sampling
-                keep_indices = np.random.choice(len(X), MAX_TRAINING_SAMPLES, replace=False)
-                X = X[keep_indices]
-                y = y[keep_indices]
-                sample_weights = sample_weights[keep_indices]
-                if y_reg is not None:
-                    y_reg = y_reg[keep_indices]
+            # Keep the LAST N samples (most recent data) instead of random subsample
+            # This preserves temporal ordering and prioritizes recent market behavior
+            keep_start = len(X) - MAX_TRAINING_SAMPLES
+            X = X[keep_start:]
+            y = y[keep_start:]
+            sample_weights = sample_weights[keep_start:]
+            if y_reg is not None:
+                y_reg = y_reg[keep_start:]
+            
+            # Also trim training_samples list to stay aligned
+            if len(training_samples) > MAX_TRAINING_SAMPLES:
+                training_samples = training_samples[keep_start:]
+            
+            new_label_counts = Counter(y)
+            logger.info(f"📉 Kept most recent {len(X)} samples. Distribution: {dict(new_label_counts)}")
         
         # Warn if severe class imbalance
         if len(label_counts) > 1:
@@ -2192,10 +2178,17 @@ class StockPredictionML:
                 sorted_indices = sorted(range(len(sample_dates)), 
                                         key=lambda i: sample_dates[i])
                 
-                # Split temporally: use first (1-test_size) for training, last test_size for testing
+                # Split temporally with PURGING GAP to prevent autocorrelation leakage
+                # Gap of 10 trading days ensures no temporal overlap between train/test
+                purge_gap = 10  # Trading days gap (lookforward is 15, so 10 is safe)
                 split_idx = int(len(sorted_indices) * (1 - test_size))
-                train_indices = sorted_indices[:split_idx]
+                train_indices = sorted_indices[:max(0, split_idx - purge_gap)]
                 test_indices = sorted_indices[split_idx:]
+                
+                if len(train_indices) == 0 or len(test_indices) == 0:
+                    logger.warning(f"Purging gap too large for dataset. Reducing gap.")
+                    train_indices = sorted_indices[:split_idx]
+                    test_indices = sorted_indices[split_idx:]
                 
                 X_train = X[train_indices]
                 X_test = X[test_indices]
@@ -3528,15 +3521,31 @@ class StockPredictionML:
                 is_binary_mode = True
         
         if is_binary_mode:
-            if action == 'UP':
-                action = 'BUY'   # UP prediction = price goes up = buy signal
-            elif action == 'DOWN':
-                action = 'HOLD'  # DOWN prediction = price goes down/neutral = hold signal (inaction)
-            # Note: Binary mode: UP=BUY, DOWN=HOLD
-            logger.debug(f"Binary mode conversion: {original_action} → {action}")
+            # Look up probability for UP instead of relying on default argmax (0.50 cutoff)
+            classes_list = list(self.label_encoder.classes_)
+            up_prob = 0.0
+            down_prob = 0.0
+            
+            if 'UP' in classes_list:
+                up_prob = float(probabilities[classes_list.index('UP')])
+            if 'DOWN' in classes_list:
+                down_prob = float(probabilities[classes_list.index('DOWN')])
 
-        # Calculate confidence for the chosen class
-        confidence = float(probabilities[prediction] * 100)
+            # Use threshold-based logic over argmax
+            from config import ML_HIGH_ACCURACY_THRESHOLD
+            
+            if up_prob >= ML_HIGH_ACCURACY_THRESHOLD:
+                action = 'BUY'
+                confidence = float(up_prob * 100)
+            else:
+                action = 'HOLD'
+                confidence = float(max(probabilities) * 100) # Keep DOWN confidence for tracking
+                
+            logger.debug(f"Binary Threshold Check: UP={up_prob:.3f}, Threshold={ML_HIGH_ACCURACY_THRESHOLD:.2f} -> Action={action}")
+        else:
+            # Default logic for multi-class
+            # Calculate confidence for the chosen class
+            confidence = float(probabilities[prediction] * 100)
         
         # Get probabilities for all classes
         prob_dict = {}

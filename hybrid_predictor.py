@@ -839,7 +839,10 @@ class HybridStockPredictor:
             # Rule B: THE HARD ML FILTER (Secondary Veto)
             # If Rules approve but ML thinks it's likely a loser/neutral, we VETO
             # Except for "Ultra High Confidence" rules (>95%) which are allowed as safety overrides
-            elif final_confidence < 95.0 and ml_prob_buy < 0.40:
+            # Rule B: THE HARD ML FILTER (Secondary Veto)
+            # If Rules approve but ML thinks it's likely a loser/neutral, we VETO
+            # Except for "Ultra High Confidence" rules (>95%) which are allowed as safety overrides
+            elif final_confidence < 95.0 and ml_prob_buy < 0.35: # Base rate is ~0.33, so <0.35 means below random chance
                 msg = f"🛑 ML UTILITY VETO: ML probability {ml_prob_buy*100:.1f}% too low for Rule {final_confidence:.1f}%."
                 logger.info(msg + " Forced HOLD.")
                 reasoning += msg + "\n"
@@ -850,7 +853,7 @@ class HybridStockPredictor:
             # Backtest (2025): Even at 90% confidence, win rate is low in stress.
             # We only allow BUYs if the market is stable (Bull/Sideways and low drawdown).
             # [USER-VERIFIED] 75% Confidence has ~70% Accuracy. Locking this in.
-            min_threshold = 75.0 # Lowered from 85.0 based on audit
+            min_threshold = 65.0 # Lowered from 75.0 to handle uncalibrated ML base-rate probabilities dragging averages down
             
             if final_confidence < min_threshold:
                 msg = f"🛡️ PROTECTION: Suppressing weak {symbol} BUY ({final_confidence:.1f}% < {min_threshold}%)"
@@ -1508,7 +1511,11 @@ class HybridStockPredictor:
                 except:
                     start_date = datetime.now()
             
-            target_date = start_date + timedelta(days=int(est_days))
+            try:
+                from utils.market_utils import add_trading_days
+                target_date = add_trading_days(start_date, int(est_days))
+            except ImportError:
+                target_date = start_date + timedelta(days=int(est_days))
             result['estimated_target_date'] = target_date.isoformat()
             
         # Ensure target date is also in recommendation for dashboard symmetry

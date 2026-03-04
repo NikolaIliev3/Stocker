@@ -129,20 +129,20 @@ HYPERPARAMETER_TUNING_PARALLEL_TRIALS = None  # None = auto (uses all cores), or
 
 # ML Model Configuration - HIGH CONVICTION MODE (3.0% Target)
 # Tuned for >60% accuracy on significant price moves
-ML_FEATURE_SELECTION_THRESHOLD = 0.005  
+ML_FEATURE_SELECTION_THRESHOLD = 0.02   # Raised from 0.005 to aggressively drop low-importance features
 ML_RF_N_ESTIMATORS = 300    
-ML_RF_MAX_DEPTH = 5         # Low depth to prevent memorization/overfitting
+ML_RF_MAX_DEPTH = 4         # Reduced from 5 to prevent memorization
 ML_RF_MIN_SAMPLES_SPLIT = 100 
-ML_RF_MIN_SAMPLES_LEAF = 50   
-ML_GB_N_ESTIMATORS = 150    
-ML_GB_MAX_DEPTH = 3         
+ML_RF_MIN_SAMPLES_LEAF = 80   # Raised from 50 for smoother decision surface
+ML_GB_N_ESTIMATORS = 100    # Reduced from 150 to limit boosting rounds
+ML_GB_MAX_DEPTH = 2         # Reduced from 3 for shallower trees
 ML_GB_LEARNING_RATE = 0.05  
-ML_HIGH_ACCURACY_THRESHOLD = 0.60  
-ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.65  
+ML_HIGH_ACCURACY_THRESHOLD = 0.38   # Lowered from 0.60 (Base rate is ~33% without SMOTE)
+ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.42  # Lowered from 0.65
 ML_MIN_TRAINING_SAMPLES = 50 
 ML_MIN_BINARY_SAMPLES = 30   
 ML_PERFORMANCE_HISTORY_LIMIT = 1000  
-ML_BINARY_HOLD_THRESHOLD = 0.60  
+ML_BINARY_HOLD_THRESHOLD = 0.38  # Lowered from 0.60
 ML_RECENT_PERFORMANCE_WINDOW = 50  
 ML_ENSEMBLE_WEIGHT_UPDATE_THRESHOLD = 5  
 ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD = 10  
