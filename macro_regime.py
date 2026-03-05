@@ -175,15 +175,19 @@ class MacroRegimeDetector:
                     
             result['available'] = True
             
-            # Map risk score
+            # Map risk score to level AND summary
             if risk_score >= 3:
                 result['risk_level'] = 'extreme'
+                result['regime_summary'] = 'Extreme Risk Environment'
             elif risk_score >= 1:
                 result['risk_level'] = 'high'
+                result['regime_summary'] = 'Elevated Risk / Caution'
             elif risk_score <= -2:
                 result['risk_level'] = 'low'
+                result['regime_summary'] = 'Low Risk / Complacent'
             else:
                 result['risk_level'] = 'neutral'
+                result['regime_summary'] = 'Normal Market Conditions'
                 
             result['reasoning'] = reasons
             
