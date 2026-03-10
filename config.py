@@ -3,12 +3,46 @@ Configuration file for Stocker App
 Contains API endpoints, security settings, and app configuration
 """
 import os
+import shutil
+import logging
 from pathlib import Path
 
 # App Configuration
 APP_NAME = "Stocker"
 APP_VERSION = "1.0.0"
 APP_DATA_DIR = Path.home() / ".stocker"
+
+# --- Auto-seed pretrained models on first run ---
+# If no ML model exists in APP_DATA_DIR, copy bundled pretrained models
+def _seed_pretrained_models():
+    """Copy pretrained models from repo into user data dir on first run."""
+    pretrained_dir = Path(__file__).parent / "pretrained_models"
+    if not pretrained_dir.exists():
+        return  # No bundled models (e.g., dev environment without them)
+    
+    # Check if any model already exists (don't overwrite user-retrained models)
+    existing_models = list(APP_DATA_DIR.glob("ml_model_*.pkl"))
+    if existing_models:
+        return  # User already has models, skip seeding
+    
+    # Create data dir if needed
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    
+    _logger = logging.getLogger(__name__)
+    _logger.info("First run detected — seeding pretrained ML models...")
+    
+    seeded = 0
+    for src_file in pretrained_dir.iterdir():
+        if src_file.suffix in ('.pkl', '.json'):
+            dst_file = APP_DATA_DIR / src_file.name
+            if not dst_file.exists():
+                shutil.copy2(src_file, dst_file)
+                seeded += 1
+    
+    if seeded > 0:
+        _logger.info(f"Seeded {seeded} pretrained model files into {APP_DATA_DIR}")
+
+_seed_pretrained_models()
 
 # Centralized File Paths (Decoupling)
 PREDICTIONS_FILE = APP_DATA_DIR / "predictions.json"
@@ -95,20 +129,20 @@ HYPERPARAMETER_TUNING_PARALLEL_TRIALS = None  # None = auto (uses all cores), or
 
 # ML Model Configuration - HIGH CONVICTION MODE (3.0% Target)
 # Tuned for >60% accuracy on significant price moves
-ML_FEATURE_SELECTION_THRESHOLD = 0.005  
+ML_FEATURE_SELECTION_THRESHOLD = 0.02   # Raised from 0.005 to aggressively drop low-importance features
 ML_RF_N_ESTIMATORS = 300    
-ML_RF_MAX_DEPTH = 5         # Low depth to prevent memorization/overfitting
+ML_RF_MAX_DEPTH = 4         # Reduced from 5 to prevent memorization
 ML_RF_MIN_SAMPLES_SPLIT = 100 
-ML_RF_MIN_SAMPLES_LEAF = 50   
-ML_GB_N_ESTIMATORS = 150    
-ML_GB_MAX_DEPTH = 3         
+ML_RF_MIN_SAMPLES_LEAF = 80   # Raised from 50 for smoother decision surface
+ML_GB_N_ESTIMATORS = 100    # Reduced from 150 to limit boosting rounds
+ML_GB_MAX_DEPTH = 2         # Reduced from 3 for shallower trees
 ML_GB_LEARNING_RATE = 0.05  
-ML_HIGH_ACCURACY_THRESHOLD = 0.60  
-ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.65  
+ML_HIGH_ACCURACY_THRESHOLD = 0.38   # Lowered from 0.60 (Base rate is ~33% without SMOTE)
+ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.42  # Lowered from 0.65
 ML_MIN_TRAINING_SAMPLES = 50 
 ML_MIN_BINARY_SAMPLES = 30   
 ML_PERFORMANCE_HISTORY_LIMIT = 1000  
-ML_BINARY_HOLD_THRESHOLD = 0.60  
+ML_BINARY_HOLD_THRESHOLD = 0.38  # Lowered from 0.60
 ML_RECENT_PERFORMANCE_WINDOW = 50  
 ML_ENSEMBLE_WEIGHT_UPDATE_THRESHOLD = 5  
 ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD = 10  

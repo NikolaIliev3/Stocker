@@ -1,5 +1,9 @@
 @echo off
 title Installing Stocker Dependencies
+
+REM Change to the directory where this script lives
+cd /d "%~dp0"
+
 echo ========================================
 echo   Installing Stocker Dependencies
 echo ========================================

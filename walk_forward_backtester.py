@@ -263,16 +263,13 @@ class WalkForwardBacktester:
                 
                 price_change_pct = ((future_price - entry_price) / entry_price) * 100  # Convert to percentage
                 
-                # NOTE: Algorithm uses INVERTED logic:
-                # - BUY = bearish signals (expecting price to go DOWN, then buy at discount)
-                # - SELL = bullish signals (expecting price to go UP, then sell to take profits)
                 is_correct = False
                 if action == 'BUY':
-                    # BUY (bearish signals) is correct if price went DOWN (so you can buy at discount)
-                    is_correct = price_change_pct < 0
-                elif action == 'SELL':
-                    # SELL (bullish signals) is correct if price went UP (so you can sell at profit)
+                    # BUY is correct if price went UP (we bought at a lower price, sold higher)
                     is_correct = price_change_pct > 0
+                elif action == 'SELL':
+                    # SELL is correct if price went DOWN (short/avoid logic)
+                    is_correct = price_change_pct < 0
                 else:
                     is_correct = False  # Unknown action
                 

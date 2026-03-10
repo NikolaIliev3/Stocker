@@ -1,6 +1,7 @@
 """
 Trend Change Predictions Tracker
-Stores and verifies trend change predictions for learning system
+Stores and verifies trend change predictions for learning system.
+Now includes entry price tracking and deduplication.
 """
 import json
 from pathlib import Path
@@ -46,14 +47,34 @@ class TrendChangeTracker:
         except Exception as e:
             logger.error(f"Error saving trend change predictions: {e}")
     
+    def has_active_prediction(self, symbol: str, direction: str) -> bool:
+        """Check if an active prediction already exists for this symbol + direction."""
+        for p in self.predictions:
+            if (p.get('status') == 'active' and 
+                p.get('symbol', '').upper() == symbol.upper() and
+                p.get('predicted_change') == direction):
+                return True
+        return False
+    
     def add_prediction(self, symbol: str, current_trend: str, predicted_change: str,
                       estimated_days: int, estimated_date: str, confidence: float,
-                      reasoning: str, key_indicators: dict) -> Dict:
-        """Add a trend change prediction"""
+                      reasoning: str, key_indicators: dict,
+                      entry_price: float = None) -> Optional[Dict]:
+        """Add a trend change prediction with deduplication and entry price tracking.
+        
+        Returns None if a duplicate active prediction exists for this symbol + direction.
+        """
+        symbol = symbol.upper()
+        
+        # Deduplication: reject if same symbol + direction already active
+        if self.has_active_prediction(symbol, predicted_change):
+            logger.info(f"Skipping duplicate trend prediction for {symbol} ({predicted_change}) — already active")
+            return None
+        
         prediction = {
             "id": len(self.predictions) + 1,
             "timestamp": datetime.now().isoformat(),
-            "symbol": symbol.upper(),
+            "symbol": symbol,
             "current_trend": current_trend,
             "predicted_change": predicted_change,
             "estimated_days": estimated_days,
@@ -61,6 +82,7 @@ class TrendChangeTracker:
             "confidence": confidence,
             "reasoning": reasoning,
             "key_indicators": key_indicators,
+            "entry_price": entry_price,  # Price at prediction time
             "status": "active",  # active, verified, expired
             "verified": False,
             "was_correct": None,
@@ -105,6 +127,11 @@ class TrendChangeTracker:
         if current_price is not None:
             prediction['current_price_at_verification'] = current_price
         
+        # Calculate price change from entry if available
+        entry_price = prediction.get('entry_price')
+        if entry_price and current_price and entry_price > 0:
+            prediction['price_change_pct'] = ((current_price - entry_price) / entry_price) * 100
+        
         # Calculate days accuracy
         try:
             estimated_date = datetime.fromisoformat(prediction.get('estimated_date', ''))
@@ -123,62 +150,32 @@ class TrendChangeTracker:
         return prediction
     
     def check_for_verification(self, data_fetcher) -> List[Dict]:
-        """Check active trend predictions for verification"""
+        """Check active trend predictions for verification.
+        
+        Note: Main verification logic is in main.py (_start_trend_change_verification).
+        This method handles simple time-based expiry.
+        """
         verified_items = []
         active_preds = self.get_active_predictions()
         
         for pred in active_preds:
             try:
-                symbol = pred.get('symbol')
-                if not symbol:
-                    continue
-                    
-                # Get current data
-                current_data = data_fetcher.fetch_stock_data(symbol)
-                current_price = current_data.get('price', 0)
-                
-                if current_price <= 0:
-                    continue
-                    
-                # Check 1: Has estimated date passed?
-                estimated_date_str = pred.get('estimated_date', '')
+                # Check if prediction is very old (> 6 months) — expire it
                 try:
-                    estimated_date = datetime.fromisoformat(estimated_date_str)
-                    has_time_passed = datetime.now() > estimated_date
+                    timestamp = datetime.fromisoformat(pred.get('timestamp', ''))
+                    if (datetime.now() - timestamp).days > 180:
+                        pred['status'] = 'expired'
+                        pred['verification_date'] = datetime.now().isoformat()
+                        verified_items.append(pred)
+                        logger.info(f"Expired old trend prediction #{pred.get('id')} for {pred.get('symbol')}")
                 except:
-                    has_time_passed = False
+                    pass
                     
-                # Check 2: Has significant movement happened in predicted direction?
-                # We need historical context or price at prediction time, but trend change only records "current trend"
-                # So we largely rely on time-based verification OR major reversals
-                
-                should_verify = has_time_passed
-                
-                if should_verify:
-                    # Determine what happened
-                    predicted_change = pred.get('predicted_change', '')
-                    
-                    # Logic to determine if prediction was correct
-                    # This is simplified - ideally we'd look at price history since prediction
-                    
-                    # For now, we will verify based on what the trend LOOKS like now compared to prediction
-                    # However, determining "trend" instantly is hard. 
-                    # We will use price movement as a proxy if we can't do full analysis
-                    
-                    # If we don't have entry price, we can't know for sure.
-                    # BUT, we can mark it as "expired - waiting for manual verification" 
-                    # OR we can try to deduce it.
-                    
-                    # Since we can't easily auto-verify purely on price without start price,
-                    # we will mostly rely on MANUAL verification for now, unless we update the tracker
-                    # to store start price.
-                    
-                    # Let's check if we CAN auto-verify. 
-                    # If we can't auto-verify safely, we leave it active for manual verification.
-                    pass 
-
             except Exception as e:
                 logger.error(f"Error checking verification for prediction {pred.get('id')}: {e}")
+        
+        if verified_items:
+            self.save()
                 
         return verified_items
 
@@ -190,6 +187,22 @@ class TrendChangeTracker:
             self.save()
             return True
         return False
+    
+    def clear_active_predictions(self) -> int:
+        """Clear all active predictions (used after major logic changes).
+        Returns count of cleared predictions."""
+        count = 0
+        for pred in self.predictions:
+            if pred.get('status') == 'active':
+                pred['status'] = 'expired'
+                pred['verification_date'] = datetime.now().isoformat()
+                pred['was_correct'] = None  # Unknown — expired due to logic change
+                pred['actual_change'] = 'expired_logic_change'
+                count += 1
+        if count > 0:
+            self.save()
+            logger.info(f"Cleared {count} active trend change predictions due to logic change")
+        return count
     
     def get_statistics(self) -> Dict:
         """Get statistics about trend change predictions"""
@@ -208,4 +221,3 @@ class TrendChangeTracker:
             'incorrect': verified - correct,
             'accuracy': accuracy
         }
-

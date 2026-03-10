@@ -528,14 +528,27 @@ class StockerApp:
                                         continue
                                 
                                 # Determine if prediction was correct
+                                # Method 1: Trend label flip
+                                # Method 2: Price-based (≥5% move in predicted direction from entry)
                                 was_correct = False
                                 actual_change = None
+                                entry_price = pred.get('entry_price')
                                 
                                 if predicted_change == 'bullish_reversal':
                                     # Predicted bullish reversal (downtrend -> uptrend)
                                     if original_trend == 'downtrend' and current_trend == 'uptrend':
                                         was_correct = True
                                         actual_change = 'bullish_reversal'
+                                    elif entry_price and current_price and entry_price > 0:
+                                        # Price-based: ≥5% rise from entry
+                                        price_change_pct = ((current_price - entry_price) / entry_price) * 100
+                                        if price_change_pct >= 5:
+                                            was_correct = True
+                                            actual_change = 'bullish_reversal_price'
+                                        elif current_trend == original_trend:
+                                            actual_change = 'no_change'
+                                        else:
+                                            actual_change = f'{original_trend}_to_{current_trend}'
                                     elif current_trend == original_trend:
                                         actual_change = 'no_change'
                                     else:
@@ -546,6 +559,16 @@ class StockerApp:
                                     if original_trend == 'uptrend' and current_trend == 'downtrend':
                                         was_correct = True
                                         actual_change = 'bearish_reversal'
+                                    elif entry_price and current_price and entry_price > 0:
+                                        # Price-based: ≥5% drop from entry
+                                        price_change_pct = ((current_price - entry_price) / entry_price) * 100
+                                        if price_change_pct <= -5:
+                                            was_correct = True
+                                            actual_change = 'bearish_reversal_price'
+                                        elif current_trend == original_trend:
+                                            actual_change = 'no_change'
+                                        else:
+                                            actual_change = f'{original_trend}_to_{current_trend}'
                                     elif current_trend == original_trend:
                                         actual_change = 'no_change'
                                     else:
@@ -4114,11 +4137,19 @@ class StockerApp:
                                 )
                                 
                                 if trend_predictions and len(trend_predictions) > 0:
-                                    # Store trend change predictions
+                                    # Get current price for entry price tracking
+                                    current_price = stock_data.get('price', 0)
+                                    
+                                    # Store trend change predictions (with confidence gate)
                                     for pred in trend_predictions:
                                         # Normalize types to avoid numpy JSON serialization issues
                                         p_confidence = float(pred.get('confidence', 0) or 0)
                                         p_est_days = int(pred.get('estimated_days', 0) or 0)
+                                        
+                                        # Confidence gate: skip low-confidence predictions
+                                        if p_confidence < 55:
+                                            logger.debug(f"Skipping low-confidence trend prediction for {symbol}: {p_confidence:.1f}%")
+                                            continue
                                         
                                         stored_pred = self.trend_change_tracker.add_prediction(
                                             symbol=pred['symbol'],
@@ -4128,8 +4159,13 @@ class StockerApp:
                                             estimated_date=pred['estimated_date'],
                                             confidence=p_confidence,
                                             reasoning=pred['reasoning'],
-                                            key_indicators=pred.get('key_indicators', {})
+                                            key_indicators=pred.get('key_indicators', {}),
+                                            entry_price=current_price
                                         )
+                                        
+                                        # Tracker returns None if duplicate — skip
+                                        if stored_pred is None:
+                                            continue
                                         
                                         # Record in learning tracker
                                         self.learning_tracker.record_trend_change_prediction(
@@ -4999,7 +5035,14 @@ SELL SIGNALS:
                                   "This tab shows when trend changes might occur based on technical indicators.",
                              font=('Segoe UI', 9), bg=theme['bg'], fg=theme['text_secondary'],
                              justify=tk.LEFT)
-        info_label.pack(fill=tk.X, pady=(0, 15))
+        info_label.pack(fill=tk.X, pady=(0, 5))
+        
+        # Accuracy score label
+        self.trend_accuracy_label = tk.Label(self.trend_change_frame, 
+                             text="",
+                             font=('Segoe UI', 10, 'bold'), bg=theme['bg'], fg=theme['fg'],
+                             justify=tk.LEFT, anchor='w')
+        self.trend_accuracy_label.pack(fill=tk.X, pady=(0, 10))
         
         # Treeview for trend change predictions
         list_card = ModernCard(self.trend_change_frame, "", theme=theme, padding=15)
@@ -5112,6 +5155,36 @@ SELL SIGNALS:
         except Exception as e:
             logger.error(f"Error loading trend change predictions: {e}")
             self.trend_change_predictions = []
+        
+        # Update accuracy score
+        try:
+            stats = self.trend_change_tracker.get_statistics()
+            verified = stats.get('verified', 0)
+            correct = stats.get('correct', 0)
+            incorrect = stats.get('incorrect', 0)
+            active = stats.get('active', 0)
+            accuracy = stats.get('accuracy', 0)
+            
+            if verified > 0:
+                # Color-code based on accuracy
+                if accuracy >= 60:
+                    acc_color = self.theme_manager.get_theme().get('success', '#00FF00')
+                elif accuracy >= 40:
+                    acc_color = self.theme_manager.get_theme().get('warning', '#FFA500')
+                else:
+                    acc_color = self.theme_manager.get_theme().get('error', '#FF0000')
+                
+                self.trend_accuracy_label.config(
+                    text=f"📊 Accuracy: {accuracy:.1f}%  |  ✅ {correct} correct  |  ❌ {incorrect} incorrect  |  🔄 {active} active  |  Total verified: {verified}",
+                    fg=acc_color
+                )
+            else:
+                self.trend_accuracy_label.config(
+                    text=f"📊 No verified predictions yet  |  🔄 {active} active",
+                    fg=theme.get('text_secondary', '#888')
+                )
+        except Exception as e:
+            logger.debug(f"Could not update trend accuracy label: {e}")
         
         # Clear tree
         for item in self.trend_change_tree.get_children():
@@ -5312,7 +5385,14 @@ SELL SIGNALS:
                                   "Double-click a row to analyze the stock immediately.",
                              font=('Segoe UI', 9), bg=theme['bg'], fg=theme['text_secondary'],
                              justify=tk.LEFT)
-        info_label.pack(fill=tk.X, pady=(0, 15))
+        info_label.pack(fill=tk.X, pady=(0, 5))
+        
+        # Accuracy score label
+        self.momentum_accuracy_label = tk.Label(self.momentum_changes_frame, 
+                             text="",
+                             font=('Segoe UI', 10, 'bold'), bg=theme['bg'], fg=theme['fg'],
+                             justify=tk.LEFT, anchor='w')
+        self.momentum_accuracy_label.pack(fill=tk.X, pady=(0, 10))
         
         # Treeview for momentum changes
         list_card = ModernCard(self.momentum_changes_frame, "", theme=theme, padding=15)
@@ -5321,7 +5401,7 @@ SELL SIGNALS:
         list_inner = tk.Frame(list_card, bg=theme['card_bg'])
         list_inner.pack(fill=tk.BOTH, expand=True)
         
-        columns = ('Fav', 'Time', 'Symbol', 'Type', 'From', 'To', 'Changes', 'Confidence', 'Strategy', 'Status')
+        columns = ('Fav', 'Time', 'Symbol', 'Type', 'From', 'To', 'Changes', 'Confidence', 'Strategy', 'Expires', 'Status')
         self.momentum_changes_tree = ttk.Treeview(list_inner, columns=columns, show='headings', height=15)
         
         for col in columns:
@@ -5333,7 +5413,9 @@ SELL SIGNALS:
             elif col == 'Symbol':
                 self.momentum_changes_tree.column(col, width=80, anchor=tk.CENTER)
             elif col == 'Changes':
-                self.momentum_changes_tree.column(col, width=300, anchor=tk.W)
+                self.momentum_changes_tree.column(col, width=250, anchor=tk.W)
+            elif col == 'Expires':
+                self.momentum_changes_tree.column(col, width=90, anchor=tk.CENTER)
             elif col == 'Status':
                 self.momentum_changes_tree.column(col, width=100, anchor=tk.CENTER)
             else:
@@ -5375,6 +5457,37 @@ SELL SIGNALS:
         
         theme = self.theme_manager.get_theme()
         
+        # Update accuracy score
+        try:
+            history = self.momentum_monitor.history
+            verified_entries = [e for e in history if e.get('verified', False)]
+            correct = len([e for e in verified_entries if e.get('status') == 'correct'])
+            incorrect = len([e for e in verified_entries if e.get('status') == 'incorrect'])
+            neutral = len([e for e in verified_entries if e.get('status') == 'neutral'])
+            pending = len([e for e in history if e.get('status') == 'pending'])
+            total_verified = correct + incorrect
+            accuracy = (correct / total_verified * 100) if total_verified > 0 else 0
+            
+            if total_verified > 0:
+                if accuracy >= 60:
+                    acc_color = theme.get('success', '#00FF00')
+                elif accuracy >= 40:
+                    acc_color = theme.get('warning', '#FFA500')
+                else:
+                    acc_color = theme.get('error', '#FF0000')
+                
+                self.momentum_accuracy_label.config(
+                    text=f"📊 Accuracy: {accuracy:.1f}%  |  ✅ {correct} correct  |  ❌ {incorrect} incorrect  |  ⏳ {pending} pending  |  Total verified: {total_verified}",
+                    fg=acc_color
+                )
+            else:
+                self.momentum_accuracy_label.config(
+                    text=f"📊 No verified changes yet  |  ⏳ {pending} pending",
+                    fg=theme.get('text_secondary', '#888')
+                )
+        except Exception as e:
+            logger.debug(f"Could not update momentum accuracy label: {e}")
+        
         # Ensure we're using current history
         self.momentum_changes_history = self.momentum_monitor.history
         
@@ -5412,6 +5525,23 @@ SELL SIGNALS:
             is_fav = symbol in self.monitored_stocks
             fav_char = "★" if is_fav else "☆"
 
+            # Calculate expiration date (30 days from detection)
+            expires_str = "--"
+            if not verified:  # Only show for pending entries
+                try:
+                    from datetime import datetime as dt_cls, timedelta as td_cls
+                    entry_time = dt_cls.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+                    expire_date = entry_time + td_cls(days=30)
+                    days_left = (expire_date - dt_cls.now()).days
+                    if days_left > 0:
+                        expires_str = f"{expire_date.strftime('%m-%d')} ({days_left}d)"
+                    else:
+                        expires_str = "Expiring"
+                except (ValueError, TypeError):
+                    expires_str = "--"
+            else:
+                expires_str = "Verified"
+
             values = (
                 fav_char,
                 timestamp,
@@ -5422,6 +5552,7 @@ SELL SIGNALS:
                 changes_str,
                 f"{recommendation.get('confidence', 50)}%",
                 change_info.get('strategy', 'mixed').title(),
+                expires_str,
                 status
             )
             
@@ -6923,36 +7054,39 @@ Confidence: {prediction['confidence']:.0f}%
                             )
                             
                             if trend_predictions:
-                                # Remove old active predictions for this symbol from tracker (to prevent duplicates)
-                                active_predictions = self.trend_change_tracker.get_active_predictions()
-                                for old_pred in active_predictions:
-                                    if old_pred.get('symbol', '').upper() == symbol.upper():
-                                        # Mark old prediction as expired (replaced by new analysis)
-                                        old_pred['status'] = 'expired'
-                                        logger.debug(f"Expired old trend change prediction #{old_pred.get('id')} for {symbol}")
-                                
-                                # Save the expired predictions
-                                if any(p.get('symbol', '').upper() == symbol.upper() for p in active_predictions):
-                                    self.trend_change_tracker.save()
+                                # Get current price for entry price tracking
+                                current_price = stock_data.get('price', 0)
                                 
                                 # Remove old predictions for this symbol (from display)
                                 self.trend_change_predictions = [
                                     p for p in self.trend_change_predictions if p.get('symbol', '').upper() != symbol.upper()
                                 ]
                                 
-                                # Store predictions
+                                # Store predictions (tracker handles deduplication internally)
                                 for pred in trend_predictions:
                                     try:
+                                        p_confidence = float(pred.get('confidence', 0) or 0)
+                                        
+                                        # Confidence gate: skip low-confidence predictions
+                                        if p_confidence < 55:
+                                            logger.debug(f"Skipping low-confidence trend prediction for {symbol}: {p_confidence:.1f}%")
+                                            continue
+                                        
                                         stored_pred = self.trend_change_tracker.add_prediction(
                                             symbol=pred['symbol'],
                                             current_trend=pred['current_trend'],
                                             predicted_change=pred['predicted_change'],
                                             estimated_days=pred['estimated_days'],
                                             estimated_date=pred['estimated_date'],
-                                            confidence=pred['confidence'],
+                                            confidence=p_confidence,
                                             reasoning=pred['reasoning'],
-                                            key_indicators=pred.get('key_indicators', {})
+                                            key_indicators=pred.get('key_indicators', {}),
+                                            entry_price=current_price
                                         )
+                                        
+                                        # Tracker returns None if duplicate — skip
+                                        if stored_pred is None:
+                                            continue
                                         
                                         # Update the prediction in memory with the stored ID
                                         pred['id'] = stored_pred['id']
@@ -6965,7 +7099,7 @@ Confidence: {prediction['confidence']:.0f}%
                                             symbol=pred['symbol'],
                                             predicted_change=pred['predicted_change'],
                                             estimated_days=pred['estimated_days'],
-                                            confidence=pred['confidence']
+                                            confidence=p_confidence
                                         )
                                         
                                         trend_predictions_count += 1
@@ -7452,17 +7586,10 @@ Confidence: {prediction['confidence']:.0f}%
                     )
                     # Store predictions and update display
                     if trend_predictions:
-                        # Remove old active predictions for this symbol from tracker (to prevent duplicates)
-                        active_predictions = self.trend_change_tracker.get_active_predictions()
-                        for old_pred in active_predictions:
-                            if old_pred.get('symbol', '').upper() == symbol.upper():
-                                # Mark old prediction as expired (replaced by new analysis)
-                                old_pred['status'] = 'expired'
-                                logger.debug(f"Expired old trend change prediction #{old_pred.get('id')} for {symbol}")
-                        
-                        # Save the expired predictions
-                        if any(p.get('symbol', '').upper() == symbol.upper() for p in active_predictions):
-                            self.trend_change_tracker.save()
+                        # Get current price for entry price tracking
+                        current_price_for_trend = trading_analysis_for_trend.get('price', 0) if trading_analysis_for_trend else 0
+                        if not current_price_for_trend:
+                            current_price_for_trend = df['close'].iloc[-1] if 'close' in df.columns else 0
                         
                         # Remove old predictions for this symbol (from display)
                         self.trend_change_predictions = [
@@ -7472,19 +7599,31 @@ Confidence: {prediction['confidence']:.0f}%
                         # Add new predictions to display
                         self.trend_change_predictions.extend(trend_predictions)
                         
-                        # Record predictions in tracker for learning system
+                        # Store predictions (tracker handles deduplication internally)
                         for pred in trend_predictions:
                             try:
+                                p_confidence = float(pred.get('confidence', 0) or 0)
+                                
+                                # Confidence gate: skip low-confidence predictions
+                                if p_confidence < 55:
+                                    logger.debug(f"Skipping low-confidence trend prediction for {symbol}: {p_confidence:.1f}%")
+                                    continue
+                                
                                 stored_pred = self.trend_change_tracker.add_prediction(
                                     symbol=pred['symbol'],
                                     current_trend=pred['current_trend'],
                                     predicted_change=pred['predicted_change'],
                                     estimated_days=pred['estimated_days'],
                                     estimated_date=pred['estimated_date'],
-                                    confidence=pred['confidence'],
+                                    confidence=p_confidence,
                                     reasoning=pred['reasoning'],
-                                    key_indicators=pred.get('key_indicators', {})
+                                    key_indicators=pred.get('key_indicators', {}),
+                                    entry_price=current_price_for_trend
                                 )
+                                
+                                # Tracker returns None if duplicate — skip
+                                if stored_pred is None:
+                                    continue
                                 
                                 # Update the prediction in memory with the stored ID
                                 pred['id'] = stored_pred['id']
@@ -7494,7 +7633,7 @@ Confidence: {prediction['confidence']:.0f}%
                                     symbol=pred['symbol'],
                                     predicted_change=pred['predicted_change'],
                                     estimated_days=pred['estimated_days'],
-                                    confidence=pred['confidence']
+                                    confidence=p_confidence
                                 )
                                 
                                 logger.info(f"📊 Recorded trend change prediction #{stored_pred['id']} for {symbol}")
