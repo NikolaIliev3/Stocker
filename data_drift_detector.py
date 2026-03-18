@@ -14,11 +14,13 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Try to import Evidently (v0.4.0)
+# Note: Use broad Exception catch because evidently can fail with pydantic ConfigError
+# on Python 3.14+ (not just ImportError)
 try:
     from evidently.report import Report
     from evidently.metric_preset import DataDriftPreset
     HAS_EVIDENTLY = True
-except ImportError as e:
+except Exception as e:
     HAS_EVIDENTLY = False
     logger.warning(f"Evidently import error: {e}. Required: pip install evidently==0.4.0")
 

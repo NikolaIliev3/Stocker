@@ -16,10 +16,12 @@ except ImportError:
     pass
 
 # Import production monitor if available
+# Note: Use broad Exception catch because production_monitor imports evidently
+# which can fail with pydantic ConfigError on Python 3.14+ (not just ImportError)
 try:
     from production_monitor import ProductionMonitor
     HAS_MONITORING = True
-except ImportError:
+except Exception:
     HAS_MONITORING = False
 
 # Import performance attribution if available
@@ -30,6 +32,7 @@ except ImportError:
     HAS_ATTRIBUTION = False
 
 from config import PREDICTIONS_FILE, STATE_FILE
+from sector_mapper import SectorMapper
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +69,9 @@ class PredictionsTracker:
                 logger.warning(f"Could not initialize performance attribution: {e}")
                 self.performance_attribution = None
         
+        # Initialize Sector Mapper for alpha benchmarking
+        self.sector_mapper = SectorMapper(self.data_dir)
+        
         self.load()
     
     def load(self):
@@ -92,7 +98,7 @@ class PredictionsTracker:
                       entry_price: float, target_price: float, 
                       stop_loss: float, confidence: float, reasoning: str,
                       estimated_days: int = None, predicted_move_pct: float = None,
-                      market_regime: str = "unknown") -> Optional[Dict]:
+                      market_regime: str = "unknown", atr_percent: float = 0.0) -> Optional[Dict]:
         """Add a new prediction with estimated target date
         
         Args:
@@ -119,7 +125,11 @@ class PredictionsTracker:
             else:  # investing
                 estimated_days = 547  # Long-term: ~1.5 years (547 days)
         
-        estimated_target_date = (datetime.now() + timedelta(days=estimated_days)).isoformat()
+        try:
+            from utils.market_utils import add_trading_days
+            estimated_target_date = add_trading_days(datetime.now(), estimated_days).isoformat()
+        except ImportError:
+            estimated_target_date = (datetime.now() + timedelta(days=estimated_days)).isoformat()
         
         prediction = {
             "id": len(self.predictions) + 1,
@@ -133,6 +143,7 @@ class PredictionsTracker:
             "confidence": confidence,
             "reasoning": reasoning,
             "market_regime": market_regime,
+            "atr_percent": atr_percent,
             "status": "active",  # active, verified, expired
             "verified": False,
             "was_correct": None,
@@ -218,7 +229,7 @@ class PredictionsTracker:
             logger.error(f"Error syncing to paper_state: {e}")
     
 
-    def verify_prediction(self, prediction_id: int, current_price: float, high: float = None, low: float = None) -> Optional[Dict]:
+    def verify_prediction(self, prediction_id: int, current_price: float, high: float = None, low: float = None, data_fetcher=None) -> Optional[Dict]:
         """Verify if a prediction came true
         
         Args:
@@ -331,6 +342,65 @@ class PredictionsTracker:
                 
             # Calculate price change
             price_change = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+            
+            # --- QUANT MODE ALPHA VERIFICATION ---
+            alpha = 0.0
+            spy_change = 0.0
+            
+            try:
+                from config import IS_QUANT_MODE
+            except ImportError:
+                IS_QUANT_MODE = False
+                
+            if IS_QUANT_MODE and data_fetcher and entry_price > 0 and was_correct is not None:
+                try:
+                    import pandas as pd
+                    # Fetch benchmarking ETF (Sector-Relative Alpha)
+                    benchmark_ticker = self.sector_mapper.get_sector_etf(prediction['symbol'])
+                    benchmark_data = data_fetcher.fetch_stock_history(benchmark_ticker, period="3mo")
+                    
+                    if benchmark_data and benchmark_data.get('data'):
+                        bench_df = pd.DataFrame(benchmark_data['data'])
+                        if 'date' in bench_df.columns:
+                            bench_df['date'] = pd.to_datetime(bench_df['date'])
+                            bench_df.set_index('date', inplace=True)
+                            
+                            pred_timestamp_naive = datetime.fromisoformat(prediction['timestamp']).replace(tzinfo=None)
+                            
+                            # Find start and end prices
+                            bench_start_idx = bench_df.index.get_indexer([pred_timestamp_naive], method='nearest')[0]
+                            # Using last row for current benchmark level
+                            bench_end_price = bench_df.iloc[-1]['close'] if 'close' in bench_df.columns else bench_df.iloc[-1]['Close']
+                            bench_start_price = bench_df.iloc[bench_start_idx]['close'] if 'close' in bench_df.columns else bench_df.iloc[bench_start_idx]['Close']
+                            
+                            if bench_start_price > 0:
+                                bench_change = ((bench_end_price - bench_start_price) / bench_start_price) * 100
+                                alpha = price_change - bench_change
+                                prediction['spy_change'] = bench_change # Keep key name for UI compatibility, but it's now bench
+                                prediction['alpha'] = alpha
+                                prediction['benchmark_etf'] = benchmark_ticker
+                                
+                                # --- NEW LOGIC: ALPHA > 0 HURDLE ---
+                                # Simply require positive alpha for a win in Quant Mode.
+                                if action == "BUY":
+                                    if alpha <= 0.0:
+                                        if was_correct:
+                                            logger.info(f"📉 ALPHA VETO: {prediction['symbol']} had absolute target hit, but Alpha ({alpha:.2f}%) <= 0. Marking FALSE.")
+                                        was_correct = False
+                                    else:
+                                        # was_correct is already True from target hit or 3% expiry
+                                        pass
+                                elif action == "SELL":
+                                    # For shorts, alpha < 0 means outperformance (dropped more than sector)
+                                    if alpha >= 0.0:
+                                        if was_correct:
+                                            logger.info(f"📈 ALPHA VETO: {prediction['symbol']} had absolute target hit, but Alpha ({alpha:.2f}%) >= 0. Marking FALSE.")
+                                        was_correct = False
+                                    else:
+                                        was_correct = True
+                except Exception as e:
+                    logger.warning(f"Failed to calculate Alpha for {prediction['symbol']}: {e}")
+
             
             # Update prediction
             prediction['verified'] = True
@@ -466,6 +536,26 @@ class PredictionsTracker:
                             logger.debug(f"Error processing history for {prediction['symbol']}: {e}")
 
                     
+                    # FALLBACK FOR EXPIRED PREDICTIONS WITH NO PRICE DATA:
+                    # If price fetch returned 0 but the prediction is expired,
+                    # use entry_price as fallback (guarantees 0% change = INCORRECT)
+                    if current_price <= 0:
+                        estimated_date_str = prediction.get('estimated_target_date')
+                        if estimated_date_str:
+                            try:
+                                is_past_expiry = datetime.now() >= datetime.fromisoformat(estimated_date_str)
+                            except:
+                                is_past_expiry = False
+                            
+                            if is_past_expiry:
+                                # Use entry_price as fallback — 0% change will mark as INCORRECT
+                                current_price = prediction.get('entry_price', 0)
+                                logger.warning(
+                                    f"⚠️ Price fetch failed for {prediction['symbol']} (pred #{prediction['id']}), "
+                                    f"but prediction expired on {estimated_date_str[:10]}. "
+                                    f"Using entry_price ${current_price} as fallback."
+                                )
+                    
                     if current_price > 0:
                         # self.verify_prediction handles its own locking
                         # Pass the retroactive High/Low values
@@ -473,7 +563,8 @@ class PredictionsTracker:
                             prediction['id'], 
                             current_price, 
                             high=high_since_entry, 
-                            low=low_since_entry
+                            low=low_since_entry,
+                            data_fetcher=data_fetcher
                         )
                         
                         if result:
@@ -484,6 +575,33 @@ class PredictionsTracker:
                             # Add to newly verified list
                             newly_verified.append(result)
                 except Exception as e:
+                    # SAFETY NET: If exception occurs but prediction is way past expiry,
+                    # force-expire it so it doesn't stay active forever
+                    try:
+                        estimated_date_str = prediction.get('estimated_target_date')
+                        if estimated_date_str:
+                            days_past = (now - datetime.fromisoformat(estimated_date_str)).days
+                            if days_past > 7:
+                                logger.warning(
+                                    f"⚠️ Force-expiring prediction #{prediction['id']} for {prediction['symbol']} "
+                                    f"({days_past} days past expiry, data fetch failed)"
+                                )
+                                with self.lock:
+                                    real_pred = self.get_prediction_by_id(prediction['id'])
+                                    if real_pred and real_pred['status'] == 'active':
+                                        real_pred['verified'] = True
+                                        real_pred['status'] = 'verified'
+                                        real_pred['was_correct'] = False
+                                        real_pred['verification_date'] = now.isoformat()
+                                        real_pred['actual_price_at_target'] = prediction.get('entry_price', 0)
+                                        real_pred['actual_price_change'] = 0.0
+                                        real_pred['days_to_target'] = (now - datetime.fromisoformat(prediction['timestamp'])).days
+                                        self.save()
+                                        verified_count += 1
+                                        newly_verified.append(real_pred)
+                    except Exception as inner_e:
+                        logger.debug(f"Error in safety net expiry: {inner_e}")
+                    
                     logger.warning(f"Could not verify prediction {prediction['id']} for {prediction['symbol']}: {e}")
                     continue
         
@@ -551,7 +669,11 @@ class PredictionsTracker:
                 estimated_days = 547
             
             prediction['estimated_days'] = estimated_days
-            prediction['estimated_target_date'] = (datetime.now() + timedelta(days=estimated_days)).isoformat()
+            try:
+                from utils.market_utils import add_trading_days
+                prediction['estimated_target_date'] = add_trading_days(datetime.now(), estimated_days).isoformat()
+            except ImportError:
+                prediction['estimated_target_date'] = (datetime.now() + timedelta(days=estimated_days)).isoformat()
             
             self.save()
         logger.info(f"Updated prediction #{prediction_id}: action changed to {new_action}")
