@@ -1,6 +1,6 @@
 """
 Data Drift Detection Module
-Uses Evidently AI to detect when live market data has drifted from training data.
+Uses scipy KS-test to detect when live market data has drifted from training data.
 This indicates the model may need retraining because market conditions have changed.
 """
 import pandas as pd
@@ -10,24 +10,15 @@ from pathlib import Path
 from datetime import datetime
 import json
 import logging
+from scipy.stats import ks_2samp
 
 logger = logging.getLogger(__name__)
-
-# Try to import Evidently (v0.4.0)
-# Note: Use broad Exception catch because evidently can fail with pydantic ConfigError
-# on Python 3.14+ (not just ImportError)
-try:
-    from evidently.report import Report
-    from evidently.metric_preset import DataDriftPreset
-    HAS_EVIDENTLY = True
-except Exception as e:
-    HAS_EVIDENTLY = False
-    logger.warning(f"Evidently import error: {e}. Required: pip install evidently==0.4.0")
 
 
 class DataDriftDetector:
     """
     Detects data drift between training data and live/current data.
+    Uses Kolmogorov-Smirnov test per feature to detect distribution shifts.
     """
     
     def __init__(self, data_dir: Path, strategy: str = 'trading'):
@@ -45,6 +36,7 @@ class DataDriftDetector:
         # Drift detection thresholds
         self.dataset_drift_threshold = 0.5
         self.feature_drift_threshold = 0.1
+        self.ks_p_value_threshold = 0.05  # p < 0.05 = significant drift
         
         # Load reference data if exists
         self.reference_data = self._load_reference_data()
@@ -105,7 +97,11 @@ class DataDriftDetector:
     
     def check_drift(self, current_data: pd.DataFrame) -> Dict:
         """
-        Check for data drift between reference and current data.
+        Check for data drift between reference and current data using KS-test.
+        
+        For each numeric feature, runs a two-sample Kolmogorov-Smirnov test
+        comparing the reference distribution to the current distribution.
+        A feature is considered drifted if p-value < 0.05.
         
         Args:
             current_data: DataFrame of current/live features
@@ -113,19 +109,10 @@ class DataDriftDetector:
         Returns:
             Dict with drift detection results:
             - drift_detected: bool
-            - drift_score: float (0-1, higher = more drift)
+            - drift_score: float (0-1, fraction of features that drifted)
             - drifted_features: list of feature names that drifted
             - recommendation: str
         """
-        if not HAS_EVIDENTLY:
-            return {
-                'drift_detected': False,
-                'drift_score': 0.0,
-                'drifted_features': [],
-                'recommendation': 'Install evidently to enable drift detection',
-                'error': 'Evidently not installed'
-            }
-        
         if self.reference_data is None:
             return {
                 'drift_detected': False,
@@ -164,34 +151,32 @@ class DataDriftDetector:
             ref_aligned = ref_aligned.replace([np.inf, -np.inf], np.nan).fillna(0)
             curr_aligned = curr_aligned.replace([np.inf, -np.inf], np.nan).fillna(0)
             
-            # Run Evidently drift detection
-            report = Report(metrics=[
-                DataDriftPreset()
-            ])
-            
-            report.run(reference_data=ref_aligned, current_data=curr_aligned)
-            
-            # Extract results
-            result_dict = report.as_dict()
-            
-            # Get dataset drift result
-            dataset_drift = False
-            drift_share = 0.0
+            # Run KS-test per feature
             drifted_features = []
+            tested_features = 0
             
-            for metric_result in result_dict.get('metrics', []):
-                metric_id = metric_result.get('metric', '')
-                result = metric_result.get('result', {})
-                
-                if 'DatasetDriftMetric' in metric_id:
-                    dataset_drift = result.get('dataset_drift', False)
-                    drift_share = result.get('drift_share', 0.0)
-                
-                if 'DataDriftTable' in metric_id:
-                    drift_by_columns = result.get('drift_by_columns', {})
-                    for col_name, col_data in drift_by_columns.items():
-                        if col_data.get('drift_detected', False):
-                            drifted_features.append(col_name)
+            for col in common_columns:
+                try:
+                    ref_values = ref_aligned[col].values.astype(float)
+                    curr_values = curr_aligned[col].values.astype(float)
+                    
+                    # Skip constant columns (no variance to test)
+                    if np.std(ref_values) == 0 and np.std(curr_values) == 0:
+                        continue
+                    
+                    tested_features += 1
+                    statistic, p_value = ks_2samp(ref_values, curr_values)
+                    
+                    if p_value < self.ks_p_value_threshold:
+                        drifted_features.append(col)
+                        
+                except (ValueError, TypeError):
+                    # Skip non-numeric or problematic columns
+                    continue
+            
+            # Calculate drift score (fraction of tested features that drifted)
+            drift_share = len(drifted_features) / tested_features if tested_features > 0 else 0.0
+            dataset_drift = drift_share > self.dataset_drift_threshold
             
             # Check if critical features drifted
             critical_drifted = [f for f in drifted_features if f in self.critical_features]
