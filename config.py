@@ -151,9 +151,43 @@ ML_ENSEMBLE_WEIGHT_MIN = 0.20
 ML_CONFIDENCE_DIFF_THRESHOLD_HIGH = 25  
 ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL = 15  
 ML_RULE_CONFIDENCE_ADVANTAGE_THRESHOLD = 15  
-ML_LABEL_THRESHOLD = 3.0  # Strict 3% hurdle for Success
-MIN_PROFIT_TARGET_PCT = 3.0  # Minimum required profit for verification
+ML_LABEL_THRESHOLD = 3.0  # Strict 3% hurdle for Success (Legacy)
+MIN_PROFIT_TARGET_PCT = 3.0  # Minimum required profit for verification (Legacy)
 MIN_STOP_LOSS_PCT = 4.0      # Production stop loss aligned with Audit V4
+
+# --- QUANT MODE SETTINGS ---
+IS_QUANT_MODE = True
+
+if IS_QUANT_MODE:
+    # Quant Mode Overrides: Prioritizes Precision over Recall for maximum accuracy.
+    
+    # 1. Confidence Thresholds (Drastically Higher)
+    # Only trade if model is 75% sure (Standard is 0.38-0.60)
+    ML_HIGH_ACCURACY_THRESHOLD = 0.75      
+    ML_VERY_HIGH_ACCURACY_THRESHOLD = 0.85 
+
+    # 2. Labeling Logic (Dynamic)
+    # Minimum price move to even consider (2%). Overridden by ATR targets in hybrid_predictor.
+    ML_LABEL_THRESHOLD = 2.0  
+
+    # 3. Model Parameters (Prevent Overfitting)
+    ML_RF_N_ESTIMATORS = 500    
+    ML_RF_MAX_DEPTH = 6         # Increased from 4 to allow 62% confidence gate clearance
+    ML_RF_MIN_SAMPLES_LEAF = 60 
+    ML_GB_LEARNING_RATE = 0.05  
+    ML_GB_MAX_DEPTH = 3         # Increased from 2
+    ML_GB_N_ESTIMATORS = 300
+    
+    # 4. Filters
+    ENABLE_REGIME_FILTER = True # Block trades in low ADX / High Volatility clusters
+    MIN_ATR_PERCENT = 1.5       # Don't trade if stock moves < 1.5% per day (Zombie prevention)
+
+# Legacy / Non-Quant Defaults for non-ML modules
+QUANT_ATR_MULTIPLIER = 0.0   # Success if Alpha > 0 (Simplified)
+QUANT_MIN_ALPHA = 0.0        # Simplified beats sector ETF requirement
+QUANT_ALPHA_FALLBACK_R2 = 0.4 # If stock-sector R2 lower than this, use SPY-alpha
+ML_MIN_SIGNAL_CONFIDENCE = 0.62  # Filter out signals with confidence lower than 62%
+ML_MODEL_FAMILY = 'stacking'     # Use Empirical Meta-Stacking (RF + GB + LR meta)
 
 # Phase 4: Deployment Safeguards
 GLOBAL_STOP_LOSS_PCT = 4.0   # Hard stop at -4%

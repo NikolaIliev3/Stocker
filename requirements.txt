@@ -1,6 +1,4 @@
-# Compatible with Python 3.12 and 3.13
-# NOTE: Python 3.14 is NOT fully supported (evidently/pydantic v1 incompatibility)
-# The app will still run on 3.14 but with drift detection disabled
+# Compatible with Python 3.12, 3.13, and 3.14
 requests>=2.31.0
 yfinance>=0.2.36
 pandas>=2.1.0
@@ -19,7 +17,6 @@ scipy>=1.11.0
 setuptools>=69.0.0
 
 # ML Data Quality Tools (free, open-source)
-evidently>=0.4.0
 cleanlab>=2.6.0
 pyarrow>=14.0.0
 
