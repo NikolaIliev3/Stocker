@@ -12,10 +12,12 @@ import logging
 import pandas as pd
 
 # Try to import drift detector
+# Note: Use broad Exception catch because data_drift_detector imports evidently
+# which can fail with pydantic ConfigError on Python 3.14+ (not just ImportError)
 try:
     from data_drift_detector import DataDriftDetector
     HAS_DRIFT_DETECTOR = True
-except ImportError:
+except Exception:
     HAS_DRIFT_DETECTOR = False
     logging.getLogger(__name__).debug("Data drift detector not available")
 

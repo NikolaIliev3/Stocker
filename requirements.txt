@@ -1,4 +1,6 @@
 # Compatible with Python 3.12 and 3.13
+# NOTE: Python 3.14 is NOT fully supported (evidently/pydantic v1 incompatibility)
+# The app will still run on 3.14 but with drift detection disabled
 requests>=2.31.0
 yfinance>=0.2.36
 pandas>=2.1.0
