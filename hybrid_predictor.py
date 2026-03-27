@@ -866,7 +866,7 @@ class HybridStockPredictor:
         - Goal: Extreme Accuracy (>60%) by filtering out 'noise' and shorting.
         - Rules:
             1. No SELL signals (Global Shorting Veto).
-            2. Global BUY threshold: 75% confidence.
+            2. Global BUY threshold: 80% confidence.
             3. SMA200 / Bear Market BUY threshold: 85% confidence.
         """
         if not base_analysis or final_action == 'HOLD':
@@ -974,15 +974,15 @@ class HybridStockPredictor:
 
             # Backtest (2025): Even at 90% confidence, win rate is low in stress.
             # We only allow BUYs if the market is stable (Bull/Sideways and low drawdown).
-            # [USER-VERIFIED] 75% Confidence has ~70% Accuracy. Locking this in.
+            # [USER-VERIFIED] 80% Confidence has higher Accuracy. Locking this in.
             # [FIX] Raising baseline floor to 85.0 to eliminate noise in bull markets.
-            # Consensus/Reversal signals get a lower bar at 75.0%.
+            # Consensus/Reversal signals get a lower bar at 80.0%.
             is_consensus = final_confidence >= 65 and ml_prob_buy >= 0.55
             is_reversal = any(kw in reasoning.lower() for kw in ['oversold', 'dip', 'reversal', 'rebound', 'contrarian'])
             
             min_threshold = 85.0
             if is_consensus or is_reversal:
-                min_threshold = 75.0 # Quality signals get a lower bar
+                min_threshold = 80.0 # Quality signals get a lower bar
             
             if final_confidence < min_threshold:
                 msg = f"🛡️ PROTECTION: Suppressing signal {symbol} ({final_confidence:.1f}% < {min_threshold}%)"
