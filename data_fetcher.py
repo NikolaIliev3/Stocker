@@ -36,6 +36,8 @@ except ImportError as e:
     logger.warning(f"New modules not available: {e}")
     HAS_NEW_MODULES = False
 
+from sector_mapper import SectorMapper
+
 logger = logging.getLogger(__name__)
 
 
@@ -100,6 +102,9 @@ class StockDataFetcher:
             self.data_provider = None
             self.quality_checker = None
             
+        # Sector Mapper for ETF mapping
+        self.sector_mapper = SectorMapper(APP_DATA_DIR)
+            
         # Sector ETF Mapping (GICS Sectors)
         self.SECTOR_ETF_MAPPING = {
             # Technology -> XLK
@@ -152,7 +157,12 @@ class StockDataFetcher:
 
     def get_sector_etf(self, symbol: str) -> str:
         """Returns the corresponding Sector ETF for a symbol."""
-        return self.SECTOR_ETF_MAPPING.get(symbol, 'SPY')  # Default to SPY (Market)
+        # Use SectorMapper for superior mapping logic
+        if hasattr(self, 'sector_mapper'):
+            return self.sector_mapper.get_sector_etf(symbol)
+        
+        # Fallback to hardcoded mapping
+        return self.SECTOR_ETF_MAPPING.get(symbol, 'SPY')
         
     def fetch_sector_data(self, etf_symbol: str, start_date: str = None, days: int = 365*5) -> pd.DataFrame:
         """Fetches historical data for a sector ETF."""
@@ -276,6 +286,51 @@ class StockDataFetcher:
         except Exception as e:
             logger.error(f"Error getting current data for {symbol}: {e}")
             return None
+
+    def fetch_current_macro_levels(self) -> dict:
+        """Fetch the latest snapshot of macro indicators (VIX, TNX, DXY)"""
+        try:
+            import yfinance as yf
+            # We fetch short history (1 month) to ensure we get the latest valid closing price
+            # even on weekends or holidays.
+            vix = yf.Ticker("^VIX").history(period="1mo")
+            tnx = yf.Ticker("^TNX").history(period="1mo")
+            dxy = yf.Ticker("DX-Y.NYB").history(period="1mo")
+            
+            # Extract latest close
+            vix_latest = float(vix['Close'].iloc[-1]) if not vix.empty else 20.0
+            tnx_latest = float(tnx['Close'].iloc[-1]) if not tnx.empty else 4.0
+            dxy_latest = float(dxy['Close'].iloc[-1]) if not dxy.empty else 100.0
+            
+            # Simple derived statuses for the ML feature extractor
+            vix_change_pct = 0.0
+            if len(vix) >= 2:
+                prev_vix = float(vix['Close'].iloc[-2])
+                vix_change_pct = ((vix_latest - prev_vix) / prev_vix) * 100 if prev_vix > 0 else 0.0
+            
+            return {
+                'available': True,
+                'vix_value': vix_latest,
+                'tnx_value': tnx_latest,
+                'dxy_value': dxy_latest,
+                'vix_change_pct': vix_change_pct,
+                # Simple fallback map for discrete categories
+                'vix_status': 'extreme_fear' if vix_latest > 30 else 'high_fear' if vix_latest > 20 else 'normal' if vix_latest > 13 else 'complacency',
+                'yield_status': 'rising' if len(tnx) >= 2 and float(tnx['Close'].iloc[-1]) > float(tnx['Close'].iloc[-2]) else 'stable',
+                'risk_level': 'high' if vix_latest > 25 else 'neutral'
+            }
+        except Exception as e:
+            logger.error(f"Failed to fetch live macro levels: {e}")
+            return {
+                'available': False,
+                'vix_value': 20.0,
+                'tnx_value': 4.0,
+                'dxy_value': 100.0,
+                'vix_change_pct': 0.0,
+                'vix_status': 'unknown',
+                'yield_status': 'unknown',
+                'risk_level': 'unknown'
+            }
 
     def _retry_operation(self, operation, max_retries=5, base_delay=3.0):
         """Execute operation with retry logic for rate limits"""
@@ -578,7 +633,37 @@ class StockDataFetcher:
             end_date: End date in YYYY-MM-DD format (optional, overrides period)
         """
         # Normalize symbol (e.g., BRK.B -> BRK-B)
-        symbol = symbol.replace('.', '-')
+        symbol = symbol.replace('.', '-').upper()
+
+        # --- QUANT MODE: PARQUET CACHE CHECK ---
+        # Prefer high-performance local cache if available and relevant (1d interval)
+        if interval == '1d':
+            cache_file = APP_DATA_DIR / "historical_cache" / f"{symbol}.parquet"
+            if cache_file.exists():
+                try:
+                    df = pd.read_parquet(cache_file)
+                    if not df.empty:
+                        # Filter by date if requested
+                        if start_date and end_date:
+                            mask = (df.index >= start_date) & (df.index <= end_date)
+                            df = df.loc[mask]
+                        
+                        if not df.empty:
+                            logger.debug(f"⚡ Parquet Cache Hit for {symbol} ({len(df)} rows)")
+                            # Convert to format expected by internal callers
+                            history_list = []
+                            for date, row in df.iterrows():
+                                history_list.append({
+                                    "date": date.strftime("%Y-%m-%d"),
+                                    "open": float(row.get('Open', row.get('open', 0))),
+                                    "high": float(row.get('High', row.get('high', 0))),
+                                    "low": float(row.get('Low', row.get('low', 0))),
+                                    "close": float(row.get('Close', row.get('close', 0))),
+                                    "volume": int(row.get('Volume', row.get('volume', 0)))
+                                })
+                            return {"data": history_list}
+                except Exception as e:
+                    logger.debug(f"Parquet read failed for {symbol}: {e}")
 
         # If start_date and end_date are provided, use them directly with yfinance
         if start_date and end_date:

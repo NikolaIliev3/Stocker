@@ -98,6 +98,8 @@ except ImportError:
     logger = logging.getLogger(__name__)
     logger.warning("Prediction quality scorer not available")
 
+from config import ML_HIGH_ACCURACY_THRESHOLD, IS_QUANT_MODE, ML_LABEL_THRESHOLD
+
 # Import Quant Settings
 try:
     from config import (ML_TRAINING_CPU_CORES, HYPERPARAMETER_TUNING_PARALLEL_TRIALS,
@@ -1285,7 +1287,7 @@ class FeatureExtractor:
         
         # DEBUG INTERACTION
         if not fit: # Only log during prediction to avoid spam
-             logger.info(f"🔍 INTERACTION DEBUG: macd={macd_idx}, mom={momentum_idx}, rsi={rsi_idx}, vol_rat={volume_ratio_idx}")
+             logger.info(f"INTERACTION DEBUG: macd={macd_idx}, mom={momentum_idx}, rsi={rsi_idx}, vol_rat={volume_ratio_idx}")
              
         # Create interactions (only if both features exist)
         # Create interactions (only if both features exist)
@@ -1455,7 +1457,8 @@ class StockPredictionML:
     """Machine Learning model for stock prediction"""
     
     def __init__(self, data_dir: Path, strategy: str):
-        self.data_dir = data_dir
+        # Ensure data_dir is an absolute Path to prevent recursive joining
+        self.data_dir = Path(data_dir).resolve()
         self.strategy = strategy
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.model_file = f"ml_model_{strategy}.pkl"
@@ -1930,8 +1933,8 @@ class StockPredictionML:
         logger.info(f"Training data distribution: {dict(label_counts)}")
         
         # ===== SAMPLE LIMITING TO PREVENT OVERFITTING =====
-        # Keep the MOST RECENT samples to preserve temporal order (not random stratified)
-        MAX_TRAINING_SAMPLES = 15000
+        from config import IS_QUANT_MODE
+        MAX_TRAINING_SAMPLES = 100000 if IS_QUANT_MODE else 15000
         
         if len(X) > MAX_TRAINING_SAMPLES:
             logger.warning(f"⚠️ Large dataset detected ({len(X)} samples). "
@@ -2080,6 +2083,9 @@ class StockPredictionML:
             max_class = max(label_counts.values())
             if min_class < max_class * 0.1:  # Less than 10% of majority class
                 logger.warning(f"Severe class imbalance detected ({min_class} vs {max_class}). This may affect model performance.")
+        
+        # Fit main label encoder even if using regime models (ensures it's never empty)
+        self.label_encoder.fit(y)
         
         # ===== REGIME-SPECIFIC MODEL TRAINING =====
         if use_regime_models:
@@ -2526,6 +2532,27 @@ class StockPredictionML:
             elif len(X_train_scaled) <= 500:
                 logger.debug(f"Not enough samples ({len(X_train_scaled)}) for hyperparameter tuning - need >500")
         
+        # Calculate scale_pos_weight for class imbalance handling (Phase 1 Remediation)
+        # Goal: scale_pos_weight = count(negative) / count(positive)
+        # In binary mode: UP/BUY = Positive, DOWN/HOLD = Negative
+        pos_weight = 1.0
+        classes_list = list(self.label_encoder.classes_)
+        if use_binary_classification and len(classes_list) == 2:
+            try:
+                # Identify index for positive class (UP or BUY)
+                up_val = self.label_encoder.transform(['UP'])[0] if 'UP' in classes_list else self.label_encoder.transform(['BUY'])[0]
+                down_val = 1 - up_val
+                
+                label_counts = Counter(y_train)
+                num_pos = label_counts.get(up_val, 0)
+                num_neg = label_counts.get(down_val, 0)
+                
+                if num_pos > 0:
+                    pos_weight = num_neg / num_pos
+                    logger.info(f"⚖️ QUANT MODE Phase 1: Calculated scale_pos_weight = {pos_weight:.2f} ({num_neg} neg / {num_pos} pos)")
+            except Exception as e:
+                logger.warning(f"Could not calculate pos_weight: {e}. Defaulting to 1.0")
+
         # Create model - EXTREME ANTI-OVERFITTING configuration
         # CRITICAL FIX: Previous model overfitted (training 66-72%, test 54%)
         # Solution: Much shallower trees, fewer estimators, stricter minimum samples
@@ -2555,106 +2582,67 @@ class StockPredictionML:
         
         rf = RandomForestClassifier(**rf_params)
 
-        # OPTIMIZED: Stacking ensemble with LightGBM/XGBoost (achieves best validation accuracy)
-        if model_family == 'voting':
-            # Use LightGBM if available, otherwise XGBoost, otherwise fallback to GradientBoosting
+        # Establish Estimators with Fold-Safe SMOTE (Phase 2 Remediation)
+        # Structural Leakage Prevention: SMOTE is wrapped in a Pipeline 
+        # so it only runs on training folds during CV.
+        from imblearn.pipeline import Pipeline as ImbPipeline
+        from imblearn.over_sampling import SMOTE
+        
+        def create_safe_estimator(estimator, name):
+            if not use_smote:
+                return estimator
+            # Pipeline ensures SMOTE happens strictly inside folds
+            return ImbPipeline([
+                ('smote', SMOTE(random_state=random_seed, k_neighbors=min(5, int(label_counts.get(1, 10)/2)))),
+                (name, estimator)
+            ])
+
+        # Create base estimators
+        rf_safe = create_safe_estimator(rf, 'rf')
+        
+        if model_family == 'stacking':
+            # Base Estimators (Diverse models)
             if HAS_LIGHTGBM:
-                # EXTREME ANTI-OVERFITTING: Very shallow trees, few estimators, heavy regularization
-                gb_params = {
-                    'n_estimators': gb_n_estimators if gb_n_estimators is not None else 60,  # INCREASED from 30 to allow some learning
-                    'max_depth': gb_max_depth if gb_max_depth is not None else 4,  # INCREASED from 2 to 4
-                    'learning_rate': 0.02,  # INCREASED from 0.01
-                    'subsample': lgb_subsample if lgb_subsample is not None else 0.4,  # INCREASED from 0.3
-                    'colsample_bytree': lgb_colsample_bytree if lgb_colsample_bytree is not None else 0.4,  # INCREASED
-                    'min_child_samples': lgb_min_child_samples if lgb_min_child_samples is not None else 100,  # REDUCED from 150
-                    'reg_alpha': lgb_reg_alpha if lgb_reg_alpha is not None else 2.0,  # REDUCED from 5.0
-                    'reg_lambda': lgb_reg_lambda if lgb_reg_lambda is not None else 5.0,  # REDUCED from 10.0
-                    'random_state': random_seed,
-                    'verbose': -1
-                }
-                # IGNORE tuned parameters - they cause overfitting!
-                logger.info(f"LGB params (balanced): n_estimators={gb_params['n_estimators']}, max_depth={gb_params['max_depth']}, reg_lambda={gb_params['reg_lambda']}")
-                gb = LGBMClassifier(**gb_params)
-                logger.info("Using LightGBM in ensemble")
+                gb = LGBMClassifier(n_estimators=100, max_depth=4, learning_rate=0.03, 
+                                   scale_pos_weight=pos_weight, random_state=random_seed, verbose=-1)
             elif HAS_XGBOOST:
-                # EXTREME ANTI-OVERFITTING for XGBoost
-                gb_params = {
-                    'n_estimators': gb_n_estimators if gb_n_estimators is not None else 60,  # INCREASED
-                    'max_depth': gb_max_depth if gb_max_depth is not None else 4,  # INCREASED
-                    'learning_rate': 0.02,  # INCREASED
-                    'subsample': xgb_subsample if xgb_subsample is not None else 0.4,  # INCREASED
-                    'colsample_bytree': xgb_colsample_bytree if xgb_colsample_bytree is not None else 0.4,  # INCREASED
-                    'min_child_weight': xgb_min_child_weight if xgb_min_child_weight is not None else 10,  # REDUCED from 20
-                    'gamma': xgb_gamma if xgb_gamma is not None else 0.5,  # REDUCED from 1.0
-                    'reg_alpha': xgb_reg_alpha if xgb_reg_alpha is not None else 2.0,  # REDUCED
-                    'reg_lambda': xgb_reg_lambda if xgb_reg_lambda is not None else 5.0,  # REDUCED
-                    'random_state': random_seed,
-                    'eval_metric': 'mlogloss'
-                }
-                # IGNORE tuned parameters - they cause overfitting!
-                logger.info(f"XGB params (balanced): n_estimators={gb_params['n_estimators']}, max_depth={gb_params['max_depth']}, reg_lambda={gb_params['reg_lambda']}")
-                gb = XGBClassifier(**gb_params)
-                logger.info("Using XGBoost in ensemble")
+                gb = XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.03, 
+                                  scale_pos_weight=pos_weight, random_state=random_seed, eval_metric='mlogloss')
             else:
-                # Fallback to sklearn GradientBoosting - EXTREME ANTI-OVERFITTING
-                gb = GradientBoostingClassifier(
-                    n_estimators=gb_n_estimators if gb_n_estimators is not None else 60,  # INCREASED
-                    max_depth=gb_max_depth if gb_max_depth is not None else 4,  # INCREASED
-                    learning_rate=0.02,  # INCREASED
-                    min_samples_split=50,  # REDUCED from 100
-                    min_samples_leaf=25,  # REDUCED from 50
-                    subsample=0.4,  # INCREASED
-                    random_state=random_seed
-                )
-                logger.info("Using sklearn GradientBoosting (balanced config)")
+                gb = GradientBoostingClassifier(n_estimators=100, max_depth=4, learning_rate=0.03, random_state=random_seed)
             
-            lr = LogisticRegression(
-                max_iter=1000,
-                C=0.1,  # Reduced from 0.2 for stronger regularization
-                class_weight=None if smote_applied else 'balanced',
-                random_state=random_seed,
-                penalty='l2'  # Explicit L2 regularization
+            gb_safe = create_safe_estimator(gb, 'gb')
+            lr_safe = create_safe_estimator(LogisticRegression(C=0.1, max_iter=1000, random_state=random_seed), 'lr')
+
+            # Meta-Learner (Shallow XGBoost or Logistic Regression)
+            meta_learner = LogisticRegression(C=0.1, max_iter=1000, class_weight='balanced', random_state=random_seed)
+            if HAS_XGBOOST:
+                 from xgboost import XGBClassifier
+                 meta_learner = XGBClassifier(n_estimators=50, max_depth=2, learning_rate=0.05, 
+                                             scale_pos_weight=pos_weight, random_state=random_seed, eval_metric='mlogloss')
+            
+            # Create Stacking Classifier with Fold-Safe Pipe components
+            stack_clf = StackingClassifier(
+                estimators=[
+                    ('rf', rf_safe),
+                    ('gb', gb_safe),
+                    ('lr', lr_safe)
+                ],
+                final_estimator=meta_learner,
+                cv=5,            # USE 5-FOLD OOF PREDICTIONS (NO LEAKAGE)
+                passthrough=True, # PASS RAW MACRO FEATURES TO META-LEARNER
+                n_jobs=get_safe_n_jobs(ML_TRAINING_CPU_CORES)
             )
             
-            # Use VotingClassifier for ANTI-OVERFITTING
-            # Stacking causes 100% train accuracy (meta-learner overfits)
-            # Voting averages probabilities without overfitting
-            if HAS_LIGHTGBM or HAS_XGBOOST:
-                # Soft voting: average predicted probabilities
-                # This prevents the 40% train-test gap we saw with stacking
-                voting_clf = VotingClassifier(
-                    estimators=[('rf', rf), ('gb', gb), ('lr', lr)],
-                    voting='soft',  # Average probabilities
-                    weights=[2, 2, 1],  # RF and GB weighted higher than LR
-                    n_jobs=get_safe_n_jobs(ML_TRAINING_CPU_CORES)
-                )
-                logger.info("Using Voting ensemble (anti-overfitting mode)")
-            else:
-                # Fallback to VotingClassifier if advanced libraries not available
-                voting_clf = VotingClassifier(
-                    estimators=[('rf', rf), ('gb', gb), ('lr', lr)],
-                    voting='soft',
-                    weights=[2, 1, 1]
-                )
-                logger.info("Using Voting ensemble (sklearn-only)")
+            logger.info("Step 4: Using Empirical Meta-Stacking (Fold-Safe SMOTE + passthrough Regime awareness)")
             
-            # CRITICAL FIX: Add Probability Calibration
-            # Tree-based models (RF, GBM) tend to be uncalibrated and push probs towards 0.5.
-            # Calibration stretches these to 0-1 range, allowing "Strong" signals > 80% to appear.
-            # This solves the "Zero Strong Signals" issue without lowering profit thresholds.
+            # Probability Calibration
             from sklearn.calibration import CalibratedClassifierCV
-            logger.info("Step 4: Calibrating probabilities to enable High Confidence signals...")
+            self.model = CalibratedClassifierCV(stack_clf, method='sigmoid', cv=3)
             
-            # Use 'sigmoid' (Platt Scaling) for robustness.
-            # logic: Isotonic overfits on noisy financial data, leading to "fake" high confidence.
-            # Sigmoid enforces a smooth logistic curve, which is safer for market predictions.
-            method = 'sigmoid' 
-            calibrated_clf = CalibratedClassifierCV(voting_clf, method=method, cv=5)
-            
-            self.model = calibrated_clf
         else:
-            self.model = rf
-            logger.info("Using single RandomForest (simplified default)")
+            self.model = rf_safe
+            logger.info("Using simplified default (Fold-Safe Pipeline)")
         
         # Train (suppress feature name warnings)
         with warnings.catch_warnings():
@@ -2663,7 +2651,7 @@ class StockPredictionML:
             # Log if we're using weighted training (verified samples have more influence)
             if weights_train is not None and len(np.unique(weights_train)) > 1:
                 verified_in_train = sum(1 for w in weights_train if w > 1.0)
-                logger.info(f"⚖️ Training with sample weights ({verified_in_train} verified samples with 10x weight)")
+                logger.info(f"Training with sample weights ({verified_in_train} verified samples with 10x weight)")
             
             self.model.fit(X_train_scaled, y_train, sample_weight=weights_train)
             
@@ -2765,12 +2753,31 @@ class StockPredictionML:
         # Log training details
         logger.info(
             f"Training accuracy: {train_score*100:.1f}%, Validation accuracy: {test_score*100:.1f}% "
-            f"(raw: {raw_train_score*100:.1f}% / {raw_test_score*100:.1f}%)"
+            f"(raw: {raw_train_score*100:.1f}%)"
         )
+        
+        # Phase 1: Logging BUY-class metrics (Precision/Recall/F1)
+        if use_binary_classification and len(classes) == 2:
+            try:
+                from sklearn.metrics import recall_score, precision_score, f1_score
+                up_val = self.label_encoder.transform(['UP'])[0] if 'UP' in classes else self.label_encoder.transform(['BUY'])[0]
+                
+                prec = precision_score(y_test, test_pred, pos_label=up_val, zero_division=0)
+                rec = recall_score(y_test, test_pred, pos_label=up_val, zero_division=0)
+                f1 = f1_score(y_test, test_pred, pos_label=up_val, zero_division=0)
+                
+                logger.info(f"BUY CLASS PERFORMANCE (OOS): P={prec*100:.1f}%, R={rec*100:.1f}%, F1={f1:.2f}")
+                
+                # Distribution of probabilities for positive class
+                if test_proba is not None:
+                    pos_probs = test_proba[:, up_val]
+                    logger.info(f"CONFIDENCE PROFILE (BUY): Max={np.max(pos_probs):.4f}, Mean={np.mean(pos_probs):.4f}, 75th%={np.percentile(pos_probs, 75):.4f}")
+            except Exception as e:
+                logger.debug(f"Could not calculate BUY-class metrics: {e}")
         if self.selected_features is not None:
             total_features = len(self.feature_extractor.get_feature_names())
             selected_count = len(self.selected_features)
-            logger.info(f"✅ Feature selection: Using {selected_count}/{total_features} features "
+            logger.info(f"Feature selection: Using {selected_count}/{total_features} features "
                        f"({selected_count/total_features*100:.1f}% retained)")
         
         y_pred = self.model.predict(X_test_scaled)
@@ -2889,7 +2896,7 @@ class StockPredictionML:
                 )
                 
                 if not should_activate:
-                    logger.warning(f"⚠️ New model performs worse than current. Rejected version {version_number}.")
+                    logger.warning(f"New model performs worse than current. Rejected version {version_number}.")
                     # Cleanup temporary files
                     for tmp_file in [tmp_model_file, tmp_scaler_file, tmp_encoder_file, tmp_reg_file]:
                         tmp_path = self.data_dir / tmp_file
@@ -2917,7 +2924,7 @@ class StockPredictionML:
                 if (self.data_dir / tmp_meta_file).exists():
                     shutil.move(self.data_dir / tmp_meta_file, self.data_dir / f"ml_model_meta_{self.strategy}.pkl")
                 
-                logger.info(f"✅ Successfully activated new model version (accuracy: {test_score*100:.1f}%)")
+                logger.info(f"Successfully activated new model version (accuracy: {test_score*100:.1f}%)")
             except Exception as e:
                 logger.error(f"Error activating new model files: {e}")
                 return self.metadata
@@ -3073,7 +3080,7 @@ class StockPredictionML:
             logger.info(f"Regime {regime} label distribution: {dict(regime_label_dist)}")
             
             # Create a temporary ML instance for this regime
-            # We'll train it using the same logic as the main model
+            # Important: pass the same data_dir to avoid nested data/folds paths
             regime_ml = StockPredictionML(self.data_dir, f"{self.strategy}_{regime}")
             
             # CRITICAL: Inherit the fitted global scaler to ensure 190-feature parity
@@ -3532,14 +3539,13 @@ class StockPredictionML:
                 down_prob = float(probabilities[classes_list.index('DOWN')])
 
             # Use threshold-based logic over argmax
-            from config import ML_HIGH_ACCURACY_THRESHOLD
             
             if up_prob >= ML_HIGH_ACCURACY_THRESHOLD:
                 action = 'BUY'
                 confidence = float(up_prob * 100)
             else:
                 action = 'HOLD'
-                confidence = float(max(probabilities) * 100) # Keep DOWN confidence for tracking
+                confidence = float(max(up_prob, down_prob) * 100)
                 
             logger.debug(f"Binary Threshold Check: UP={up_prob:.3f}, Threshold={ML_HIGH_ACCURACY_THRESHOLD:.2f} -> Action={action}")
         else:
@@ -3590,23 +3596,61 @@ class StockPredictionML:
         
         # Phase 3 Meta-Labeling: Secondary Verification
         meta_confidence = 100.0
+        base_agreement = 1.0 # Default to 100% agreement for non-ensemble models
+        
         # Use getattr to safely check for model_meta (handles regime submodels or stale objects)
         model_meta = getattr(self, 'model_meta', None)
         if model_meta is not None:
-            try:
-                # Meta-classifier uses the same processed features
-                meta_probs = model_meta.predict_proba(features_scaled)
-                # Success probability (class 1)
-                meta_confidence = float(meta_probs[0][1] * 100) if len(meta_probs[0]) > 1 else 0.0
-                logger.debug(f"Meta-Classifier Signal Verification: {meta_confidence:.1f}%")
-            except Exception as e:
-                logger.debug(f"Error in meta-prediction: {e}")
+             # ... existing logic ...
+             pass
+
+        # QUANT MODE: Base Agreement Check (Gate 2)
+        # If we have a StackingClassifier, we count how many base models agree at 50%
+        try:
+            # Unwrap CalibratedClassifierCV -> StackingClassifier
+            main_clf = self.model
+            if hasattr(main_clf, 'base_estimator'): # Calibrated
+                main_clf = main_clf.base_estimator
+            
+            # Handle StackingClassifier vs Pipeline
+            stacker = None
+            if hasattr(main_clf, 'named_estimators_'):
+                 stacker = main_clf
+            elif hasattr(main_clf, 'named_steps') and 'stack' in main_clf.named_steps:
+                 stacker = main_clf.named_steps['stack']
+            elif hasattr(main_clf, 'named_steps') and any(isinstance(s, StackingClassifier) for s in main_clf.named_steps.values()):
+                 # Find the stacker in a pipeline
+                 for step in main_clf.named_steps.values():
+                     if hasattr(step, 'named_estimators_'):
+                         stacker = step
+                         break
+            
+            if stacker:
+                agreement_count = 0
+                estimators = list(stacker.named_estimators_.values())
+                for est in estimators:
+                    # Pipeline unwrap if needed
+                    est_actual = est.named_steps.get(list(est.named_steps.keys())[-1]) if hasattr(est, 'named_steps') else est
+                    try:
+                        est_probs = est_actual.predict_proba(features_final)[0]
+                        # Check if this estimator predicts the SAME class as the ensemble argmax
+                        est_pred = np.argmax(est_probs)
+                        if est_pred == prediction:
+                            agreement_count += 1
+                    except: pass
+                
+                if len(estimators) > 0:
+                    base_agreement = agreement_count / len(estimators)
+                    logger.debug(f"Base Stacker Agreement: {base_agreement*100:.1f}% ({agreement_count}/{len(estimators)})")
+        except Exception as e:
+            logger.debug(f"Could not calculate base agreement: {e}")
 
         result = {
             'action': action,
             'confidence': confidence,
             'probabilities': prob_dict,
-            'meta_confidence': meta_confidence
+            'meta_confidence': meta_confidence,
+            'base_agreement': base_agreement
         }
         
         # Add explanation if available
@@ -3935,51 +3979,42 @@ class StockPredictionML:
                         try:
                             with open(regime_ml.metadata_file, 'r') as f:
                                 regime_own_metadata = json.load(f)
-                                # Extract selected_features and other info from regime's own metadata
-                                if 'selected_features' in regime_own_metadata:
-                                    regime_metadata['selected_features'] = regime_own_metadata['selected_features']
-                                if 'selected_feature_names' in regime_own_metadata:
-                                    regime_metadata['selected_feature_names'] = regime_own_metadata['selected_feature_names']
-                                if 'scaler_n_features' in regime_own_metadata:
-                                    regime_metadata['scaler_n_features'] = regime_own_metadata['scaler_n_features']
-                                if 'train_accuracy' in regime_own_metadata:
-                                    regime_metadata['train_accuracy'] = regime_own_metadata['train_accuracy']
-                                if 'test_accuracy' in regime_own_metadata:
-                                    regime_metadata['test_accuracy'] = regime_own_metadata['test_accuracy']
+                                # Merge relevant fields
+                                for k in ['selected_features', 'selected_feature_names', 'scaler_n_features', 'train_accuracy', 'test_accuracy']:
+                                    if k in regime_own_metadata:
+                                        regime_metadata[k] = regime_own_metadata[k]
                                 logger.debug(f"Loaded regime metadata from {regime_ml.metadata_file.name}")
                         except Exception as e:
                             logger.debug(f"Could not load regime metadata from {regime_ml.metadata_file.name}: {e}")
 
-                    
                     regime_ml.metadata = regime_metadata if regime_metadata else {}
-                    regime_ml.train_accuracy = regime_metadata.get('train_accuracy', 0) if regime_metadata else 0
-                    regime_ml.test_accuracy = regime_metadata.get('test_accuracy', 0) if regime_metadata else 0
+                    regime_ml.train_accuracy = regime_metadata.get('train_accuracy', 0)
+                    regime_ml.test_accuracy = regime_metadata.get('test_accuracy', 0)
                     
-                    # Load selected features if available
-                    # First try from regime-specific metadata (from main metadata or regime's own file)
-                    if regime_metadata and 'selected_features' in regime_metadata:
+                    # CRITICAL FIX: Ensure selected_features is loaded into the regime_ml object
+                    if 'selected_features' in regime_metadata:
                         regime_ml.selected_features = np.array(regime_metadata['selected_features'])
-                        logger.info(f"Loaded selected_features for {regime} regime: {len(regime_ml.selected_features)} features")
-                    # Then try from main metadata's regime_metadata section
-                    elif self.metadata and 'regime_metadata' in self.metadata:
-                        regime_meta = self.metadata['regime_metadata'].get(regime, {})
-                        if 'selected_features' in regime_meta:
-                            regime_ml.selected_features = np.array(regime_meta['selected_features'])
-                            logger.info(f"Loaded selected_features for {regime} regime from main metadata: {len(regime_ml.selected_features)} features")
-                        else:
-                            # Fallback to main model's selected features
-                            regime_ml.selected_features = self.selected_features if hasattr(self, 'selected_features') and self.selected_features is not None else None
-                            if regime_ml.selected_features is not None:
-                                logger.debug(f"Using main model's selected_features for {regime} regime: {len(regime_ml.selected_features)} features")
-                            else:
-                                logger.warning(f"No selected_features found for {regime} regime. Feature selection may not work correctly.")
+                        logger.info(f"✅ Loaded {len(regime_ml.selected_features)} selected_features for {regime} regime model")
                     else:
-                        # Fallback to main model's selected features
-                        regime_ml.selected_features = self.selected_features if hasattr(self, 'selected_features') and self.selected_features is not None else None
+                        # FALLBACK: If regime model exists but has no selection, it MUST use the main model's selection
+                        # to avoid input-shape mismatch and garbage-slicing.
+                        regime_ml.selected_features = self.selected_features if hasattr(self, 'selected_features') else None
                         if regime_ml.selected_features is not None:
-                            logger.debug(f"Using main model's selected_features for {regime} regime: {len(regime_ml.selected_features)} features")
+                            logger.info(f"ℹ️ {regime} regime model inheriting {len(regime_ml.selected_features)} selected_features from main model")
                         else:
-                            logger.warning(f"No selected_features found for {regime} regime. Feature selection may not work correctly.")
+                            logger.warning(f"⚠️ No selected_features found for {regime} or main model")
+
+                    # Verify model is actually fitted (check for specific attributes)
+                    is_fitted = False
+                    if hasattr(regime_ml.model, 'n_features_in_'):
+                        is_fitted = True
+                    elif hasattr(regime_ml.model, 'classes_'):
+                        is_fitted = True
+                        
+                    if not is_fitted:
+                        logger.warning(f"⚠️ {regime} model appears to be UN-FITTED. Predictions will be random/default.")
+
+                    self.regime_models[regime] = regime_ml
                     
                     # Verify the model loaded correctly
                     if regime_ml.model is None:

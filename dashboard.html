@@ -108,6 +108,31 @@
                 </div>
             </div>
 
+            <!-- Module Performance Card -->
+            <div class="glass p-6 rounded-2xl">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="font-semibold text-lg flex items-center gap-2">
+                        <i data-lucide="activity" class="w-5 h-5 text-teal-400"></i> Module Performance
+                    </h2>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <div class="flex items-center justify-between">
+                            <p class="text-[10px] text-slate-400 lowercase">Trend Changes</p>
+                            <p id="trend-verified" class="text-[10px] text-slate-500">0 signals</p>
+                        </div>
+                        <p id="trend-accuracy" class="text-xl font-bold text-blue-400">--%</p>
+                    </div>
+                    <div>
+                        <div class="flex items-center justify-between">
+                            <p class="text-[10px] text-slate-400 lowercase">Momentum</p>
+                            <p id="momentum-verified" class="text-[10px] text-slate-500">0 signals</p>
+                        </div>
+                        <p id="momentum-accuracy" class="text-xl font-bold text-blue-400">--%</p>
+                    </div>
+                </div>
+            </div>
+
             <!-- New Star Accuracy Card -->
             <div class="glass p-6 rounded-2xl">
                 <div class="flex items-center justify-between mb-4">
@@ -308,6 +333,27 @@
                     if (stats.accuracy >= 65) accEl.className = 'text-xl font-bold text-emerald-400';
                     else if (stats.accuracy >= 50) accEl.className = 'text-xl font-bold text-blue-400';
                     else accEl.className = 'text-xl font-bold text-rose-400';
+
+                    // Update Module Performance
+                    if (document.getElementById('trend-accuracy')) {
+                        document.getElementById('trend-accuracy').textContent = `${Math.round(stats.trend_accuracy || 0)}%`;
+                        document.getElementById('trend-verified').textContent = `${stats.trend_verified || 0} signals`;
+
+                        const trEl = document.getElementById('trend-accuracy');
+                        if ((stats.trend_accuracy || 0) >= 60) trEl.className = 'text-xl font-bold text-emerald-400';
+                        else if ((stats.trend_accuracy || 0) >= 50) trEl.className = 'text-xl font-bold text-blue-400';
+                        else trEl.className = 'text-xl font-bold text-rose-400';
+                    }
+
+                    if (document.getElementById('momentum-accuracy')) {
+                        document.getElementById('momentum-accuracy').textContent = `${Math.round(stats.momentum_accuracy || 0)}%`;
+                        document.getElementById('momentum-verified').textContent = `${stats.momentum_verified || 0} signals`;
+
+                        const moEl = document.getElementById('momentum-accuracy');
+                        if ((stats.momentum_accuracy || 0) >= 60) moEl.className = 'text-xl font-bold text-emerald-400';
+                        else if ((stats.momentum_accuracy || 0) >= 50) moEl.className = 'text-xl font-bold text-blue-400';
+                        else moEl.className = 'text-xl font-bold text-rose-400';
+                    }
                 }
 
                 // 2. Predictions Table
@@ -631,17 +677,21 @@
             if (!history || history.length === 0) return;
 
             const buckets = {
-                yellow: { total: 0, correct: 0, label: 'High Condфиence', icon: 'text-yellow-400', iconName: 'star' }, // >80%
-                purple: { total: 0, correct: 0, label: 'Consensus', icon: 'text-purple-500', iconName: 'users' }, // Agree
-                red: { total: 0, correct: 0, label: 'Reversal', icon: 'text-red-500', iconName: 'refresh-ccw' }, // Reversal
-                // Combinations
-                golden: { total: 0, correct: 0, label: 'Golden (Yellow+Red)', icon: 'text-orange-400', iconName: 'trophy' }
+                yellow: { total: 0, correct: 0, label: 'High Confidence', icon: 'text-yellow-400', iconName: 'star' },
+                purple: { total: 0, correct: 0, label: 'Consensus', icon: 'text-purple-500', iconName: 'users' },
+                red: { total: 0, correct: 0, label: 'Reversal', icon: 'text-red-500', iconName: 'refresh-ccw' },
+                // Pair Combinations
+                golden: { total: 0, correct: 0, label: 'Yellow + Red', icon: 'text-orange-400', iconName: 'trophy' },
+                yp: { total: 0, correct: 0, label: 'Yellow + Purple', icon: 'text-amber-300', iconName: 'award' },
+                pr: { total: 0, correct: 0, label: 'Purple + Red', icon: 'text-fuchsia-400', iconName: 'flame' },
+                // Triple
+                triple: { total: 0, correct: 0, label: 'Triple Star', icon: 'text-cyan-300', iconName: 'crown' }
             };
 
             history.forEach(pred => {
                 if (!pred.verified) return;
 
-                const rec = pred.recommendation || pred; // Handle both formats
+                const rec = pred.recommendation || pred;
                 const confidence = rec.confidence || pred.confidence || 0;
 
                 let reasoning = pred.reasoning || '';
@@ -651,7 +701,6 @@
                 const action = pred.action;
                 const isCorrect = pred.was_correct;
 
-                // Identification Logic (Same as table)
                 const isYellow = confidence > 80;
                 const isPurple = reasoning.includes('both methods agree');
                 const isRed = action === 'BUY' && (
@@ -662,23 +711,16 @@
                     reasoning.includes('rebound')
                 );
 
-                // Update Buckets
-                if (isYellow) {
-                    buckets.yellow.total++;
-                    if (isCorrect) buckets.yellow.correct++;
-                }
-                if (isPurple) {
-                    buckets.purple.total++;
-                    if (isCorrect) buckets.purple.correct++;
-                }
-                if (isRed) {
-                    buckets.red.total++;
-                    if (isCorrect) buckets.red.correct++;
-                }
-                if (isYellow && isRed) {
-                    buckets.golden.total++;
-                    if (isCorrect) buckets.golden.correct++;
-                }
+                // Singles
+                if (isYellow) { buckets.yellow.total++; if (isCorrect) buckets.yellow.correct++; }
+                if (isPurple) { buckets.purple.total++; if (isCorrect) buckets.purple.correct++; }
+                if (isRed) { buckets.red.total++; if (isCorrect) buckets.red.correct++; }
+                // Pairs
+                if (isYellow && isRed) { buckets.golden.total++; if (isCorrect) buckets.golden.correct++; }
+                if (isYellow && isPurple) { buckets.yp.total++; if (isCorrect) buckets.yp.correct++; }
+                if (isPurple && isRed) { buckets.pr.total++; if (isCorrect) buckets.pr.correct++; }
+                // Triple
+                if (isYellow && isPurple && isRed) { buckets.triple.total++; if (isCorrect) buckets.triple.correct++; }
             });
 
             // Render
@@ -698,6 +740,9 @@
                 else if (key === 'purple') iconHtml = '<i data-lucide="star" class="w-3 h-3 text-purple-500 fill-purple-500"></i>';
                 else if (key === 'red') iconHtml = '<i data-lucide="star" class="w-3 h-3 text-red-500 fill-red-500"></i>';
                 else if (key === 'golden') iconHtml = '<div class="flex"><i data-lucide="star" class="w-3 h-3 text-yellow-400 fill-yellow-400"></i><i data-lucide="star" class="w-3 h-3 text-red-500 fill-red-500 -ml-1"></i></div>';
+                else if (key === 'yp') iconHtml = '<div class="flex"><i data-lucide="star" class="w-3 h-3 text-yellow-400 fill-yellow-400"></i><i data-lucide="star" class="w-3 h-3 text-purple-500 fill-purple-500 -ml-1"></i></div>';
+                else if (key === 'pr') iconHtml = '<div class="flex"><i data-lucide="star" class="w-3 h-3 text-purple-500 fill-purple-500"></i><i data-lucide="star" class="w-3 h-3 text-red-500 fill-red-500 -ml-1"></i></div>';
+                else if (key === 'triple') iconHtml = '<div class="flex"><i data-lucide="star" class="w-3 h-3 text-yellow-400 fill-yellow-400"></i><i data-lucide="star" class="w-3 h-3 text-purple-500 fill-purple-500 -ml-1"></i><i data-lucide="star" class="w-3 h-3 text-red-500 fill-red-500 -ml-1"></i></div>';
 
                 container.innerHTML += `
                     <div class="flex items-center justify-between text-xs">

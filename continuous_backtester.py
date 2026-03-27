@@ -17,11 +17,7 @@ import time
 from data_fetcher import StockDataFetcher
 from hybrid_predictor import HybridStockPredictor
 
-# Import Quant Settings
-try:
-    from quant_config import IS_QUANT_MODE
-except ImportError:
-    IS_QUANT_MODE = False
+from config import IS_QUANT_MODE
 
 # Import benchmarking if available
 try:

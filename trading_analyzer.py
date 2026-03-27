@@ -1042,14 +1042,20 @@ class TradingAnalyzer:
 
         # --- NEW: Sentiment & Macro Adjustments ---
         
-        # Sentiment
+        # Sentiment (graduated impact based on strength)
         if sentiment_info and sentiment_info.get('available'):
             sent_adj = self.sentiment_analyzer.get_sentiment_context(sentiment_info)
-            if sent_adj['confidence_adjustment'] != 0:
-                 # Adjust score based on conf adjustment? Or just add reasoning
-                 # Modifying score directly for cleaner impact
-                 if sent_adj['confidence_adjustment'] > 0: score += 1
-                 elif sent_adj['confidence_adjustment'] < 0: score -= 1
+            conf_adj = sent_adj['confidence_adjustment']
+            if conf_adj != 0:
+                 # Graduated score impact: strong sentiment = ±2, moderate = ±1
+                 if conf_adj >= 5:
+                     score += 2  # Strong positive
+                 elif conf_adj > 0:
+                     score += 1  # Moderate positive
+                 elif conf_adj <= -5:
+                     score -= 2  # Strong negative
+                 elif conf_adj < 0:
+                     score -= 1  # Moderate negative
                  reasons.extend(sent_adj['reasoning'])
                  
         # Macro Regime

@@ -39,6 +39,10 @@ except ImportError:
             except: return default
 
 from config import PREDICTIONS_FILE, STATE_FILE, PORTFOLIO_FILE
+from trend_change_tracker import TrendChangeTracker
+from momentum_monitor import MomentumMonitor
+
+DATA_DIR = PREDICTIONS_FILE.parent
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -116,13 +120,29 @@ def get_state():
             except:
                 is_stale = True
 
+        # Load Trend and Momentum Stats
+        try:
+            trend_tracker = TrendChangeTracker(DATA_DIR)
+            momentum_monitor = MomentumMonitor(DATA_DIR)
+            
+            trend_stats = trend_tracker.get_statistics()
+            momentum_stats = momentum_monitor.get_statistics()
+        except Exception as e:
+            logger.error(f"Error loading side-tracker stats: {e}")
+            trend_stats = {"accuracy": 0, "verified": 0, "active": 0}
+            momentum_stats = {"accuracy": 0, "verified": 0, "active": 0}
+
         # [FIX] FORCE dynamic stats if state is stale OR just to be safe (Audit Trail > Cache)
         # We always trust the predictions.json for the cognitive health score
         state["stats"] = {
             "accuracy": accuracy,
             "verified": len(verified_preds),
             "active": len(active),
-            "recent_accuracy": accuracy
+            "recent_accuracy": accuracy,
+            "trend_accuracy": trend_stats.get('accuracy', 0),
+            "trend_verified": trend_stats.get('verified', 0),
+            "momentum_accuracy": momentum_stats.get('accuracy', 0),
+            "momentum_verified": momentum_stats.get('verified', 0)
         }
 
         # [FIX] If state is stale, the 'predictions' dict (Real-time signals) is also old.
