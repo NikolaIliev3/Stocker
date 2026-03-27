@@ -115,7 +115,17 @@ class PredictionsTracker:
         if action in ("HOLD", "AVOID"):
             logger.info(f"⏭️ Skipping {action} for {symbol} — veto signal, not stored.")
             return None
-        
+            
+        # --- QUANT MODE HARD ENFORCEMENT ---
+        # Catch any predictions that bypassed the hybrid_predictor's filters
+        # (e.g., from main.py's consensus upgrades)
+        if action == "SELL":
+             logger.info(f"🛑 ELITE VETO (Tracker): Suppressing {symbol} SELL ({confidence}%) - Long-Only Strategy. Not saved.")
+             return None
+             
+        if action == "BUY" and confidence < 80.0:
+             logger.info(f"🛡️ PROTECTION (Tracker): Suppressing {symbol} BUY ({confidence}% < 80.0%). Not saved.")
+             return None
         # Calculate estimated target date based on strategy if not provided
         if estimated_days is None:
             if strategy == "trading":
