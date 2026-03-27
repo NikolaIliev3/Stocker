@@ -451,7 +451,7 @@
 
                     // Star Indicator Logic (Dual Stars)
                     let starsHtml = '';
-                    let reasoning = pred.reasoning || '';
+                    let reasoning = pred.reasoning || (rec && rec.reasoning) || (rec && rec.description) || '';
                     if (Array.isArray(reasoning)) reasoning = reasoning.join(' ');
                     reasoning = reasoning.toLowerCase();
 
@@ -626,8 +626,9 @@
 
             // Reasoning (Handle format)
             const reasoningEl = document.getElementById('modal-reasoning');
-            // Clean up the text a bit if needed, or display as is
-            let text = pred.reasoning || "No detailed reasoning available.";
+            // Check top level, then recommendation level, then description alias
+            let text = pred.reasoning || (rec && rec.reasoning) || (rec && rec.description) || "No detailed reasoning available.";
+            
             if (Array.isArray(text)) {
                 reasoningEl.innerHTML = text.map(t => `<div class="mb-2">• ${t}</div>`).join('');
             } else {
@@ -694,7 +695,7 @@
                 const rec = pred.recommendation || pred;
                 const confidence = rec.confidence || pred.confidence || 0;
 
-                let reasoning = pred.reasoning || '';
+                let reasoning = pred.reasoning || (rec && rec.reasoning) || (rec && rec.description) || '';
                 if (Array.isArray(reasoning)) reasoning = reasoning.join(' ');
                 reasoning = reasoning.toLowerCase();
 
