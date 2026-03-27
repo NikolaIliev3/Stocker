@@ -8968,33 +8968,101 @@ Confidence: {prediction['confidence']:.0f}%
             logger.error(f"Error opening dashboard: {e}")
             messagebox.showerror("Error", f"Could not open dashboard: {e}")
 
+    def _get_local_commit_sha(self):
+        """Get the local commit SHA, trying git first then falling back to version.txt"""
+        import subprocess
+        # Try git first
+        try:
+            result = subprocess.run(["git", "rev-parse", "HEAD"], 
+                                   capture_output=True, text=True, check=True,
+                                   cwd=str(Path(__file__).parent))
+            sha = result.stdout.strip()
+            if sha:
+                # Also update version.txt so non-git users have it after updates
+                self._save_local_commit_sha(sha)
+                return sha
+        except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+            pass  # git not available, fall back to version.txt
+        
+        # Fall back to version.txt
+        version_file = Path(__file__).parent / "version.txt"
+        if version_file.exists():
+            return version_file.read_text().strip()
+        return None
+    
+    def _get_local_branch(self):
+        """Get the current branch name, trying git first then falling back to default"""
+        import subprocess
+        try:
+            result = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                                   capture_output=True, text=True, check=True,
+                                   cwd=str(Path(__file__).parent))
+            branch = result.stdout.strip()
+            if branch:
+                # Save branch name for non-git users
+                branch_file = Path(__file__).parent / "branch.txt"
+                branch_file.write_text(branch)
+                return branch
+        except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+            pass
+        
+        # Fall back to branch.txt
+        branch_file = Path(__file__).parent / "branch.txt"
+        if branch_file.exists():
+            return branch_file.read_text().strip()
+        return "Trend-Change-Predictions"  # Default branch
+    
+    def _save_local_commit_sha(self, sha):
+        """Save the commit SHA to version.txt for non-git users"""
+        try:
+            version_file = Path(__file__).parent / "version.txt"
+            version_file.write_text(sha)
+        except Exception as e:
+            logger.debug(f"Could not save version.txt: {e}")
+
     def _check_for_updates(self, automatic=False):
-        """Check for updates on GitHub in a background thread"""
+        """Check for updates on GitHub in a background thread (works without git)"""
         def check():
             try:
-                # Get current branch
-                branch_cmd = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], 
-                                         capture_output=True, text=True, check=True)
-                current_branch = branch_cmd.stdout.strip()
+                import urllib.request
+                import json
                 
-                # Fetch remote updates
-                subprocess.run(["git", "fetch", "origin"], check=True, capture_output=True)
+                REPO_OWNER = "NikolaIliev3"
+                REPO_NAME = "Stocker"
                 
-                # Compare local and remote
-                local_cmd = subprocess.run(["git", "rev-parse", "HEAD"], 
-                                        capture_output=True, text=True, check=True)
-                remote_cmd = subprocess.run(["git", "rev-parse", f"origin/{current_branch}"], 
-                                         capture_output=True, text=True, check=True)
+                current_branch = self._get_local_branch()
+                local_sha = self._get_local_commit_sha()
                 
-                local_sha = local_cmd.stdout.strip()
-                remote_sha = remote_cmd.stdout.strip()
+                if not local_sha:
+                    if not automatic:
+                        self.root.after(0, lambda: messagebox.showwarning("Update Check", 
+                            "Could not determine current version.\n\n"
+                            "This may happen on first run. The version will be saved after the next update."))
+                    return
+                
+                # Use GitHub API to get latest commit on the branch
+                api_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/commits/{current_branch}"
+                req = urllib.request.Request(api_url, headers={
+                    "Accept": "application/vnd.github.v3+json",
+                    "User-Agent": "Stocker-App"
+                })
+                
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    data = json.loads(response.read().decode())
+                    remote_sha = data.get("sha", "")
+                
+                if not remote_sha:
+                    raise ValueError("Could not get remote commit SHA from GitHub API")
                 
                 if local_sha != remote_sha:
                     # Update available
+                    commit_msg = data.get("commit", {}).get("message", "").split("\n")[0][:80]
                     def prompt_user():
                         if messagebox.askyesno("Update Available", 
-                                             f"A new update is available on branch '{current_branch}'.\n\nWould you like to download and restart the app?"):
-                            self._apply_update(current_branch)
+                                             f"A new update is available on branch '{current_branch}'.\n\n"
+                                             f"Latest change: {commit_msg}\n\n"
+                                             f"Would you like to download and restart the app?"):
+                            self._apply_update(current_branch, remote_sha)
                     
                     self.root.after(0, prompt_user)
                 elif not automatic:
@@ -9012,15 +9080,87 @@ Confidence: {prediction['confidence']:.0f}%
         thread.daemon = True
         thread.start()
 
-    def _apply_update(self, branch):
-        """Pull updates and restart the app"""
+    def _apply_update(self, branch, remote_sha=None):
+        """Pull updates and restart the app (tries git, falls back to ZIP download)"""
+        import subprocess
+        
+        # Try git pull first (fastest and cleanest)
         try:
-            # Pull updates
             pull_cmd = subprocess.run(["git", "pull", "origin", branch], 
-                                    capture_output=True, text=True, check=True)
-            logger.info(f"Update pulled successfully: {pull_cmd.stdout}")
+                                    capture_output=True, text=True, check=True,
+                                    cwd=str(Path(__file__).parent))
+            logger.info(f"Update pulled successfully via git: {pull_cmd.stdout}")
             
-            # Show success and restart
+            # Update stored SHA
+            if remote_sha:
+                self._save_local_commit_sha(remote_sha)
+            
+            messagebox.showinfo("Update Successful", "Update downloaded successfully. The app will now restart.")
+            python = sys.executable
+            os.execv(python, [python] + sys.argv)
+            return
+        except (FileNotFoundError, OSError):
+            logger.info("Git not available, falling back to ZIP download")
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Git pull failed: {e.stderr}, falling back to ZIP download")
+        
+        # Fallback: Download ZIP from GitHub and extract
+        try:
+            import urllib.request
+            import zipfile
+            import io
+            import shutil
+            
+            REPO_OWNER = "NikolaIliev3"
+            REPO_NAME = "Stocker"
+            
+            zip_url = f"https://github.com/{REPO_OWNER}/{REPO_NAME}/archive/refs/heads/{branch}.zip"
+            
+            messagebox.showinfo("Downloading Update", 
+                              "Downloading update... This may take a moment.\n\nThe app will restart when complete.")
+            
+            req = urllib.request.Request(zip_url, headers={"User-Agent": "Stocker-App"})
+            with urllib.request.urlopen(req, timeout=60) as response:
+                zip_data = response.read()
+            
+            app_dir = Path(__file__).parent
+            
+            # Extract ZIP to a temp directory
+            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+                # The ZIP contains a top-level folder like "Stocker-branch-name/"
+                top_level = zf.namelist()[0].split("/")[0]
+                
+                # Extract and copy files, skipping data/model directories to preserve user data
+                preserve_dirs = {'data', 'models', 'ml_models', '__pycache__', '.git', 'logs'}
+                preserve_files = {'version.txt', 'branch.txt'}
+                
+                for member in zf.namelist():
+                    # Get the relative path after the top-level directory
+                    rel_path = member[len(top_level) + 1:]  # Strip "Stocker-branch-name/"
+                    if not rel_path:
+                        continue
+                    
+                    # Skip preserved directories
+                    first_part = rel_path.split("/")[0]
+                    if first_part in preserve_dirs:
+                        continue
+                    
+                    dest_path = app_dir / rel_path
+                    
+                    if member.endswith("/"):
+                        # Directory
+                        dest_path.mkdir(parents=True, exist_ok=True)
+                    else:
+                        # File
+                        dest_path.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(member) as src, open(dest_path, 'wb') as dst:
+                            dst.write(src.read())
+            
+            # Update stored SHA
+            if remote_sha:
+                self._save_local_commit_sha(remote_sha)
+            
+            logger.info("Update applied successfully via ZIP download")
             messagebox.showinfo("Update Successful", "Update downloaded successfully. The app will now restart.")
             
             # Restart the app
