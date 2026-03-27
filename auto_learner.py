@@ -207,11 +207,16 @@ class AutoLearner:
                                 estimated_days=estimated_days
                             )
                             
+                            if prediction is None:
+                                logger.info(f"⏭️ Auto-learner vetoed {symbol} ({action}, {confidence:.1f}%)")
+                                continue
+                            
                             # Mark as recently predicted
                             self.recently_predicted[symbol] = datetime.now()
                             
                             predictions_made += 1
                             logger.info(f"✅ Auto-learner: Made prediction #{prediction['id']} for {symbol} ({strategy}, {confidence:.1f}% confidence)")
+
                             
                         except Exception as e:
                             logger.error(f"Error making auto-prediction for {rec.get('symbol', 'unknown')}: {e}")

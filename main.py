@@ -3090,6 +3090,10 @@ class StockerApp:
             atr_percent=atr_percent
         )
         
+        if prediction is None:
+            messagebox.showinfo("Prediction Vetoed", f"Prediction for {self.current_symbol} was blocked by Quant Filters (e.g., SELL or <80% confidence).")
+            return
+        
         # Format target date for display
         from datetime import datetime, timedelta
         target_date = datetime.now() + timedelta(days=estimated_days)
@@ -4293,6 +4297,12 @@ class StockerApp:
                         market_regime=rec.get('market_regime', 'unknown'),
                         atr_percent=atr_percent
                     )
+                    
+                    if prediction is None:
+                        self.root.after(0, self._append_firing_result, 
+                                      f"⏭️ {symbol}: Vetoed by Quant Filters ({action}, {(confidence or 0):.1f}%)\n")
+                        continue
+                        
                     predictions_created += 1
                     self.root.after(0, self._append_firing_result, 
                                   f"✅ {symbol}: Prediction #{prediction['id']} ({action}, {(confidence or 0):.1f}%)\n")
@@ -8031,7 +8041,11 @@ Confidence: {prediction['confidence']:.0f}%
                         market_regime=analysis.get('market_regime', 'unknown'),
                         atr_percent=atr_percent
                     )
-                    logger.info(f"Auto-saved prediction #{prediction['id']} for {symbol} (target date: {prediction.get('estimated_target_date', 'N/A')})")
+                    
+                    if prediction is None:
+                        logger.info(f"Auto-save vetoed by Quant Filters for {symbol}")
+                    else:
+                        logger.info(f"Auto-saved prediction #{prediction['id']} for {symbol} (target date: {prediction.get('estimated_target_date', 'N/A')})")
                     
                     # Add to monitoring (already added above, but ensure it's updated)
                     self.stock_monitor.add_stock(symbol, action, strategy, confidence)
