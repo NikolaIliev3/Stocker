@@ -29,22 +29,22 @@ except ImportError:
     HAS_SECTOR_ML = False
 
 # Import configuration
-# Logger must be initialized before using it in try/except block
 logger = logging.getLogger(__name__)
 
-# Import Quant Mode Overrides (High Accuracy)
-try:
-    from quant_config import ML_HIGH_ACCURACY_THRESHOLD, ML_LABEL_THRESHOLD, ML_RF_N_ESTIMATORS
-    IS_QUANT_MODE = True
-    logger.info("🎯 Quant Mode Active: High Accuracy Thresholds Loaded")
-except ImportError:
-    # Standard Configuration
-    from config import (ML_HIGH_ACCURACY_THRESHOLD, ML_VERY_HIGH_ACCURACY_THRESHOLD,
-                   ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD, ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL,
-                   ML_PERFORMANCE_HISTORY_LIMIT, ML_RECENT_PERFORMANCE_WINDOW,
-                   ML_ENSEMBLE_WEIGHT_UPDATE_THRESHOLD, ML_ENSEMBLE_WEIGHT_MAX,
-                   AI_PREDICTOR_ENABLED, LLM_AI_PREDICTOR_ENABLED)
-    IS_QUANT_MODE = False
+from config import (
+    IS_QUANT_MODE, ML_HIGH_ACCURACY_THRESHOLD, ML_VERY_HIGH_ACCURACY_THRESHOLD,
+    ML_LABEL_THRESHOLD, ML_RF_N_ESTIMATORS, ML_RF_MIN_SAMPLES_LEAF, 
+    ML_GB_LEARNING_RATE, ML_GB_N_ESTIMATORS,
+    ML_PERFORMANCE_ACCURACY_DIFF_THRESHOLD, ML_CONFIDENCE_DIFF_THRESHOLD_NORMAL,
+    ML_PERFORMANCE_HISTORY_LIMIT, ML_RECENT_PERFORMANCE_WINDOW,
+    ML_ENSEMBLE_WEIGHT_UPDATE_THRESHOLD, ML_ENSEMBLE_WEIGHT_MAX,
+    AI_PREDICTOR_ENABLED, LLM_AI_PREDICTOR_ENABLED,
+    BASE_POSITION_SIZE_PCT, MAX_CONCURRENT_POSITIONS, TIME_STOP_DAYS,
+    MIN_PROFIT_TARGET_PCT, MIN_STOP_LOSS_PCT
+)
+
+if IS_QUANT_MODE:
+    logger.info("🎯 Quant Mode Active: High Accuracy Thresholds Loaded from config.py")
 
 
 class HybridStockPredictor:
@@ -165,6 +165,7 @@ class HybridStockPredictor:
     def predict(self, stock_data: dict, history_data: dict, 
                 financials_data: dict = None, is_backtest: bool = False, current_date=None) -> Dict:
         """Make prediction using hybrid approach"""
+        audit_file = self.data_dir / "signal_audit.csv"
         # Check cache first (only if not backtesting)
         symbol = stock_data.get('symbol', '')
         if symbol and not is_backtest:
@@ -372,10 +373,19 @@ class HybridStockPredictor:
                     except Exception as vol_error:
                         pass  # Use default if calculation fails
 
+                # Ensure macro info is present for ML feature extraction
+                macro_info = base_analysis.get('macro_info')
+                if not macro_info and not is_backtest and hasattr(self, 'trading_analyzer') and hasattr(self.trading_analyzer, 'data_fetcher') and self.trading_analyzer.data_fetcher:
+                    try:
+                        macro_info = self.trading_analyzer.data_fetcher.fetch_current_macro_levels()
+                        base_analysis['macro_info'] = macro_info
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch live macro info for ML injection: {e}")
+
                 features = self.feature_extractor.extract_features(
                     stock_data, history_data, financials_data, indicators,
                     market_regime, timeframe_analysis, relative_strength, support_resistance,
-                    None, None, None, volume_analysis, base_analysis.get('macro_info'),
+                    None, None, None, volume_analysis, macro_info,
                     as_of_date=current_date
                 )
                 
@@ -394,6 +404,27 @@ class HybridStockPredictor:
                     if not is_empty:
                         # Safe logging for DataFrame or other types
                         log_features = features.iloc[0].to_dict() if isinstance(features, pd.DataFrame) else "Numpy Array/List"
+                        
+                        # CRITICAL DIAGNOSTIC: Log subset of raw features to check for redundancy
+                        try:
+                            if isinstance(features, pd.DataFrame):
+                                raw_vals = features.values[0]
+                                f_shape = features.shape
+                            elif getattr(features, 'shape', None):
+                                f_shape = features.shape
+                                # If 2D (1, N), take row 0. If 1D (N,), take as is.
+                                raw_vals = features[0] if len(f_shape) > 1 else features
+                            else:
+                                raw_vals = features
+                                f_shape = "unknown"
+                                
+                            feat_names = self.feature_extractor.get_feature_names()
+                            subset_count = min(len(feat_names), len(raw_vals), 10)
+                            subset = {feat_names[i]: raw_vals[i] for i in range(subset_count)}
+                            logger.info(f"📊 RAW FEATURE SUBSET for {symbol}: Shape={f_shape}, Features={subset}")
+                        except Exception as log_err:
+                            logger.error(f"Failed to log feature subset: {log_err}")
+                            
                         logger.info(f"🔍 ML Input Features for {symbol} (Full): {log_features}")
                 # Pass stock_data and history_data for regime-specific model detection
                 ml_prediction = self.ml_predictor.predict(
@@ -491,9 +522,98 @@ class HybridStockPredictor:
             final_prediction['used_sector_model'] = False
             final_prediction['sector'] = None
             final_prediction['sector_fallback_reason'] = sector_fallback_reason
+            
+        # Add atr_percent to recommendation for tracker access
+        if 'recommendation' in final_prediction:
+            vol_data = base_analysis.get('volatility', {})
+            atr_pct = vol_data.get('atr_percent', 0.0)
+            if atr_pct == 0 and 'indicators' in final_prediction:
+                indicators = final_prediction['indicators']
+                price = stock_data.get('price', 0)
+                if 'atr' in indicators and price > 0:
+                    atr_pct = (indicators['atr'] / price) * 100
+            
+            final_prediction['recommendation']['atr_percent'] = atr_pct
         
         # 6. Add Historical Upside Analysis (Phase 5)
         self._add_historical_upside(final_prediction, base_analysis)
+        
+        # Include technical indicators and price action for downstream consumers (e.g. Trend Change Predictor)
+        final_prediction['indicators'] = base_analysis.get('indicators', {})
+        final_prediction['price_action'] = base_analysis.get('price_action', {})
+        final_prediction['momentum_analysis'] = base_analysis.get('momentum_analysis', {})
+        final_prediction['history_data'] = history_data
+
+        # --- QUANT MODE: TWO-GATE VETO ---
+        # Gate 1: Meta-Learner Confidence Floor (≥ 62%)
+        # Gate 2: Base Model Agreement Floor (≥ 2/3 agree)
+        if 'recommendation' in final_prediction and ml_available and ml_prediction:
+            rec = final_prediction['recommendation']
+            final_action = rec.get('action', 'HOLD')
+            
+            if final_action == 'BUY':
+                meta_conf = ml_prediction.get('confidence', 0) / 100
+                base_agree = ml_prediction.get('base_agreement', 1.0)
+                
+                gate1_pass = meta_conf >= 0.62
+                gate2_pass = base_agree >= 0.66
+                
+                if not (gate1_pass and gate2_pass):
+                    veto_reason = []
+                    if not gate1_pass: veto_reason.append(f"Meta-Conf {meta_conf:.2f} < 0.62")
+                    if not gate2_pass: veto_reason.append(f"Base-Agree {base_agree:.2f} < 0.66")
+                    
+                    logger.info(f"🛡️ SIGNAL VETO ({symbol}): {' & '.join(veto_reason)}. (Gate1: {meta_conf:.2f}, Gate2: {base_agree:.2f}). Downgrading to HOLD.")
+                    rec['action'] = 'HOLD'
+                    rec['confidence'] = 50.0
+                    veto_str = f"🛡️ SIGNAL VETO: {', '.join(veto_reason)}."
+                    reasoning_data = rec.get('reasoning', "")
+                    if isinstance(reasoning_data, list):
+                        rec['reasoning'] = [veto_str] + reasoning_data
+                    else:
+                        rec['reasoning'] = veto_str + "\n" + reasoning_data
+
+        # --- SIGNAL AUDIT LOGGING ---
+        try:
+            # --- SIGNAL QUALITY CLASSIFICATION ---
+            # Clean Fire: Confidence > 65% AND 100% Base Agreement
+            # Marginal Fire: Confidence 62%-65% OR 66.7% Base Agreement
+            sig_quality = "N/A"
+            final_rec = final_prediction.get('recommendation', {})
+            final_action = final_rec.get('action', 'HOLD')
+            ml_action = ml_prediction.get('action') if ml_prediction else 'N/A'
+            
+            if final_action == 'BUY' and ml_prediction:
+                ml_conf_val = ml_prediction.get('confidence', 0)
+                ml_agree_val = ml_prediction.get('base_agreement', 0)
+                
+                if ml_conf_val > 65.0 and ml_agree_val >= 1.0:
+                    sig_quality = "CLEAN"
+                    logger.info(f"💎 CLEAN FIRE ({symbol}): Conf {ml_conf_val:.1f}%, Agreement 100%")
+                else:
+                    sig_quality = "MARGINAL"
+                    logger.info(f"⚖️ MARGINAL FIRE ({symbol}): Conf {ml_conf_val:.1f}%, Agreement {ml_agree_val*100:.1f}%")
+            elif ml_action == 'BUY' and final_action == 'HOLD':
+                sig_quality = "VETOED"
+
+            audit_data = {
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'symbol': symbol,
+                'action': final_prediction.get('recommendation', {}).get('action', 'HOLD'),
+                'confidence': final_prediction.get('recommendation', {}).get('confidence', 0),
+                'rule_action': rule_prediction.get('action', 'HOLD'),
+                'ml_action': ml_prediction.get('action', 'HOLD') if ml_prediction else 'N/A',
+                'ml_conf': ml_prediction.get('confidence', 0) if ml_prediction else 0,
+                'base_agreement': ml_prediction.get('base_agreement', 0) if ml_prediction else 0,
+                'signal_quality': sig_quality,
+                'is_backtest': is_backtest
+            }
+            
+            # Simple CSV append
+            df_audit = pd.DataFrame([audit_data])
+            df_audit.to_csv(audit_file, mode='a', header=not audit_file.exists(), index=False)
+        except Exception as e:
+            logger.debug(f"Audit logging failed: {e}")
 
         # Store in cache for future use
         if symbol:
@@ -828,13 +948,15 @@ class HybridStockPredictor:
                         ml_prob_buy /= 100.0
             
             # Rule A: THE GOLDEN SIGNAL (Confluence)
-            # If Rules are very strong AND ML agrees, it's a nearly "guaranteed" winner
+            # If Rules are very strong AND ML agrees, mark as golden but DON'T artificially boost.
+            # [FIX] Removed the 89% boost. This was creating a "wall of 89%" where every stock
+            # in a bull market hit the same ceiling, making the dashboard useless.
+            # Now the natural confidence score speaks for itself.
             if final_confidence >= 80.0 and ml_prob_buy >= 0.60:
-                msg = f"✨ GOLDEN SIGNAL: Rule ({final_confidence:.1f}%) and ML ({ml_prob_buy*100:.1f}%) in high agreement."
+                msg = f"✨ GOLDEN SIGNAL: Both methods agree - high confidence (Rule {final_confidence:.1f}%, ML {ml_prob_buy*100:.1f}%)."
                 logger.info(msg)
                 reasoning += msg + "\n"
-                # We do not return here, we let it pass through with potentially boosted confidence
-                final_confidence = max(final_confidence, 90.0)
+                # No boost — let the natural confidence determine the tier.
             
             # Rule B: THE HARD ML FILTER (Secondary Veto)
             # If Rules approve but ML thinks it's likely a loser/neutral, we VETO
@@ -853,19 +975,26 @@ class HybridStockPredictor:
             # Backtest (2025): Even at 90% confidence, win rate is low in stress.
             # We only allow BUYs if the market is stable (Bull/Sideways and low drawdown).
             # [USER-VERIFIED] 75% Confidence has ~70% Accuracy. Locking this in.
-            min_threshold = 65.0 # Lowered from 75.0 to handle uncalibrated ML base-rate probabilities dragging averages down
+            # [FIX] Raising baseline floor to 85.0 to eliminate noise in bull markets.
+            # Consensus/Reversal signals get a lower bar at 75.0%.
+            is_consensus = final_confidence >= 65 and ml_prob_buy >= 0.55
+            is_reversal = any(kw in reasoning.lower() for kw in ['oversold', 'dip', 'reversal', 'rebound', 'contrarian'])
+            
+            min_threshold = 85.0
+            if is_consensus or is_reversal:
+                min_threshold = 75.0 # Quality signals get a lower bar
             
             if final_confidence < min_threshold:
-                msg = f"🛡️ PROTECTION: Suppressing weak {symbol} BUY ({final_confidence:.1f}% < {min_threshold}%)"
+                msg = f"🛡️ PROTECTION: Suppressing signal {symbol} ({final_confidence:.1f}% < {min_threshold}%)"
                 logger.info(msg)
                 reasoning += msg + "\n"
                 return 'HOLD', 50.0, reasoning
             else:
                 logger.info(f"💎 ELITE TRADE: Executing High-Conviction {symbol} BUY ({final_confidence:.1f}% >= {min_threshold}%)")
                     
-        if final_action == 'BUY' and final_confidence > 80.0 and not is_backtest:
-            logger.debug(f"⚠️ CALIBRATION CAP: Reducing {final_confidence:.1f}% -> 80.0% (Inversion Safeguard)")
-            final_confidence = 80.0
+        # [REMOVED] 80% Calibration Cap for Yellow Star Investigation
+        # Previously, we capped final_confidence at 80.0 to prevent overconfidence bias.
+        # Removing this to allow "Golden Signals" to reach 90%+ and trigger yellow stars.
             
         # 4. FINAL PASS
         if final_action != 'HOLD':
@@ -1251,8 +1380,17 @@ class HybridStockPredictor:
         reasoning += f"Ensemble Weights: {' / '.join(weight_parts)}\n"
         reasoning += f"Final Prediction: {final_action} ({final_confidence:.1f}% confidence)\n"
         
-        # Agreement analysis
-        if rule_action == ml_action:
+        # Agreement analysis — use ml_prob_buy for more accurate consensus detection
+        # ml_confidence can be misleadingly low due to ensemble weighting
+        ml_buy_prob_raw = 0.0
+        if ml_pred and 'probabilities' in ml_pred:
+            probs = ml_pred.get('probabilities', {})
+            if isinstance(probs, dict):
+                ml_buy_prob_raw = probs.get('BUY', probs.get('buy', 0.0))
+                if ml_buy_prob_raw > 1.0:
+                    ml_buy_prob_raw /= 100.0  # Normalize to 0-1
+        
+        if rule_action == ml_action and rule_confidence >= 65 and (ml_confidence >= 55 or ml_buy_prob_raw >= 0.55):
             reasoning += "✓ Both methods agree - high confidence\n"
         else:
             reasoning += "⚠ Methods differ - using weighted consensus\n"

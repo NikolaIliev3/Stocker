@@ -40,3 +40,47 @@ def get_market_status_message():
         return f"Market is closed (Closed at 4:00 PM ET, currently {now_et.strftime('%I:%M %p')} ET)"
     else:
         return "Market is open"
+
+
+def add_trading_days(start_date, trading_days: int):
+    """Add N trading days to a date, skipping weekends and major US holidays.
+    
+    This ensures predictions get the full number of TRADING days to play out,
+    instead of being shortchanged by weekends.
+    
+    Args:
+        start_date: datetime object or date to start from
+        trading_days: Number of trading days to add
+        
+    Returns:
+        datetime with N trading days added
+    """
+    if trading_days <= 0:
+        return start_date
+    
+    # Major US market holidays (month, day) — fixed-date holidays
+    # For floating holidays (Thanksgiving, etc.), we approximate
+    US_HOLIDAYS_FIXED = {
+        (1, 1),   # New Year's Day
+        (1, 15),  # MLK Day (approximate - 3rd Monday)
+        (2, 19),  # Presidents Day (approximate - 3rd Monday)
+        (7, 4),   # Independence Day
+        (9, 1),   # Labor Day (approximate - 1st Monday)
+        (11, 28), # Thanksgiving (approximate - 4th Thursday)
+        (12, 25), # Christmas Day
+    }
+    
+    current = start_date
+    days_added = 0
+    
+    while days_added < trading_days:
+        current += datetime.timedelta(days=1)
+        # Skip weekends (5=Saturday, 6=Sunday)
+        if current.weekday() >= 5:
+            continue
+        # Skip major holidays
+        if (current.month, current.day) in US_HOLIDAYS_FIXED:
+            continue
+        days_added += 1
+    
+    return current

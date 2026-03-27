@@ -1,10 +1,16 @@
 """
 Momentum and Trend Reversal Monitoring System
-Detects changes in momentum and trend reversals for stocks
+Detects changes in momentum and trend reversals for stocks.
+
+Key design principles:
+- Only fire on MEANINGFUL momentum changes (not noise like RSI crossing 50)
+- Require multi-signal confirmation for recommendations
+- Cooldown per symbol to prevent duplicate alerts
+- Verification uses minimum time window and price threshold
 """
 import json
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import logging
 
@@ -14,13 +20,22 @@ logger = logging.getLogger(__name__)
 class MomentumMonitor:
     """Monitors stocks for momentum changes and trend reversals"""
     
+    # Cooldown: don't fire same type of change for same stock within this many hours
+    COOLDOWN_HOURS = 24
+    
+    # Verification settings
+    VERIFY_MIN_HOURS = 72      # Wait at least 3 days before verifying
+    VERIFY_MIN_PRICE_PCT = 2.0  # Minimum 2% price move to count as correct
+    
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.momentum_file = self.data_dir / "momentum_states.json"
         self.history_file = self.data_dir / "momentum_history.json"
+        self.cooldown_file = self.data_dir / "momentum_cooldowns.json"
         self.momentum_states = self._load_states()
         self.history = self._load_history()
+        self.cooldowns = self._load_cooldowns()
     
     def _load_states(self) -> Dict:
         """Load momentum states from file"""
@@ -49,6 +64,42 @@ class MomentumMonitor:
             except Exception as e:
                 logger.error(f"Error loading momentum history: {e}")
         return []
+    
+    def _load_cooldowns(self) -> Dict:
+        """Load cooldown timestamps per symbol+change_type"""
+        if self.cooldown_file.exists():
+            try:
+                with open(self.cooldown_file, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Error loading cooldowns: {e}")
+        return {}
+    
+    def _save_cooldowns(self):
+        """Save cooldown timestamps"""
+        try:
+            with open(self.cooldown_file, 'w') as f:
+                json.dump(self.cooldowns, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving cooldowns: {e}")
+    
+    def _is_on_cooldown(self, symbol: str, change_type: str) -> bool:
+        """Check if a symbol+change_type is on cooldown"""
+        key = f"{symbol.upper()}:{change_type}"
+        last_fire = self.cooldowns.get(key)
+        if not last_fire:
+            return False
+        try:
+            last_time = datetime.fromisoformat(last_fire)
+            return (datetime.now() - last_time).total_seconds() < self.COOLDOWN_HOURS * 3600
+        except:
+            return False
+    
+    def _set_cooldown(self, symbol: str, change_type: str):
+        """Set cooldown for a symbol+change_type"""
+        key = f"{symbol.upper()}:{change_type}"
+        self.cooldowns[key] = datetime.now().isoformat()
+        self._save_cooldowns()
         
     def save_history(self):
         """Save momentum change history to file"""
@@ -64,10 +115,6 @@ class MomentumMonitor:
             
     def add_to_history(self, symbol: str, action: str, changes: dict, strategy: str = 'mixed', current_price: float = None, current_date=None):
         """Add a momentum change event to history"""
-        
-        # Check for duplicates... (logic remains same)
-        # ... 
-        
         entry = {
             'symbol': symbol.upper(),
             'action': action,
@@ -82,7 +129,7 @@ class MomentumMonitor:
         self.save_history()
 
     def verify_history(self, data_fetcher) -> List[Dict]:
-        """Verify past momentum changes"""
+        """Verify past momentum changes with proper time window and price threshold"""
         verified_items = []
         now = datetime.now()
         
@@ -95,56 +142,68 @@ class MomentumMonitor:
                 entry_time = datetime.strptime(entry.get('time', ''), "%Y-%m-%d %H:%M:%S")
             except ValueError:
                 continue
+            
+            elapsed_hours = (now - entry_time).total_seconds() / 3600
                 
-            # Verify after 24 hours
-            if (now - entry_time).total_seconds() >= 24 * 3600:
-                symbol = entry.get('symbol')
-                price_at_change = entry.get('price_at_change')
+            # Verify after minimum window (3 days), not 24 hours
+            if elapsed_hours < self.VERIFY_MIN_HOURS:
+                continue
+            
+            # Auto-expire very old entries (> 30 days)
+            if elapsed_hours > 30 * 24:
+                entry['status'] = 'expired'
+                entry['verified'] = True
+                verified_items.append(entry)
+                continue
                 
-                if not price_at_change:
-                    # Can't verify without original price
-                    entry['status'] = 'expired'
-                    entry['verified'] = True
-                    continue
+            symbol = entry.get('symbol')
+            price_at_change = entry.get('price_at_change')
+            
+            if not price_at_change:
+                entry['status'] = 'expired'
+                entry['verified'] = True
+                continue
+            
+            # Get current price
+            try:
+                current_data = data_fetcher.fetch_stock_data(symbol)
+                current_price = current_data.get('price', 0)
                 
-                # Get current price
-                try:
-                    current_data = data_fetcher.fetch_stock_data(symbol)
-                    current_price = current_data.get('price', 0)
+                if current_price > 0:
+                    recommendation = entry.get('changes', {}).get('recommendation', {})
+                    action = recommendation.get('action', 'HOLD')
                     
-                    if current_price > 0:
-                        recommendation = entry.get('changes', {}).get('recommendation', {})
-                        action = recommendation.get('action', 'HOLD')
-                        
-                        entry['verification_price'] = current_price
-                        entry['verification_time'] = now.strftime("%Y-%m-%d %H:%M:%S")
-                        
-                        # Determine correctness
-                        is_correct = False
-                        
-                        if action == 'BUY' or action == 'STRONG_BUY':
-                            # Correct if price went up
-                            if current_price > price_at_change:
-                                is_correct = True
-                        elif action == 'SELL' or action == 'STRONG_SELL':
-                            # Correct if price went down (assuming looking for lower re-entry or taking profit)
-                            # NOTE: Context matters, but generally SELL means price expected to drop or stay flat
-                            if current_price < price_at_change:
-                                is_correct = True
-                        else:
-                            # HOLD - Neutral, hard to verify automatically without more context
-                            # For now, mark as expired/neutral
-                            entry['status'] = 'neutral'
-                            entry['verified'] = True
-                            continue
-                            
-                        entry['status'] = 'correct' if is_correct else 'incorrect'
+                    entry['verification_price'] = current_price
+                    entry['verification_time'] = now.strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # Calculate price change percentage
+                    price_change_pct = ((current_price - price_at_change) / price_at_change) * 100
+                    entry['price_change_pct'] = round(price_change_pct, 2)
+                    
+                    # Determine correctness with minimum threshold
+                    is_correct = False
+                    
+                    if action in ('BUY', 'STRONG_BUY'):
+                        # Correct only if price rose by at least VERIFY_MIN_PRICE_PCT
+                        if price_change_pct >= self.VERIFY_MIN_PRICE_PCT:
+                            is_correct = True
+                    elif action in ('SELL', 'STRONG_SELL'):
+                        # Correct only if price fell by at least VERIFY_MIN_PRICE_PCT
+                        if price_change_pct <= -self.VERIFY_MIN_PRICE_PCT:
+                            is_correct = True
+                    else:
+                        # HOLD - mark as neutral
+                        entry['status'] = 'neutral'
                         entry['verified'] = True
+                        continue
                         
-                        verified_items.append(entry)
-                        
-                except Exception as e:
-                    logger.error(f"Error verifying momentum history for {symbol}: {e}")
+                    entry['status'] = 'correct' if is_correct else 'incorrect'
+                    entry['verified'] = True
+                    
+                    verified_items.append(entry)
+                    
+            except Exception as e:
+                logger.error(f"Error verifying momentum history for {symbol}: {e}")
         
         if verified_items:
             self.save_history()
@@ -167,23 +226,23 @@ class MomentumMonitor:
     
     def update_momentum_state(self, symbol: str, indicators: dict, price_action: dict, 
                              momentum_analysis: dict, current_date=None) -> Dict:
-        """Update momentum state for a stock and detect changes
+        """Update momentum state for a stock and detect MEANINGFUL changes.
         
-        Args:
-            symbol: Stock symbol
-            indicators: Current technical indicators
-            price_action: Current price action analysis
-            momentum_analysis: Current momentum analysis
-            current_date: Optional as_of_date for deterministic timestamps
-            
-        Returns:
-            Dict with detected changes...
+        Only fires on:
+        - RSI extreme zone transitions (oversold recovery, overbought reversal) — NOT 50-crossings
+        - MACD zero-line crossovers
+        - MFI extreme zone transitions — NOT 50-crossings
+        - Momentum score large shifts (≥5 points AND crossing zero)
+        - Trend reversals (uptrend↔downtrend)
+        - Golden Cross / Death Cross
+        - EMA 50 and EMA 200 crossings (NOT EMA 20 — too noisy)
+        
+        All changes subject to per-symbol cooldown to prevent duplicate alerts.
         """
         symbol_key = self._get_stock_key(symbol)
         
         # Extract current state
         current_state = {
-            # ... (fields remain same)
             'rsi': indicators.get('rsi', 50),
             'macd': indicators.get('macd', 0),
             'macd_signal': indicators.get('macd_signal', 0),
@@ -219,105 +278,126 @@ class MomentumMonitor:
                 'current_state': current_state
             }
         
-        # Check for momentum changes
+        # ── RSI extreme zone transitions ONLY ──
         prev_rsi = previous_state.get('rsi', 50)
         curr_rsi = current_state['rsi']
         
-        # RSI momentum shift (crossing key levels)
+        # RSI recovery from oversold (< 30 → > 40): meaningful signal
         if prev_rsi < 30 and curr_rsi > 40:
-            changes.append("📈 RSI recovered from oversold (momentum shift bullish)")
-            momentum_changed = True
+            if not self._is_on_cooldown(symbol, 'rsi_recovery'):
+                changes.append("📈 RSI recovered from oversold (momentum shift bullish)")
+                momentum_changed = True
+                self._set_cooldown(symbol, 'rsi_recovery')
+        # RSI drop from overbought (> 70 → < 60): meaningful signal
         elif prev_rsi > 70 and curr_rsi < 60:
-            changes.append("📉 RSI dropped from overbought (momentum shift bearish)")
-            momentum_changed = True
-        elif (prev_rsi < 50 and curr_rsi > 50) or (prev_rsi > 50 and curr_rsi < 50):
-            changes.append(f"🔄 RSI crossed 50 level ({prev_rsi:.1f} → {curr_rsi:.1f})")
-            momentum_changed = True
+            if not self._is_on_cooldown(symbol, 'rsi_reversal'):
+                changes.append("📉 RSI dropped from overbought (momentum shift bearish)")
+                momentum_changed = True
+                self._set_cooldown(symbol, 'rsi_reversal')
+        # REMOVED: RSI 50-crossing — this is noise, not a signal
         
-        # MACD momentum change
+        # ── MACD zero-line crossover ──
         prev_macd_diff = previous_state.get('macd_diff', 0)
         curr_macd_diff = current_state['macd_diff']
         
         if prev_macd_diff <= 0 and curr_macd_diff > 0:
-            changes.append("📈 MACD turned bullish (momentum shift)")
-            momentum_changed = True
+            if not self._is_on_cooldown(symbol, 'macd_bullish'):
+                changes.append("📈 MACD turned bullish (momentum shift)")
+                momentum_changed = True
+                self._set_cooldown(symbol, 'macd_bullish')
         elif prev_macd_diff >= 0 and curr_macd_diff < 0:
-            changes.append("📉 MACD turned bearish (momentum shift)")
-            momentum_changed = True
+            if not self._is_on_cooldown(symbol, 'macd_bearish'):
+                changes.append("📉 MACD turned bearish (momentum shift)")
+                momentum_changed = True
+                self._set_cooldown(symbol, 'macd_bearish')
         
-        # MFI momentum change
+        # ── MFI extreme zone transitions ONLY ──
         prev_mfi = previous_state.get('mfi', 50)
         curr_mfi = current_state['mfi']
         
         if prev_mfi < 20 and curr_mfi > 30:
-            changes.append("📈 MFI recovered from oversold (momentum shift bullish)")
-            momentum_changed = True
+            if not self._is_on_cooldown(symbol, 'mfi_recovery'):
+                changes.append("📈 MFI recovered from oversold (momentum shift bullish)")
+                momentum_changed = True
+                self._set_cooldown(symbol, 'mfi_recovery')
         elif prev_mfi > 80 and curr_mfi < 70:
-            changes.append("📉 MFI dropped from overbought (momentum shift bearish)")
-            momentum_changed = True
-        elif (prev_mfi < 50 and curr_mfi > 50) or (prev_mfi > 50 and curr_mfi < 50):
-            changes.append(f"🔄 MFI crossed 50 level ({prev_mfi:.1f} → {curr_mfi:.1f})")
-            momentum_changed = True
+            if not self._is_on_cooldown(symbol, 'mfi_reversal'):
+                changes.append("📉 MFI dropped from overbought (momentum shift bearish)")
+                momentum_changed = True
+                self._set_cooldown(symbol, 'mfi_reversal')
+        # REMOVED: MFI 50-crossing — same noise problem as RSI
         
-        # Momentum score change (significant shift)
+        # ── Momentum score: require large shift AND zone crossing ──
         prev_momentum = previous_state.get('momentum_score', 0)
         curr_momentum = current_state['momentum_score']
         
-        if abs(curr_momentum - prev_momentum) >= 3:
-            direction = "bullish" if curr_momentum > prev_momentum else "bearish"
-            changes.append(f"🔄 Momentum score shifted {direction} ({prev_momentum} → {curr_momentum})")
-            momentum_changed = True
+        # Only fire if: shift ≥ 5 points AND crossed from negative to positive (or vice versa)
+        score_shift = curr_momentum - prev_momentum
+        crossed_zero = (prev_momentum < 0 and curr_momentum > 0) or (prev_momentum > 0 and curr_momentum < 0)
         
-        # Check for trend reversals
+        if abs(score_shift) >= 5 and crossed_zero:
+            direction = "bullish" if curr_momentum > prev_momentum else "bearish"
+            if not self._is_on_cooldown(symbol, f'momentum_{direction}'):
+                changes.append(f"🔄 Momentum score shifted {direction} ({prev_momentum} → {curr_momentum})")
+                momentum_changed = True
+                self._set_cooldown(symbol, f'momentum_{direction}')
+        
+        # ── Trend reversals ──
         prev_trend = previous_state.get('trend', 'sideways')
         curr_trend = current_state['trend']
         
         if prev_trend != curr_trend:
             if (prev_trend == 'uptrend' and curr_trend == 'downtrend') or \
                (prev_trend == 'downtrend' and curr_trend == 'uptrend'):
-                changes.append(f"⚠️ TREND REVERSAL: {prev_trend} → {curr_trend}")
-                trend_reversed = True
+                if not self._is_on_cooldown(symbol, 'trend_reversal'):
+                    changes.append(f"⚠️ TREND REVERSAL: {prev_trend} → {curr_trend}")
+                    trend_reversed = True
+                    self._set_cooldown(symbol, 'trend_reversal')
             else:
-                changes.append(f"🔄 Trend changed: {prev_trend} → {curr_trend}")
-                momentum_changed = True
+                # Sideways transitions are less significant
+                if not self._is_on_cooldown(symbol, 'trend_shift'):
+                    changes.append(f"🔄 Trend changed: {prev_trend} → {curr_trend}")
+                    momentum_changed = True
+                    self._set_cooldown(symbol, 'trend_shift')
         
-        # Golden Cross / Death Cross reversals
+        # ── Golden Cross / Death Cross ──
         prev_golden = previous_state.get('golden_cross', False)
         prev_death = previous_state.get('death_cross', False)
         curr_golden = current_state['golden_cross']
         curr_death = current_state['death_cross']
         
         if prev_death and curr_golden:
-            changes.append("🟢 GOLDEN CROSS detected (major trend reversal to bullish)")
-            trend_reversed = True
+            if not self._is_on_cooldown(symbol, 'golden_cross'):
+                changes.append("🟢 GOLDEN CROSS detected (major trend reversal to bullish)")
+                trend_reversed = True
+                self._set_cooldown(symbol, 'golden_cross')
         elif prev_golden and curr_death:
-            changes.append("🔴 DEATH CROSS detected (major trend reversal to bearish)")
-            trend_reversed = True
+            if not self._is_on_cooldown(symbol, 'death_cross'):
+                changes.append("🔴 DEATH CROSS detected (major trend reversal to bearish)")
+                trend_reversed = True
+                self._set_cooldown(symbol, 'death_cross')
         
-        # EMA position reversals
-        prev_above_20 = previous_state.get('price_above_ema20', False)
+        # ── EMA crossings: only EMA 50 and EMA 200 (EMA 20 is too noisy) ──
         prev_above_50 = previous_state.get('price_above_ema50', False)
         prev_above_200 = previous_state.get('price_above_ema200', False)
-        
-        curr_above_20 = current_state['price_above_ema20']
         curr_above_50 = current_state['price_above_ema50']
         curr_above_200 = current_state['price_above_ema200']
         
-        # Price crossing key EMAs
-        if prev_above_20 != curr_above_20:
-            direction = "above" if curr_above_20 else "below"
-            changes.append(f"🔄 Price crossed EMA 20 ({direction})")
-            momentum_changed = True
+        # REMOVED: EMA 20 crossing — too noisy, fires on routine pullbacks
         
         if prev_above_50 != curr_above_50:
             direction = "above" if curr_above_50 else "below"
-            changes.append(f"🔄 Price crossed EMA 50 ({direction})")
-            momentum_changed = True
+            if not self._is_on_cooldown(symbol, f'ema50_{direction}'):
+                changes.append(f"🔄 Price crossed EMA 50 ({direction})")
+                momentum_changed = True
+                self._set_cooldown(symbol, f'ema50_{direction}')
         
         if prev_above_200 != curr_above_200:
             direction = "above" if curr_above_200 else "below"
-            changes.append(f"⚠️ Price crossed EMA 200 ({direction}) - major trend change")
-            trend_reversed = True
+            if not self._is_on_cooldown(symbol, f'ema200_{direction}'):
+                changes.append(f"⚠️ Price crossed EMA 200 ({direction}) - major trend change")
+                trend_reversed = True
+                self._set_cooldown(symbol, f'ema200_{direction}')
         
         # Determine recommendation based on trend and momentum changes
         recommendation = self._determine_recommendation(
@@ -352,9 +432,13 @@ class MomentumMonitor:
     
     def _determine_recommendation(self, previous_state: dict, current_state: dict, 
                                   trend_reversed: bool, momentum_changed: bool) -> dict:
-        """Determine recommendation based on trend and momentum changes (STANDARD LOGIC)"""
+        """Determine recommendation with MULTI-SIGNAL CONFIRMATION.
+        
+        Requires ≥2 confirming signals to set BUY or SELL.
+        Conflicting signals = HOLD (not just reduced confidence).
+        """
         if not previous_state:
-            return {'action': 'HOLD', 'confidence': 50, 'reason': 'Initial state'}
+            return {'action': 'HOLD', 'confidence': 50, 'reasons': ['Initial state']}
         
         curr_trend = current_state.get('trend', 'sideways')
         prev_trend = previous_state.get('trend', 'sideways')
@@ -365,93 +449,85 @@ class MomentumMonitor:
         golden_cross = current_state.get('golden_cross', False)
         death_cross = current_state.get('death_cross', False)
         
+        # Collect bullish and bearish signals separately
+        bullish_signals = []
+        bearish_signals = []
+        
+        # Trend reversal (strong signal, weight 2)
+        if trend_reversed:
+            if prev_trend == 'downtrend' and curr_trend == 'uptrend':
+                bullish_signals.append(('trend_reversal', 70, "Trend reversed from downtrend to uptrend"))
+            elif prev_trend == 'uptrend' and curr_trend == 'downtrend':
+                bearish_signals.append(('trend_reversal', 70, "Trend reversed from uptrend to downtrend"))
+        
+        # Golden/Death Cross (strong signal)
+        if golden_cross and not previous_state.get('golden_cross', False):
+            bullish_signals.append(('golden_cross', 75, "Golden Cross detected - strong bullish signal"))
+        if death_cross and not previous_state.get('death_cross', False):
+            bearish_signals.append(('death_cross', 75, "Death Cross detected - strong bearish signal"))
+        
+        # RSI extremes
+        if curr_rsi < 30:
+            bullish_signals.append(('rsi_oversold', 65, f"RSI oversold ({curr_rsi:.1f}) - potential recovery"))
+        elif curr_rsi > 70:
+            bearish_signals.append(('rsi_overbought', 65, f"RSI overbought ({curr_rsi:.1f}) - potential pullback"))
+        
+        # MFI extremes
+        if curr_mfi < 20:
+            bullish_signals.append(('mfi_oversold', 60, f"MFI oversold ({curr_mfi:.1f}) - buying pressure"))
+        elif curr_mfi > 80:
+            bearish_signals.append(('mfi_overbought', 60, f"MFI overbought ({curr_mfi:.1f}) - selling pressure"))
+        
+        # MACD + momentum alignment (only if both agree)
+        if curr_macd_diff > 0 and curr_momentum > 0:
+            bullish_signals.append(('macd_momentum', 55, "MACD bullish with positive momentum"))
+        elif curr_macd_diff < 0 and curr_momentum < 0:
+            bearish_signals.append(('macd_momentum', 55, "MACD bearish with negative momentum"))
+        
+        # Strong momentum (must be significant, ≥5)
+        if curr_momentum >= 5:
+            bullish_signals.append(('strong_momentum', 60, "Strong bullish momentum"))
+        elif curr_momentum <= -5:
+            bearish_signals.append(('strong_momentum', 60, "Strong bearish momentum"))
+        
+        # ── Decision: require ≥2 confirming signals ──
         action = 'HOLD'
         confidence = 50
         reasons = []
         
-        # STANDARD LOGIC:
-        # Bullish (Stock rising/recovering) -> BUY (Follow Trend / Dip Buy)
-        # Bearish (Stock falling/overbought) -> SELL (Take Profit / Short)
+        has_bullish = len(bullish_signals) >= 2
+        has_bearish = len(bearish_signals) >= 2
         
-        # Trend reversal analysis
-        if trend_reversed:
-            if prev_trend == 'downtrend' and curr_trend == 'uptrend':
-                action = 'BUY'  # Bullish reversal
-                confidence = 70
-                reasons.append("Trend reversed from downtrend to uptrend (Bullish)")
-            elif prev_trend == 'uptrend' and curr_trend == 'downtrend':
-                action = 'SELL'  # Bearish reversal
-                confidence = 70
-                reasons.append("Trend reversed from uptrend to downtrend (Bearish)")
-        
-        # Golden Cross / Death Cross
-        if golden_cross and not previous_state.get('golden_cross', False):
-            action = 'BUY'  # Bullish
-            confidence = max(confidence, 75)
-            reasons.append("Golden Cross detected - strong bullish signal")
-        elif death_cross and not previous_state.get('death_cross', False):
-            action = 'SELL'  # Bearish
-            confidence = max(confidence, 75)
-            reasons.append("Death Cross detected - strong bearish signal")
-        
-        # RSI analysis
-        if curr_rsi < 30:
-            if action == 'HOLD':
-                action = 'BUY'  # Bullish (Oversold bounce)
-                confidence = 65
-            reasons.append(f"RSI oversold ({curr_rsi:.1f}) - potential recovery")
-        elif curr_rsi > 70:
-            if action == 'HOLD':
-                action = 'SELL'  # Bearish (Overbought pullback)
-                confidence = 65
-            reasons.append(f"RSI overbought ({curr_rsi:.1f}) - potential pullback")
-        
-        # MFI analysis
-        if curr_mfi < 20:
-            if action == 'HOLD':
-                action = 'BUY'  # Bullish
-                confidence = max(confidence, 60)
-            reasons.append(f"MFI oversold ({curr_mfi:.1f}) - buying pressure")
-        elif curr_mfi > 80:
-            if action == 'HOLD':
-                action = 'SELL'  # Bearish
-                confidence = max(confidence, 60)
-            reasons.append(f"MFI overbought ({curr_mfi:.1f}) - selling pressure")
-        
-        # MACD analysis
-        if curr_macd_diff > 0:
-            if action == 'HOLD' and curr_momentum > 0:
-                action = 'BUY'  # Bullish
-                confidence = max(confidence, 55)
-            reasons.append("MACD bullish - upward momentum")
-        elif curr_macd_diff < 0:
-            if action == 'HOLD' and curr_momentum < 0:
-                action = 'SELL'  # Bearish
-                confidence = max(confidence, 55)
-            reasons.append("MACD bearish - downward momentum")
-        
-        # Momentum score
-        if curr_momentum >= 3:
-            if action == 'HOLD':
-                action = 'BUY'  # Bullish
-                confidence = max(confidence, 60)
-            reasons.append("Strong bullish momentum")
-        elif curr_momentum <= -3:
-            if action == 'HOLD':
-                action = 'SELL'  # Bearish
-                confidence = max(confidence, 60)
-            reasons.append("Strong bearish momentum")
-        
-        # If conflicting signals, reduce confidence
-        if (action == 'BUY' and (curr_rsi > 70 or curr_mfi > 80)) or \
-           (action == 'SELL' and (curr_rsi < 30 or curr_mfi < 20)):
-            confidence = max(50, confidence - 15)
-            reasons.append("⚠️ Conflicting signals - reduced confidence")
+        if has_bullish and has_bearish:
+            # Conflicting confirmed signals → HOLD
+            action = 'HOLD'
+            confidence = 50
+            reasons = ["⚠️ Conflicting signals — both bullish and bearish confirmed"]
+        elif has_bullish:
+            action = 'BUY'
+            # Confidence = max of confirming signals, capped at 85
+            confidence = min(85, max(s[1] for s in bullish_signals))
+            # Bonus for more signals
+            if len(bullish_signals) >= 3:
+                confidence = min(85, confidence + 5)
+            reasons = [s[2] for s in bullish_signals[:3]]
+        elif has_bearish:
+            action = 'SELL'
+            confidence = min(85, max(s[1] for s in bearish_signals))
+            if len(bearish_signals) >= 3:
+                confidence = min(85, confidence + 5)
+            reasons = [s[2] for s in bearish_signals[:3]]
+        else:
+            # Not enough signals to make a call
+            action = 'HOLD'
+            confidence = 50
+            all_reasons = [s[2] for s in bullish_signals + bearish_signals]
+            reasons = all_reasons[:2] if all_reasons else ["Insufficient confirming signals"]
         
         return {
             'action': action,
-            'confidence': min(90, confidence),
-            'reasons': reasons[:3]  # Top 3 reasons
+            'confidence': confidence,
+            'reasons': reasons
         }
     
     def get_stock_state(self, symbol: str) -> Optional[Dict]:
@@ -467,24 +543,10 @@ class MomentumMonitor:
             logger.debug(f"Removed momentum monitoring for: {symbol_key}")
     
     def detect_peaks_bottoms(self, symbol: str, price_history: list, indicators: dict) -> Dict:
-        """Detect if price is at a peak or bottom
+        """Detect if price is at a peak or bottom.
         
-        Args:
-            symbol: Stock symbol
-            price_history: List of price data points [{'date': str, 'close': float, 'high': float, 'low': float, 'volume': float}, ...]
-            indicators: Current technical indicators
-            
-        Returns:
-            Dict with peak/bottom detection:
-            {
-                'peak_detected': bool,
-                'bottom_detected': bool,
-                'confidence': float,
-                'reasoning': str,
-                'current_price': float,
-                'peak_price': float (if peak detected),
-                'bottom_price': float (if bottom detected)
-            }
+        Uses multi-signal confirmation (≥3 signals needed).
+        Fixed: no dead code, proper volume confirmation ordering.
         """
         import pandas as pd
         import numpy as np
@@ -500,7 +562,6 @@ class MomentumMonitor:
                 df.set_index('date', inplace=True)
             df = df.sort_index()
             
-            # Ensure required columns exist
             if 'close' not in df.columns or 'high' not in df.columns or 'low' not in df.columns:
                 return {'peak_detected': False, 'bottom_detected': False, 'confidence': 0.0}
             
@@ -508,88 +569,27 @@ class MomentumMonitor:
             current_high = float(df['high'].iloc[-1])
             current_low = float(df['low'].iloc[-1])
             
-            # Recent price window (last 10-20 days)
+            # Recent price window
             recent_window = min(20, len(df))
-            recent_prices = df['close'].tail(recent_window)
             recent_highs = df['high'].tail(recent_window)
             recent_lows = df['low'].tail(recent_window)
+            recent_prices = df['close'].tail(recent_window)
             
-            peak_detected = False
-            bottom_detected = False
-            confidence = 0.0
-            peak_reasoning_parts = []
-            bottom_reasoning_parts = []
-            
-            # 1. Detect actual local minima/maxima (price reversals)
-            # Find the actual lowest/highest points in recent history
             max_high = float(recent_highs.max())
             min_low = float(recent_lows.min())
             
-            # Find when the min/max occurred
-            max_high_idx = recent_highs.idxmax() if len(recent_highs) > 0 else None
-            min_low_idx = recent_lows.idxmin() if len(recent_lows) > 0 else None
+            # Proximity checks
+            is_at_peak = current_high >= max_high * 0.98
+            is_at_bottom = current_low <= min_low * 1.02
+            price_moved_from_bottom = current_price > min_low * 1.03
+            price_moved_from_peak = current_price < max_high * 0.97
             
-            # Check if we're at or very close to the actual peak/bottom
-            # A peak is detected if current price is near the max AND indicators suggest reversal
-            # A bottom is detected if current price is near the min AND indicators suggest reversal
-            is_at_peak = current_high >= max_high * 0.98  # Within 2% of peak
-            is_at_bottom = current_low <= min_low * 1.02  # Within 2% of bottom
-            
-            # Additional check: if price has moved away from the min/max, we detected it late
-            # This means the actual bottom/peak was in the recent past and we're seeing it now
-            price_moved_from_bottom = current_price > min_low * 1.03  # Price is 3%+ above the low
-            price_moved_from_peak = current_price < max_high * 0.97  # Price is 3%+ below the high
-            
-            # Get indicators once
+            # Get indicators
             rsi = indicators.get('rsi', 50)
             mfi = indicators.get('mfi', 50)
             macd_diff = indicators.get('macd_diff', 0)
             
-            # Peak detection signals
-            peak_signals = 0
-            if is_at_peak:
-                peak_signals += 1
-                peak_reasoning_parts.append(f"Price reached 20-day peak at ${max_high:.2f}")
-            elif price_moved_from_peak:
-                # Price was at peak recently and has moved down (reversal detected)
-                # This handles cases where we detect the peak after price has already started falling
-                peak_signals += 1
-                price_decrease_pct = ((max_high - current_price) / max_high) * 100
-                if price_decrease_pct >= 5.0:
-                    peak_reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down ({price_decrease_pct:.1f}% decline)")
-                else:
-                    peak_reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down ({price_decrease_pct:.1f}% below peak)")
-            
-            # Check RSI for overbought (peak)
-            if rsi >= 70:
-                peak_signals += 2  # Strong signal
-                peak_reasoning_parts.append(f"RSI overbought ({rsi:.1f})")
-            elif rsi >= 65:
-                peak_signals += 1
-                peak_reasoning_parts.append(f"RSI approaching overbought ({rsi:.1f})")
-            
-            # Check MFI for overbought (peak)
-            if mfi >= 80:
-                peak_signals += 2
-                peak_reasoning_parts.append(f"MFI overbought ({mfi:.1f})")
-            elif mfi >= 75:
-                peak_signals += 1
-                peak_reasoning_parts.append(f"MFI approaching overbought ({mfi:.1f})")
-            
-            # Check MACD divergence (price making higher highs, MACD making lower highs = peak)
-            if len(recent_prices) >= 10:
-                recent_high_prices = recent_highs.tail(10)
-                if len(recent_high_prices) >= 5:
-                    price_trend = recent_high_prices.iloc[-1] > recent_high_prices.iloc[-5]
-                    # If price is rising but MACD is falling, bearish divergence (peak forming)
-                    if price_trend and macd_diff < 0:
-                        peak_signals += 2
-                        peak_reasoning_parts.append("Bearish MACD divergence detected")
-            
-            # Bottom detection signals
-            bottom_signals = 0
-            
-            # Check volume confirmation (if available) - do this after bottom_signals is defined
+            # Volume ratio (compute once, use for both)
             volume_ratio = 1.0
             if 'volume' in df.columns:
                 recent_volumes = df['volume'].tail(recent_window)
@@ -598,153 +598,137 @@ class MomentumMonitor:
                     current_volume = recent_volumes.iloc[-1]
                     if avg_volume > 0:
                         volume_ratio = current_volume / avg_volume
-                        if volume_ratio > 1.5:
-                            if peak_signals > 0:
-                                peak_signals += 1
-                                peak_reasoning_parts.append("High volume confirms peak")
-                            if bottom_signals > 0:
-                                bottom_signals += 1
-                                bottom_reasoning_parts.append("High volume confirms bottom")
-            if is_at_bottom:
-                bottom_signals += 1
-                bottom_reasoning_parts.append(f"Price reached 20-day bottom at ${min_low:.2f}")
-            elif price_moved_from_bottom:
-                # Price was at bottom recently and has moved up (reversal detected)
-                # This handles cases where we detect the bottom after price has already started rising
-                bottom_signals += 1
-                price_increase_pct = ((current_price - min_low) / min_low) * 100
-                if price_increase_pct >= 5.0:
-                    bottom_reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up ({price_increase_pct:.1f}% recovery)")
-                else:
-                    bottom_reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up ({price_increase_pct:.1f}% above bottom)")
             
-            # Check RSI for oversold (bottom)
-            if rsi <= 30:
-                bottom_signals += 2  # Strong signal
-                bottom_reasoning_parts.append(f"RSI oversold ({rsi:.1f})")
-            elif rsi <= 35:
-                bottom_signals += 1
-                bottom_reasoning_parts.append(f"RSI approaching oversold ({rsi:.1f})")
+            # ── Peak detection signals ──
+            peak_signals = 0
+            peak_reasoning = []
             
-            # Check MFI for oversold (bottom)
-            if mfi <= 20:
-                bottom_signals += 2
-                bottom_reasoning_parts.append(f"MFI oversold ({mfi:.1f})")
-            elif mfi <= 25:
-                bottom_signals += 1
-                bottom_reasoning_parts.append(f"MFI approaching oversold ({mfi:.1f})")
-            
-            # Check MACD divergence (price making lower lows, MACD making higher lows = bottom)
-            if len(recent_prices) >= 10:
-                recent_low_prices = recent_lows.tail(10)
-                if len(recent_low_prices) >= 5:
-                    price_trend = recent_low_prices.iloc[-1] < recent_low_prices.iloc[-5]
-                    # If price is falling but MACD is rising, bullish divergence (bottom forming)
-                    if price_trend and macd_diff > 0:
-                        bottom_signals += 2
-                        bottom_reasoning_parts.append("Bullish MACD divergence detected")
-            
-            # Determine if peak/bottom detected (need at least 3 signals)
-            peak_detected = peak_signals >= 3
-            bottom_detected = bottom_signals >= 3
-            
-            # FIX: Separate reasoning for peak vs bottom to avoid confusion
-            # If both are detected, prioritize the stronger signal
-            peak_reasoning_parts = []
-            bottom_reasoning_parts = []
-            
-            # Separate peak reasoning
             if is_at_peak:
-                peak_reasoning_parts.append(f"Price reached 20-day peak at ${max_high:.2f}")
+                peak_signals += 1
+                peak_reasoning.append(f"Price reached 20-day peak at ${max_high:.2f}")
             elif price_moved_from_peak:
+                peak_signals += 1
                 price_decrease_pct = ((max_high - current_price) / max_high) * 100
-                if price_decrease_pct >= 5.0:
-                    peak_reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down ({price_decrease_pct:.1f}% decline)")
-                else:
-                    peak_reasoning_parts.append(f"Peak detected at ${max_high:.2f}, price now reversing down ({price_decrease_pct:.1f}% below peak)")
+                peak_reasoning.append(f"Peak detected at ${max_high:.2f}, price reversing down ({price_decrease_pct:.1f}% decline)")
             
             if rsi >= 70:
-                peak_reasoning_parts.append(f"RSI overbought ({rsi:.1f})")
+                peak_signals += 2
+                peak_reasoning.append(f"RSI overbought ({rsi:.1f})")
             elif rsi >= 65:
-                peak_reasoning_parts.append(f"RSI approaching overbought ({rsi:.1f})")
+                peak_signals += 1
+                peak_reasoning.append(f"RSI approaching overbought ({rsi:.1f})")
             
             if mfi >= 80:
-                peak_reasoning_parts.append(f"MFI overbought ({mfi:.1f})")
+                peak_signals += 2
+                peak_reasoning.append(f"MFI overbought ({mfi:.1f})")
             elif mfi >= 75:
-                peak_reasoning_parts.append(f"MFI approaching overbought ({mfi:.1f})")
+                peak_signals += 1
+                peak_reasoning.append(f"MFI approaching overbought ({mfi:.1f})")
             
+            # Bearish MACD divergence
             if len(recent_prices) >= 10:
                 recent_high_prices = recent_highs.tail(10)
                 if len(recent_high_prices) >= 5:
                     price_trend = recent_high_prices.iloc[-1] > recent_high_prices.iloc[-5]
                     if price_trend and macd_diff < 0:
-                        peak_reasoning_parts.append("Bearish MACD divergence detected")
+                        peak_signals += 2
+                        peak_reasoning.append("Bearish MACD divergence detected")
             
-            # Separate bottom reasoning
+            # Volume confirmation for peak
+            if volume_ratio > 1.5 and peak_signals > 0:
+                peak_signals += 1
+                peak_reasoning.append("High volume confirms peak")
+            
+            # ── Bottom detection signals ──
+            bottom_signals = 0
+            bottom_reasoning = []
+            
             if is_at_bottom:
-                bottom_reasoning_parts.append(f"Price reached 20-day bottom at ${min_low:.2f}")
+                bottom_signals += 1
+                bottom_reasoning.append(f"Price reached 20-day bottom at ${min_low:.2f}")
             elif price_moved_from_bottom:
+                bottom_signals += 1
                 price_increase_pct = ((current_price - min_low) / min_low) * 100
-                if price_increase_pct >= 5.0:
-                    bottom_reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up ({price_increase_pct:.1f}% recovery)")
-                else:
-                    bottom_reasoning_parts.append(f"Bottom detected at ${min_low:.2f}, price now reversing up ({price_increase_pct:.1f}% above bottom)")
+                bottom_reasoning.append(f"Bottom detected at ${min_low:.2f}, price reversing up ({price_increase_pct:.1f}% recovery)")
             
             if rsi <= 30:
-                bottom_reasoning_parts.append(f"RSI oversold ({rsi:.1f})")
+                bottom_signals += 2
+                bottom_reasoning.append(f"RSI oversold ({rsi:.1f})")
             elif rsi <= 35:
-                bottom_reasoning_parts.append(f"RSI approaching oversold ({rsi:.1f})")
+                bottom_signals += 1
+                bottom_reasoning.append(f"RSI approaching oversold ({rsi:.1f})")
             
             if mfi <= 20:
-                bottom_reasoning_parts.append(f"MFI oversold ({mfi:.1f})")
+                bottom_signals += 2
+                bottom_reasoning.append(f"MFI oversold ({mfi:.1f})")
             elif mfi <= 25:
-                bottom_reasoning_parts.append(f"MFI approaching oversold ({mfi:.1f})")
+                bottom_signals += 1
+                bottom_reasoning.append(f"MFI approaching oversold ({mfi:.1f})")
             
+            # Bullish MACD divergence
             if len(recent_prices) >= 10:
                 recent_low_prices = recent_lows.tail(10)
                 if len(recent_low_prices) >= 5:
                     price_trend = recent_low_prices.iloc[-1] < recent_low_prices.iloc[-5]
                     if price_trend and macd_diff > 0:
-                        bottom_reasoning_parts.append("Bullish MACD divergence detected")
+                        bottom_signals += 2
+                        bottom_reasoning.append("Bullish MACD divergence detected")
             
-            # Determine final reasoning based on what was detected
-            # If both detected, prioritize the stronger signal
+            # Volume confirmation for bottom
+            if volume_ratio > 1.5 and bottom_signals > 0:
+                bottom_signals += 1
+                bottom_reasoning.append("High volume confirms bottom")
+            
+            # ── Determine detection (≥3 signals) ──
+            peak_detected = peak_signals >= 3
+            bottom_detected = bottom_signals >= 3
+            
+            # If both detected, prioritize stronger
             if peak_detected and bottom_detected:
-                # Both detected - use the stronger signal
                 if peak_signals >= bottom_signals:
-                    final_reasoning = '; '.join(peak_reasoning_parts) if peak_reasoning_parts else 'Peak detected with multiple confirmations'
-                    confidence = min(90, 50 + (peak_signals * 10))
-                    # Only return peak detection
                     bottom_detected = False
                 else:
-                    final_reasoning = '; '.join(bottom_reasoning_parts) if bottom_reasoning_parts else 'Bottom detected with multiple confirmations'
-                    confidence = min(90, 50 + (bottom_signals * 10))
-                    # Only return bottom detection
                     peak_detected = False
-            elif peak_detected:
-                final_reasoning = '; '.join(peak_reasoning_parts) if peak_reasoning_parts else 'Peak detected with multiple confirmations'
-                confidence = min(90, 50 + (peak_signals * 10))
-            elif bottom_detected:
-                final_reasoning = '; '.join(bottom_reasoning_parts) if bottom_reasoning_parts else 'Bottom detected with multiple confirmations'
-                confidence = min(90, 50 + (bottom_signals * 10))
-            else:
-                final_reasoning = 'No significant signals'
-                confidence = 0.0
             
-            # Return the actual peak/bottom prices (the detected minimum/maximum)
-            # These are the prices where reversal occurred, not necessarily current price
+            # Build result
+            if peak_detected:
+                confidence = min(90, 50 + (peak_signals * 10))
+                final_reasoning = '; '.join(peak_reasoning) if peak_reasoning else 'Peak detected with multiple confirmations'
+            elif bottom_detected:
+                confidence = min(90, 50 + (bottom_signals * 10))
+                final_reasoning = '; '.join(bottom_reasoning) if bottom_reasoning else 'Bottom detected with multiple confirmations'
+            else:
+                confidence = 0.0
+                final_reasoning = 'No significant signals'
+            
             return {
                 'peak_detected': peak_detected,
                 'bottom_detected': bottom_detected,
                 'confidence': confidence,
                 'reasoning': final_reasoning,
                 'current_price': current_price,
-                'peak_price': max_high if peak_detected else None,  # The actual peak price detected
-                'bottom_price': min_low if bottom_detected else None,  # The actual bottom price detected
-                'reversal_detected': peak_detected or bottom_detected,  # Indicates reversal is incoming
+                'peak_price': max_high if peak_detected else None,
+                'bottom_price': min_low if bottom_detected else None,
+                'reversal_detected': peak_detected or bottom_detected,
                 'signals_count': {'peak': peak_signals, 'bottom': bottom_signals}
             }
         except Exception as e:
             logger.error(f"Error detecting peaks/bottoms for {symbol}: {e}")
             return {'peak_detected': False, 'bottom_detected': False, 'confidence': 0.0, 'reasoning': f'Error: {str(e)}'}
 
+    def get_statistics(self) -> Dict:
+        """Get statistics about momentum change predictions"""
+        total = len(self.history)
+        verified_items = [p for p in self.history if p.get('verified', False)]
+        verified = len(verified_items)
+        correct = len([p for p in verified_items if p.get('status') == 'correct'])
+        
+        accuracy = (correct / verified * 100) if verified > 0 else 0
+        
+        return {
+            'total_predictions': total,
+            'verified': verified,
+            'correct': correct,
+            'incorrect': verified - correct,
+            'accuracy': accuracy
+        }

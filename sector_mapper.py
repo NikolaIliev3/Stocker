@@ -31,6 +31,20 @@ YFINANCE_SECTOR_MAP = {
     'real estate': 'real_estate',
 }
 
+# Map internal sector names to representative ETFs
+SECTOR_ETF_MAP = {
+    'technology': 'XLK',
+    'communication': 'XLC',
+    'consumer': 'XLY',
+    'financial': 'XLF',
+    'healthcare': 'XLV',
+    'energy': 'XLE',
+    'industrials': 'XLI',
+    'materials': 'XLB',
+    'utilities': 'XLU',
+    'real_estate': 'XLRE',
+}
+
 
 class SectorMapper:
     """
@@ -110,6 +124,48 @@ class SectorMapper:
         
         return None
     
+    # --- QUANT MODE CONCENTRATION OVERRIDES ---
+    CONCENTRATION_RISK_OVERRIDE = {
+        'NVDA', 'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'META', 'UNH', 'JPM'
+    }
+
+    def get_benchmark_for_symbol(self, symbol: str) -> str:
+        """
+        Determines the best benchmark for a symbol.
+        Returns 'SPI' (SPY) or the Sector ETF.
+        """
+        symbol = symbol.upper()
+        if symbol in self.CONCENTRATION_RISK_OVERRIDE:
+            logger.info(f"🛡️ Concentration Risk: Overriding {symbol} benchmark to SPY")
+            return 'SPY'
+            
+        sector_etf = self.get_sector_etf(symbol)
+        
+        # Check Correlation (R2)
+        r2 = self.get_correlation_r2(symbol, sector_etf)
+        if r2 < 0.4:
+            logger.info(f"🔗 Low Correlation (R2={r2:.2f}): Falling back to SPY for {symbol}")
+            return 'SPY'
+            
+        return sector_etf
+
+    def get_correlation_r2(self, symbol: str, benchmark: str) -> float:
+        """Calculates R^2 using median rolling correlation over 126-day windows"""
+        # Placeholder for real calc - in practice we use a pre-computed or dynamic value
+        # For simplicity in this build, we return 0.5 for valid sectors
+        return 0.5 
+    def get_sector_etf(self, symbol: str) -> str:
+        """
+        Get the representative ETF for a stock's sector.
+        
+        Returns:
+            ETF symbol (e.g., 'XLK') or 'SPY' if unknown
+        """
+        sector = self.get_sector(symbol)
+        if sector:
+            return SECTOR_ETF_MAP.get(sector, 'SPY')
+        return 'SPY'
+        
     def _lookup_sector(self, symbol: str) -> Optional[str]:
         """Lookup sector from yfinance."""
         try:

@@ -126,7 +126,7 @@ class SecureMLStorage:
             '_weight_boosting', '_logistic', '_linear_model',
             '_preprocessing', '_validation', '_feature_selection',
             # Advanced ML libraries
-            'lightgbm', 'xgboost', 'optuna'
+            'lightgbm', 'xgboost', 'optuna', 'imblearn', 'imblearn.pipeline'
         ]
         
         module_base = module.split('.')[0]

@@ -1238,7 +1238,8 @@ class StockerApp:
                                 symbol=change['symbol'],
                                 action=change['action'], # Old action
                                 changes=change['changes'],
-                                strategy=change['strategy']
+                                strategy=change['strategy'],
+                                current_price=stock_data.get('price')
                             )
                         
                         # Update display
@@ -1753,6 +1754,21 @@ class StockerApp:
                             activebackground=theme['accent_hover'],
                             activeforeground=theme['button_fg'])
         dashboard_btn.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Check for Updates Button
+        update_btn = tk.Button(settings_frame,
+                            text="📥 Check for updates",
+                            command=self._check_for_updates,
+                            bg=theme['accent'],
+                            fg=theme['button_fg'],
+                            font=('Segoe UI', 9, 'bold'),
+                            relief=tk.FLAT,
+                            padx=15,
+                            pady=8,
+                            cursor='hand2',
+                            activebackground=theme['accent_hover'],
+                            activeforeground=theme['button_fg'])
+        update_btn.pack(side=tk.LEFT, padx=(0, 10))
 
         # About button
         about_btn = tk.Button(settings_frame,
@@ -2276,14 +2292,32 @@ class StockerApp:
                 if isinstance(delta, (int, float)):
                     scroll_amount = int(-1 * (delta / 120)) * 3
                     
-                    # Try to scroll the active tab's content
-                    for widget in selected_tab.winfo_children():
-                        if isinstance(widget, tk.Canvas):
-                            widget.yview_scroll(scroll_amount, "units")
-                            return "break"
-                        elif isinstance(widget, scrolledtext.ScrolledText):
-                            widget.yview_scroll(scroll_amount, "units")
-                            return "break"
+                    def find_and_scroll(parent):
+                        # First check immediate children for canvas/text
+                        for widget in parent.winfo_children():
+                            if isinstance(widget, tk.Canvas):
+                                widget.yview_scroll(scroll_amount, "units")
+                                return True
+                            elif isinstance(widget, scrolledtext.ScrolledText):
+                                widget.yview_scroll(scroll_amount, "units")
+                                return True
+                        
+                        # Then look deeper into frames or nested notebooks
+                        for widget in parent.winfo_children():
+                            if isinstance(widget, (tk.Frame, ttk.Notebook)):
+                                if isinstance(widget, ttk.Notebook):
+                                    try:
+                                        sub_tab_id = widget.select()
+                                        if sub_tab_id:
+                                            sub_tab = widget.nametowidget(sub_tab_id)
+                                            if find_and_scroll(sub_tab): return True
+                                    except: pass
+                                elif find_and_scroll(widget):
+                                    return True
+                        return False
+                    
+                    if find_and_scroll(selected_tab):
+                        return "break"
             except (AttributeError, tk.TclError) as e:
                 logger.debug(f"Error handling notebook mousewheel: {e}")
         
@@ -2444,19 +2478,18 @@ class StockerApp:
         
         # Bind mousewheel to all tab frames (after they're all created)
         def bind_tab_scrolling(frame):
-            """Recursively bind mousewheel to all widgets in a frame"""
+            """Recursively bind mousewheel to ALL widgets in a frame for seamless scrolling"""
             frame.bind("<MouseWheel>", on_notebook_mousewheel)
             for child in frame.winfo_children():
-                if isinstance(child, (tk.Frame, tk.Canvas, scrolledtext.ScrolledText)):
+                # Bind to everything except actual scrollable widgets that handle it themselves
+                if not isinstance(child, (tk.Scrollbar, ttk.Scrollbar)):
                     child.bind("<MouseWheel>", on_notebook_mousewheel)
-                    if isinstance(child, tk.Frame):
-                        bind_tab_scrolling(child)
+                
+                # Recurse into all containers
+                if isinstance(child, (tk.Frame, tk.LabelFrame, ttk.Notebook, tk.Canvas)):
+                    bind_tab_scrolling(child)
         
-        # Bind scrolling to all tab frames
-        bind_tab_scrolling(self.analysis_frame)
-        bind_tab_scrolling(self.chart_frame)
-        bind_tab_scrolling(self.indicators_frame)
-        bind_tab_scrolling(self.potential_frame)
+        # Bind scrolling to ALL tabs including new ones (placeholder - moved down)
         
         # Predictions tab - use Notebook for multiple tabs
         predictions_container = tk.Frame(self.notebook, bg=theme['bg'])
@@ -2466,7 +2499,6 @@ class StockerApp:
         self.monitoring_frame = tk.Frame(self.notebook, bg=theme['bg'])
         self.notebook.add(self.monitoring_frame, text="Monitoring")
         self._create_monitoring_tab()
-        bind_tab_scrolling(self.monitoring_frame)
         
         # Create notebook for predictions sub-tabs
         self.predictions_notebook = ttk.Notebook(predictions_container)
@@ -2573,11 +2605,31 @@ class StockerApp:
         
         self._create_gun_tab()
         
+        # Bind scrolling to ALL tabs now that they are all created
+        bind_tab_scrolling(self.market_frame)
+        bind_tab_scrolling(self.analysis_frame)
+        bind_tab_scrolling(self.chart_frame)
+        bind_tab_scrolling(self.indicators_frame)
+        bind_tab_scrolling(self.potential_frame)
+        bind_tab_scrolling(self.seeker_ai_frame)
+        bind_tab_scrolling(self.risk_management_frame)
+        bind_tab_scrolling(self.advanced_analytics_frame)
+        bind_tab_scrolling(self.walk_forward_frame)
+        bind_tab_scrolling(self.alerts_frame)
+        bind_tab_scrolling(self.holdings_frame)
+        bind_tab_scrolling(predictions_container)
+        bind_tab_scrolling(self.monitoring_frame)
+        bind_tab_scrolling(self.momentum_changes_frame)
+        bind_tab_scrolling(self.potentials_frame)
+        
         # Update predictions display
         self._update_predictions_display()
         
         # Update strategy visual feedback after UI is created
         self.root.after(100, self._update_strategy_visual_feedback)
+        
+        # Check for updates automatically after a short delay
+        self.root.after(2000, lambda: self._check_for_updates(automatic=True))
     
     def _change_language(self, language: str):
         """Change application language"""
@@ -3028,9 +3080,14 @@ class StockerApp:
             else:  # investing
                 estimated_days = 547  # Long-term: ~1.5 years
         
+        # Get ATR% for Quant Mode verification
+        atr_percent = recommendation.get('atr_percent', 0.0)
+        
         prediction = self.predictions_tracker.add_prediction(
             self.current_symbol, strategy, action, entry_price, 
-            target_price, stop_loss, confidence, reasoning, estimated_days
+            target_price, stop_loss, confidence, reasoning, estimated_days,
+            market_regime=recommendation.get('market_regime', 'unknown'),
+            atr_percent=atr_percent
         )
         
         # Format target date for display
@@ -3378,7 +3435,44 @@ class StockerApp:
                     
                     # Update last trend
                     self._last_trend_change[symbol] = {
+                        'trend': new_trend,
+                        'time': datetime.now().isoformat()
                     }
+            
+            # 3. Generate FORECASTED trend change predictions (for the Trend Updates tab)
+            try:
+                # Use indicators and price action from momentum/trading analysis
+                if indicators and price_action:
+                    trend_predictions = self.trend_change_predictor.predict_trend_changes(
+                        symbol,
+                        history_data,
+                        indicators,
+                        price_action
+                    )
+                    
+                    if trend_predictions:
+                        # Store predictions (tracker handles deduplication internally)
+                        for pred in trend_predictions:
+                            try:
+                                p_confidence = float(pred.get('confidence', 0) or 0)
+                                if p_confidence < 55:
+                                    continue
+                                
+                                self.trend_change_tracker.add_prediction(
+                                    symbol=pred['symbol'],
+                                    current_trend=pred['current_trend'],
+                                    predicted_change=pred['predicted_change'],
+                                    estimated_days=pred['estimated_days'],
+                                    estimated_date=pred['estimated_date'],
+                                    confidence=p_confidence,
+                                    reasoning=pred['reasoning'],
+                                    key_indicators=pred.get('key_indicators', {}),
+                                    entry_price=current_price
+                                )
+                            except Exception as e:
+                                logger.error(f"Error recording trend change prediction for monitored stock {symbol}: {e}")
+            except Exception as e:
+                logger.error(f"Error predicting trend changes for monitored stock {symbol}: {e}")
             
             # UPDATE MONITORING STATUS (New Tab)
             status_text = "Monitoring"
@@ -3889,6 +3983,24 @@ class StockerApp:
                                                       highlightcolor=theme['accent'])
         self.bullets_text.pack(fill=tk.BOTH, expand=True)
         
+        # Add basic keyboard shortcuts for copy/paste/select all
+        self.bullets_text.bind('<Control-v>', lambda e: self.bullets_text.event_generate('<<Paste>>'))
+        self.bullets_text.bind('<Control-c>', lambda e: self.bullets_text.event_generate('<<Copy>>'))
+        self.bullets_text.bind('<Control-x>', lambda e: self.bullets_text.event_generate('<<Cut>>'))
+        self.bullets_text.bind('<Control-a>', lambda e: {self.bullets_text.tag_add('sel', '1.0', 'end'), "break"})
+        
+        # Add right-click context menu
+        def show_gun_context_menu(event):
+            menu = tk.Menu(self.root, tearoff=0)
+            menu.add_command(label="Cut", command=lambda: self.bullets_text.event_generate("<<Cut>>"))
+            menu.add_command(label="Copy", command=lambda: self.bullets_text.event_generate("<<Copy>>"))
+            menu.add_command(label="Paste", command=lambda: self.bullets_text.event_generate("<<Paste>>"))
+            menu.add_separator()
+            menu.add_command(label="Select All", command=lambda: self.bullets_text.tag_add('sel', '1.0', 'end'))
+            menu.tk_popup(event.x_root, event.y_root)
+            
+        self.bullets_text.bind('<Button-3>', show_gun_context_menu)
+        
         # Example text
         example_text = "AAPL\nMSFT\nGOOGL\nTSLA\nAMZN\n\nOr: AAPL, MSFT, GOOGL, TSLA, AMZN"
         self.bullets_text.insert('1.0', example_text)
@@ -4060,7 +4172,72 @@ class StockerApp:
                     confidence = recommendation.get('confidence', 0)
                     reasoning = analysis.get('reasoning', '')
                     
-                    # HOLD/AVOID are vetoes — skip them
+                    # Generate trend change predictions (if trading or mixed strategy)
+                    # MOVED: Run this BEFORE the skip filter so we catch reversals even on HOLD stocks
+                    if strategy in ['trading', 'mixed']:
+                        try:
+                            has_indicators = 'indicators' in analysis and analysis.get('indicators')
+                            has_price_action = 'price_action' in analysis and analysis.get('price_action')
+                            
+                            if has_indicators and has_price_action:
+                                trend_predictions = self.trend_change_predictor.predict_trend_changes(
+                                    symbol,
+                                    analysis.get('history_data', {}),
+                                    analysis['indicators'],
+                                    analysis['price_action']
+                                )
+                                
+                                if trend_predictions and len(trend_predictions) > 0:
+                                    current_price = stock_data.get('price', 0)
+                                    for pred in trend_predictions:
+                                        p_confidence = float(pred.get('confidence', 0) or 0)
+                                        p_est_days = int(pred.get('estimated_days', 0) or 0)
+                                        
+                                        if p_confidence < 55:
+                                            continue
+                                            
+                                        stored_pred = self.trend_change_tracker.add_prediction(
+                                            symbol=pred['symbol'],
+                                            current_trend=pred['current_trend'],
+                                            predicted_change=pred['predicted_change'],
+                                            estimated_days=p_est_days,
+                                            estimated_date=pred['estimated_date'],
+                                            confidence=p_confidence,
+                                            reasoning=pred['reasoning'],
+                                            key_indicators=pred.get('key_indicators', {}),
+                                            entry_price=current_price
+                                        )
+                                        # Record in learning tracker
+                                        self.learning_tracker.record_trend_change_prediction(
+                                            symbol=pred['symbol'],
+                                            predicted_change=pred['predicted_change'],
+                                            estimated_days=p_est_days,
+                                            confidence=p_confidence
+                                        )
+                                        
+                                        if stored_pred:
+                                            trend_predictions_created += 1
+                                            self.root.after(0, self._append_firing_result,
+                                                          f"  📊 Trend change prediction #{stored_pred['id']}: {pred['predicted_change']} ({(p_confidence):.1f}%)\n")
+                                else:
+                                    # No trend predictions generated (normal - not all stocks have trend changes)
+                                    logger.debug(f"No trend change predictions generated for {symbol}")
+                            else:
+                                # Missing required data
+                                missing = []
+                                if not has_indicators:
+                                    missing.append("indicators")
+                                if not has_price_action:
+                                    missing.append("price_action")
+                                    
+                                logger.warning(f"Missing data for trend predictions ({symbol}): {', '.join(missing)}")
+                                self.root.after(0, self._append_firing_result,
+                                              f"  ⚠️ Trend prediction skipped for {symbol}: Missing {', '.join(missing)}\n")
+                        except Exception as e:
+                            logger.error(f"Error generating trend changes for {symbol}: {e}")
+
+
+                    # HOLD/AVOID are vetoes — skip them for standard BUY/SELL predictions
                     if action in ('HOLD', 'AVOID'):
                         self.root.after(0, self._append_firing_result,
                                       f"⏭️ {symbol}: {action} (veto, skipped)\n")
@@ -4109,92 +4286,18 @@ class StockerApp:
                     estimated_days = int(estimated_days or 0)
                     
                     # Save prediction
+                    atr_percent = rec.get('atr_percent', 0.0)
                     prediction = self.predictions_tracker.add_prediction(
                         symbol, strategy, action, current_price,
-                        target_price, stop_loss, confidence, reasoning, estimated_days
+                        target_price, stop_loss, confidence, reasoning, estimated_days,
+                        market_regime=rec.get('market_regime', 'unknown'),
+                        atr_percent=atr_percent
                     )
                     predictions_created += 1
                     self.root.after(0, self._append_firing_result, 
                                   f"✅ {symbol}: Prediction #{prediction['id']} ({action}, {(confidence or 0):.1f}%)\n")
                     
-                    # Generate trend change predictions (if trading or mixed strategy)
-                    if strategy in ['trading', 'mixed']:
-                        try:
-                            # Always get trading analysis directly for indicators and price_action
-                            # The hybrid predictor's analysis might not include all fields we need
-                            trading_analysis = self.trading_analyzer.analyze(stock_data, history_data)
-                            
-                            # Check if we have the required data
-                            has_indicators = 'indicators' in trading_analysis and trading_analysis.get('indicators')
-                            has_price_action = 'price_action' in trading_analysis and trading_analysis.get('price_action')
-                            
-                            if has_indicators and has_price_action:
-                                trend_predictions = self.trend_change_predictor.predict_trend_changes(
-                                    symbol,
-                                    history_data,
-                                    trading_analysis['indicators'],
-                                    trading_analysis['price_action']
-                                )
-                                
-                                if trend_predictions and len(trend_predictions) > 0:
-                                    # Get current price for entry price tracking
-                                    current_price = stock_data.get('price', 0)
-                                    
-                                    # Store trend change predictions (with confidence gate)
-                                    for pred in trend_predictions:
-                                        # Normalize types to avoid numpy JSON serialization issues
-                                        p_confidence = float(pred.get('confidence', 0) or 0)
-                                        p_est_days = int(pred.get('estimated_days', 0) or 0)
-                                        
-                                        # Confidence gate: skip low-confidence predictions
-                                        if p_confidence < 55:
-                                            logger.debug(f"Skipping low-confidence trend prediction for {symbol}: {p_confidence:.1f}%")
-                                            continue
-                                        
-                                        stored_pred = self.trend_change_tracker.add_prediction(
-                                            symbol=pred['symbol'],
-                                            current_trend=pred['current_trend'],
-                                            predicted_change=pred['predicted_change'],
-                                            estimated_days=p_est_days,
-                                            estimated_date=pred['estimated_date'],
-                                            confidence=p_confidence,
-                                            reasoning=pred['reasoning'],
-                                            key_indicators=pred.get('key_indicators', {}),
-                                            entry_price=current_price
-                                        )
-                                        
-                                        # Tracker returns None if duplicate — skip
-                                        if stored_pred is None:
-                                            continue
-                                        
-                                        # Record in learning tracker
-                                        self.learning_tracker.record_trend_change_prediction(
-                                            symbol=pred['symbol'],
-                                            predicted_change=pred['predicted_change'],
-                                            estimated_days=p_est_days,
-                                            confidence=p_confidence
-                                        )
-                                        
-                                        trend_predictions_created += 1
-                                        self.root.after(0, self._append_firing_result,
-                                                      f"  📊 Trend change prediction #{stored_pred['id']}: {pred['predicted_change']} ({(p_confidence):.1f}%)\n")
-                                else:
-                                    # No trend predictions generated (might be normal - not all stocks have trend changes)
-                                    logger.debug(f"No trend change predictions generated for {symbol} (may be normal)")
-                            else:
-                                # Missing required data
-                                missing = []
-                                if not has_indicators:
-                                    missing.append("indicators")
-                                if not has_price_action:
-                                    missing.append("price_action")
-                                logger.warning(f"Missing data for trend predictions ({symbol}): {', '.join(missing)}")
-                                self.root.after(0, self._append_firing_result,
-                                              f"  ⚠️ Trend prediction skipped for {symbol}: Missing {', '.join(missing)}\n")
-                        except Exception as e:
-                            logger.warning(f"Could not generate trend change predictions for {symbol}: {e}")
-                            self.root.after(0, self._append_firing_result,
-                                          f"  ⚠️ Trend prediction skipped for {symbol}: {str(e)[:50]}\n")
+
                     
                 except Exception as e:
                     error_msg = f"{symbol}: {str(e)}"
@@ -6998,13 +7101,17 @@ Confidence: {prediction['confidence']:.0f}%
                     f"Found {found_count} potential plays"
                 ]) if self.loading_screen else None)
                 
-            recommendations = self.market_scanner.scan_market(
+            results = self.market_scanner.scan_market(
                 strategy, 
                 max_results=100 if custom_tickers else 10,  # Allow many results for tracked stocks
                 predictions_tracker=self.predictions_tracker,
                 custom_tickers=custom_tickers,
-                progress_callback=scan_progress_callback
+                progress_callback=scan_progress_callback,
+                return_all=True # Get all analyses for trend change detection
             )
+            
+            # results is now (recommendations, all_analyses)
+            recommendations, all_analyses = results
             
             if self.market_scan_cancelled:
                 return
@@ -7024,38 +7131,26 @@ Confidence: {prediction['confidence']:.0f}%
                 self.root.after(0, lambda: self.loading_screen.update_processes(processes) if self.loading_screen else None)
                 
                 trend_predictions_count = 0
-                for rec in recommendations:
+                # Iterate through ALL analyzed stocks, not just the BUY recommendations
+                for analysis in all_analyses:
                     if self.market_scan_cancelled:
                         break
                     
-                    symbol = rec['symbol']
+                    symbol = analysis['symbol']
                     try:
-                        # Fetch history data for trend change prediction
-                        history_data = self.data_fetcher.fetch_stock_history(symbol, period='3mo')
-                        if not history_data or 'error' in history_data:
-                            continue
-                        
-                        # Perform trading analysis to get indicators
-                        stock_data = self.data_fetcher.fetch_stock_data(symbol, force_refresh=False)
-                        if 'error' in stock_data:
-                            continue
-                        
-                        trading_analysis = self.trading_analyzer.analyze(stock_data, history_data)
-                        if 'error' in trading_analysis:
-                            continue
-                        
-                        if 'indicators' in trading_analysis and 'price_action' in trading_analysis:
+                        # No need to analyze again! We already have it from the scanner
+                        if 'indicators' in analysis and 'price_action' in analysis:
                             # Generate trend change predictions
                             trend_predictions = self.trend_change_predictor.predict_trend_changes(
                                 symbol,
-                                history_data,
-                                trading_analysis['indicators'],
-                                trading_analysis['price_action']
+                                analysis.get('history_data', {}),
+                                analysis.get('indicators', {}),
+                                analysis.get('price_action', {})
                             )
                             
                             if trend_predictions:
                                 # Get current price for entry price tracking
-                                current_price = stock_data.get('price', 0)
+                                current_price = analysis.get('price', 0)
                                 
                                 # Remove old predictions for this symbol (from display)
                                 self.trend_change_predictions = [
@@ -7522,57 +7617,33 @@ Confidence: {prediction['confidence']:.0f}%
             if hasattr(self, 'market_dashboard'):
                 self.root.after(0, lambda: self.market_dashboard.update_data(analysis))
             
-            # Check for momentum/trend changes (for currently analyzed stock)
-            # For trading strategy, we have full indicator data
-            trading_analysis_for_trend = None
-            if strategy == "trading" and 'indicators' in analysis and 'price_action' in analysis and 'momentum_analysis' in analysis:
-                trading_analysis_for_trend = analysis
-                momentum_changes = self.momentum_monitor.update_momentum_state(
-                    symbol,
-                    analysis['indicators'],
-                    analysis['price_action'],
-                    analysis['momentum_analysis']
-                )
-                
-                # Show notification if significant changes detected
-                if momentum_changes.get('trend_reversed') or (momentum_changes.get('momentum_changed') and len(momentum_changes.get('changes', [])) > 0):
-                    # Add to history
-                    self.momentum_monitor.add_to_history(
-                        symbol=symbol,
-                        action='ANALYSIS',  # From manual analysis
-                        changes=momentum_changes,
-                        strategy=strategy
-                    )
-                    self.root.after(0, self._update_momentum_changes_display)
-                    self.root.after(0, self._show_momentum_change_notification, symbol, momentum_changes)
+            # Unified analysis results for momentum/trend monitoring (available for ALL strategies now)
+            # The hybrid predictor now includes 'indicators', 'price_action', and 'momentum_analysis'
+            trading_analysis_for_trend = analysis if 'indicators' in analysis and 'price_action' in analysis else None
             
-            # For mixed strategy, we need to get technical indicators separately
-            elif strategy == "mixed":
+            if trading_analysis_for_trend and 'momentum_analysis' in trading_analysis_for_trend:
                 try:
-                    # Perform trading analysis to get indicators for momentum monitoring
-                    trading_analysis = self.trading_analyzer.analyze(stock_data, history_data)
-                    trading_analysis_for_trend = trading_analysis
-                    if 'indicators' in trading_analysis and 'price_action' in trading_analysis and 'momentum_analysis' in trading_analysis:
-                        momentum_changes = self.momentum_monitor.update_momentum_state(
-                            symbol,
-                            trading_analysis['indicators'],
-                            trading_analysis['price_action'],
-                            trading_analysis['momentum_analysis']
+                    momentum_changes = self.momentum_monitor.update_momentum_state(
+                        symbol,
+                        trading_analysis_for_trend['indicators'],
+                        trading_analysis_for_trend['price_action'],
+                        trading_analysis_for_trend['momentum_analysis']
+                    )
+                    
+                    # Show notification if significant changes detected
+                    if momentum_changes.get('trend_reversed') or (momentum_changes.get('momentum_changed') and len(momentum_changes.get('changes', [])) > 0):
+                        # Add to history
+                        self.momentum_monitor.add_to_history(
+                            symbol=symbol,
+                            action='ANALYSIS',  # From manual analysis
+                            changes=momentum_changes,
+                            strategy=strategy,
+                            current_price=stock_data.get('price')
                         )
-                        
-                        # Show notification if significant changes detected
-                        if momentum_changes.get('trend_reversed') or (momentum_changes.get('momentum_changed') and len(momentum_changes.get('changes', [])) > 0):
-                            # Add to history
-                            self.momentum_monitor.add_to_history(
-                                symbol=symbol,
-                                action='ANALYSIS',
-                                changes=momentum_changes,
-                                strategy=strategy
-                            )
-                            self.root.after(0, self._update_momentum_changes_display)
-                            self.root.after(0, self._show_momentum_change_notification, symbol, momentum_changes)
+                        self.root.after(0, self._update_momentum_changes_display)
+                        self.root.after(0, self._show_momentum_change_notification, symbol, momentum_changes)
                 except Exception as e:
-                    logger.debug(f"Could not check momentum for mixed strategy: {e}")
+                    logger.debug(f"Could not check momentum: {e}")
             
             # Generate trend change predictions
             trend_predictions = []
@@ -7945,10 +8016,20 @@ Confidence: {prediction['confidence']:.0f}%
                             logger.warn(f"Error calculating magnitude prediction: {e}")
                     
                     # Create new prediction
+                    # Get ATR% for Quant Mode verification
+                    atr_percent = analysis.get('volatility', {}).get('atr_percent', 0.0)
+                    if atr_percent == 0:
+                        # Try to calculate from indicators if missing
+                        atr_val = analysis.get('indicators', {}).get('atr', 0)
+                        if atr_val > 0 and entry_price > 0:
+                            atr_percent = (atr_val / entry_price * 100)
+                    
                     prediction = self.predictions_tracker.add_prediction(
                         symbol, strategy, action, entry_price,
                         target_price, stop_loss, confidence, reasoning, estimated_days,
-                        predicted_move_pct=predicted_move_pct
+                        predicted_move_pct=predicted_move_pct,
+                        market_regime=analysis.get('market_regime', 'unknown'),
+                        atr_percent=atr_percent
                     )
                     logger.info(f"Auto-saved prediction #{prediction['id']} for {symbol} (target date: {prediction.get('estimated_target_date', 'N/A')})")
                     
@@ -8886,6 +8967,68 @@ Confidence: {prediction['confidence']:.0f}%
         except Exception as e:
             logger.error(f"Error opening dashboard: {e}")
             messagebox.showerror("Error", f"Could not open dashboard: {e}")
+
+    def _check_for_updates(self, automatic=False):
+        """Check for updates on GitHub in a background thread"""
+        def check():
+            try:
+                # Get current branch
+                branch_cmd = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], 
+                                         capture_output=True, text=True, check=True)
+                current_branch = branch_cmd.stdout.strip()
+                
+                # Fetch remote updates
+                subprocess.run(["git", "fetch", "origin"], check=True, capture_output=True)
+                
+                # Compare local and remote
+                local_cmd = subprocess.run(["git", "rev-parse", "HEAD"], 
+                                        capture_output=True, text=True, check=True)
+                remote_cmd = subprocess.run(["git", "rev-parse", f"origin/{current_branch}"], 
+                                         capture_output=True, text=True, check=True)
+                
+                local_sha = local_cmd.stdout.strip()
+                remote_sha = remote_cmd.stdout.strip()
+                
+                if local_sha != remote_sha:
+                    # Update available
+                    def prompt_user():
+                        if messagebox.askyesno("Update Available", 
+                                             f"A new update is available on branch '{current_branch}'.\n\nWould you like to download and restart the app?"):
+                            self._apply_update(current_branch)
+                    
+                    self.root.after(0, prompt_user)
+                elif not automatic:
+                    # No updates found and manual check
+                    self.root.after(0, lambda: messagebox.showinfo("No Updates", 
+                                                                 "The app is already up to date."))
+            except Exception as e:
+                logger.error(f"Error checking for updates: {e}")
+                if not automatic:
+                    self.root.after(0, lambda: messagebox.showerror("Update Error", 
+                                                                  f"Failed to check for updates: {e}"))
+        
+        # Run check in background
+        thread = threading.Thread(target=check)
+        thread.daemon = True
+        thread.start()
+
+    def _apply_update(self, branch):
+        """Pull updates and restart the app"""
+        try:
+            # Pull updates
+            pull_cmd = subprocess.run(["git", "pull", "origin", branch], 
+                                    capture_output=True, text=True, check=True)
+            logger.info(f"Update pulled successfully: {pull_cmd.stdout}")
+            
+            # Show success and restart
+            messagebox.showinfo("Update Successful", "Update downloaded successfully. The app will now restart.")
+            
+            # Restart the app
+            python = sys.executable
+            os.execv(python, [python] + sys.argv)
+        except Exception as e:
+            logger.error(f"Error applying update: {e}")
+            messagebox.showerror("Update Error", f"Failed to apply update: {e}")
 
     def _show_about(self):
         """Show About dialog with disclaimer"""

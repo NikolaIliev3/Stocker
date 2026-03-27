@@ -39,7 +39,7 @@ class AutoLearner:
         # You can change this to 1-24 hours based on your needs
         self.scan_interval_hours = 6  # Scan every 6 hours (configurable)
         self.predictions_per_scan = 5  # Make 5 predictions per scan
-        self.min_confidence = 60  # Only make predictions with 60%+ confidence
+        self.min_confidence = 62  # Aligned with Quant Mode Gate 1 (ML Confidence Floor)
         
         # Track last scan time per strategy
         self.last_scan_time = {}

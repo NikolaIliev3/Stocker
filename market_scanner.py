@@ -112,7 +112,7 @@ class MarketScanner:
     
     def scan_market(self, strategy: str, max_results: int = 10, 
                    predictions_tracker=None, custom_tickers: List[str] = None,
-                   progress_callback=None) -> List[Dict]:
+                   progress_callback=None, return_all: bool = False) -> List[Dict]:
         """
         Scan market and return recommended stocks
         
@@ -140,6 +140,8 @@ class MarketScanner:
         for idx, symbol in enumerate(stocks_to_scan):
             if progress_callback:
                 progress_callback(idx + 1, total_stocks, symbol, len(recommendations))
+        
+        all_results = [] # To store all analyses if return_all is True
 
         # TOPOLOGY ANALYSIS (Global Context)
         # Pre-scan the market to build the graph and find mispricings
@@ -295,9 +297,18 @@ class MarketScanner:
                         'reasoning': analysis.get('reasoning', '')[:200]  # Truncate
                     })
                 
+                # Store all results if requested (even if filtered for recommendations)
+                if return_all:
+                    analysis_clone = analysis.copy()
+                    analysis_clone['symbol'] = symbol
+                    analysis_clone['history_data'] = history_data
+                    all_results.append(analysis_clone)
+                
                 # Limit to prevent too many API calls (unless custom scan)
                 if not is_custom_scan and len(recommendations) >= max_results:
-                    break
+                    # If we don't need all results, we can break early
+                    if not return_all:
+                        break
                     
             except Exception as e:
                 logger.warning(f"Error analyzing {symbol}: {e}")
@@ -313,6 +324,9 @@ class MarketScanner:
         recommendations.sort(key=get_sort_key, reverse=True)
         
         logger.info(f"Found {len(recommendations)} recommendations")
+        
+        if return_all:
+            return recommendations, all_results
         return recommendations
 
     def scan_for_dips(self, max_results: int = 20, 

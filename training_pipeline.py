@@ -9,12 +9,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from config import ML_LABEL_THRESHOLD
-# Import Quant Settings
-try:
-    from quant_config import IS_QUANT_MODE
-except ImportError:
-    IS_QUANT_MODE = False
+from config import ML_LABEL_THRESHOLD, IS_QUANT_MODE
 import logging
 import threading
 import ssl
@@ -324,21 +319,78 @@ class TrainingDataGenerator:
                 # Check price at the EXACT end of the lookforward period (Expiry)
                 expiry_idx = min(idx + lookforward_days, len(prices) - 1)
                 expiry_price = prices[expiry_idx]
+                expiry_date = dates[expiry_idx]
                 
                 price_change = (expiry_price - current_price) / current_price
                 
-                if price_change >= success_threshold:
-                    label = 'BUY' # Terminal Winner
+                # Calculate Alpha vs Sector Benchmark (Quant Mode enhancement)
+                benchmark_change = 0.0
+                benchmark_ticker = self.data_fetcher.get_sector_etf(symbol)
+                
+                # Use sector history if available (calculated in step 2)
+                bench_hist = None
+                if benchmark_ticker == 'SPY':
+                    bench_hist = self.spy_history
                 else:
-                    label = 'HOLD' # Failed to hit 3% at expiry
+                    bench_hist = self.sector_data_cache.get(benchmark_ticker)
+                
+                if bench_hist is not None and not bench_hist.empty:
+                    try:
+                        # Find closest dates in benchmark history
+                        bench_start_idx = bench_hist.index.get_indexer([current_date], method='nearest')[0]
+                        bench_end_idx = bench_hist.index.get_indexer([expiry_date], method='nearest')[0]
+                        
+                        col = 'close' if 'close' in bench_hist.columns else 'Close'
+                        bench_start_price = bench_hist.iloc[bench_start_idx][col]
+                        bench_end_price = bench_hist.iloc[bench_end_idx][col]
+                        
+                        if bench_start_price > 0:
+                            benchmark_change = (bench_end_price - bench_start_price) / bench_start_price
+                    except Exception as e:
+                        logger.debug(f"Could not calculate benchmark change for {benchmark_ticker}: {e}")
+                
+                alpha = price_change - benchmark_change
+                
+                # --- QUANT MODE ALPHA TARGETING ---
+                # A trade is a success if it outperforms its sector benchmark by the Alpha threshold
+                # Alpha threshold is dynamic: max(1.5 * ATR%, 2.0%)
+                from config import IS_QUANT_MODE, QUANT_ATR_MULTIPLIER, QUANT_MIN_ALPHA
+                
+                # Get ATR% from indicators_df or calculate it if missing
+                current_indicators = indicators_df.iloc[idx]
+                atr_pct = float(current_indicators.get('atr_percent', 0.0))
+                if atr_pct == 0 and 'atr' in current_indicators:
+                    atr_val = float(current_indicators.get('atr', 0.0))
+                    atr_pct = (atr_val / current_price) if current_price > 0 else 0
+                
+                # Dynamic Alpha Hurdle: 1.5x ATR, but at least 2.0%
+                dynamic_alpha_threshold = max(QUANT_ATR_MULTIPLIER * atr_pct / 100.0, QUANT_MIN_ALPHA / 100.0)
+                
+                if IS_QUANT_MODE and strategy == "trading":
+                    # --- NEW LOGIC: 3% HURDLE + SECTOR ALPHA ---
+                    if price_change >= 0.03 and alpha > 0.0:
+                        label = 'BUY'
+                    else:
+                        label = 'HOLD'
+                else:
+                    # Legacy absolute targeting
+                    if price_change >= success_threshold:
+                        label = 'BUY' # Terminal Winner
+                    else:
+                        label = 'HOLD' # Failed to hit 3% at expiry
                 
                 if strategy == "investing":
-                     # Simple return based - strict 10% gain required for BUY
-                     ret = (prices[min(idx+lookforward_days, len(prices)-1)] - current_price) / current_price
-                     if ret > 0.10: 
-                        label = 'BUY'
-                     else: 
-                        label = 'HOLD'
+                     # Simple return based - strict 10% gain required for BUY (relative to sector optionally)
+                     if IS_QUANT_MODE:
+                         if alpha > 0.05: # 5% Alpha for investing
+                             label = 'BUY'
+                         else:
+                             label = 'HOLD'
+                     else:
+                         if price_change > 0.10: 
+                            label = 'BUY'
+                         else: 
+                            label = 'HOLD'
 
                 # --- FEATURE EXTRACTION (O(1) Lookup) ---
                 # We simply grab the row from indicators_df and format it
@@ -365,7 +417,18 @@ class TrainingDataGenerator:
                 regime_dict = {'regime': m_regime, 'strength': 50} # Simplified
                 
                 # Macro
-                macro_dict = {'regime': 'neutral'} # Simplified
+                macro_dict = {'available': False, 'regime': 'neutral'}
+                if 'VIX' in row_dict and not pd.isna(row_dict['VIX']):
+                    macro_dict = {
+                        'available': True,
+                        'vix_value': float(row_dict['VIX']),
+                        'tnx_value': float(row_dict.get('TNX', 4.0)),
+                        'dxy_value': float(row_dict.get('DXY', 100.0)),
+                        'vix_status': 'unknown',
+                        'yield_status': 'unknown',
+                        'risk_level': 'unknown',
+                        'vix_change_pct': 0.0
+                    }
                 
                  # Sector
                 sector_dict = None
@@ -411,8 +474,10 @@ class TrainingDataGenerator:
                         'label': label,
                         'meta_label': 1 if label != 'HOLD' else 0, # Simplified meta
                         'rule_action': label, # Using label as proxy for rule action in fast mode
-                        'price_change_pct': float(price_change * 100), # Terminal profit
-                        'max_profit_pct': float(max_profit_pct), # PEAK profit (New for Phase 5)
+                        'price_change_pct': float(price_change * 100), # Absolute return
+                        'alpha': float(alpha * 100), # Alpha relative to SPY
+                        'max_profit_pct': float(max_profit_pct), # PEAK profit
+
                         'pattern_features': pattern_features, # RSI, ATR, etc. (New for Phase 5)
                         'date': current_date.strftime('%Y-%m-%d'),
                         'symbol': symbol,
@@ -504,9 +569,10 @@ class MLTrainingPipeline:
                 'samples': len(all_samples)
             }
         
-        logger.info(f"Total samples: {len(all_samples)}")
+        logger.info(f"✅ Sample generation phase complete. Processing {len(all_samples)} samples.")
         
         # Train model
+        logger.info(f"Initializing StockPredictionML for {strategy}...")
         ml_model = StockPredictionML(self.data_dir, strategy)
         
         if progress_callback:
@@ -525,11 +591,14 @@ class MLTrainingPipeline:
         # Apply saved config parameters if available, otherwise use defaults
         train_kwargs = {
             'use_hyperparameter_tuning': training_params.get('use_hyperparameter_tuning', True),  # ENABLED: Dynamic tuning for better accuracy
-            'use_binary_classification': training_params.get('use_binary_classification', True),
-            'use_regime_models': training_params.get('use_regime_models', True),
+            'use_binary_classification': kwargs.get('use_binary_classification', training_params.get('use_binary_classification', True)),
+            'use_regime_models': kwargs.get('use_regime_models', training_params.get('use_regime_models', True)),
             'feature_selection_method': training_params.get('feature_selection_method', 'importance'),
-            'model_family': training_params.get('model_family', 'voting'),
+            'model_family': kwargs.get('model_family', training_params.get('model_family', 'stacking' if IS_QUANT_MODE else 'voting')),
+            'use_smote': kwargs.get('use_smote', training_params.get('use_smote', True if IS_QUANT_MODE else False)) 
         }
+        
+        logger.info(f"Training with parameters: {train_kwargs}")
         
         # Add optional hyperparameters if provided in config
         for param in ['rf_n_estimators', 'rf_max_depth', 'rf_min_samples_split', 'rf_min_samples_leaf',
@@ -583,7 +652,10 @@ class MLTrainingPipeline:
                 probs = ml_model.predict_batch(feature_vectors)
                 
                 # Find BUY index
-                classes = ml_model.label_encoder.classes_
+                classes = []
+                if hasattr(ml_model.label_encoder, 'classes_'):
+                    classes = ml_model.label_encoder.classes_
+                
                 buy_idx = -1
                 if 'BUY' in classes:
                     buy_idx = list(classes).index('BUY')
@@ -691,15 +763,11 @@ class MLTrainingPipeline:
                 # Calculate actual price change
                 price_change_pct = ((actual_price - entry_price) / entry_price) * 100
                 
-                # --- QUANT MODE LABELING --
-                threshold_buy = 3.0
-                threshold_sell = -3.0
-                
-                if IS_QUANT_MODE:
-                     # Calculate ATR for dynamic labeling at prediction time
-                     # Requirement: We need hist up to pred_date
-                     # This will be handled inside the history fetch block below
-                     pass # We'll set labels after fetching hist
+                # --- QUANT MODE ALPHA EDGE ---
+                alpha = pred.get('alpha')
+                if alpha is None:
+                    # Fallback for old legacy predictions
+                    alpha = price_change_pct
                 
                 # Determine correct label based on actual outcome and strategy
                 # STRICT BINARY LOGIC: Only BUY or HOLD. No SELL.
@@ -710,17 +778,33 @@ class MLTrainingPipeline:
                         else:
                             label = "HOLD"
                     else:
-                        label = None # To be determined after hist/ATR
+                        # --- NEW LOGIC: 3% HURDLE + SECTOR ALPHA ---
+                        if price_change_pct >= 3 and alpha > 0.0:
+                            label = "BUY"
+                        else:
+                            label = "HOLD"
                 elif strategy == "investing":
-                    if price_change_pct >= 10:
-                        label = "BUY"
+                    if IS_QUANT_MODE:
+                        if alpha >= 5.0:
+                            label = "BUY"
+                        else:
+                            label = "HOLD"
                     else:
-                        label = "HOLD"
+                        if price_change_pct >= 10:
+                            label = "BUY"
+                        else:
+                            label = "HOLD"
                 else:  # mixed
-                    if price_change_pct >= 5:
-                        label = "BUY"
+                    if IS_QUANT_MODE:
+                        if alpha >= 3.0:
+                            label = "BUY"
+                        else:
+                            label = "HOLD"
                     else:
-                        label = "HOLD"
+                        if price_change_pct >= 5:
+                            label = "BUY"
+                        else:
+                            label = "HOLD"
                 
                 # Fetch historical data up to prediction date
                 # We need at least 50 days of history before prediction
@@ -782,28 +866,14 @@ class MLTrainingPipeline:
                 current_price = float(hist.iloc[-1]['Close'])
                 
                 # Assign labels if in Quant Mode (after ATR calculation)
+                # Assign labels if in Quant Mode
                 if IS_QUANT_MODE and strategy == "trading" and label is None:
-                    try:
-                        # Calculate ATR(14) locally from 'hist'
-                        df_tr = hist.copy()
-                        df_tr['tr1'] = df_tr['High'] - df_tr['Low']
-                        df_tr['tr2'] = abs(df_tr['High'] - df_tr['Close'].shift())
-                        df_tr['tr3'] = abs(df_tr['Low'] - df_tr['Close'].shift())
-                        df_tr['tr'] = df_tr[['tr1', 'tr2', 'tr3']].max(axis=1)
-                        atr = df_tr['tr'].rolling(14).mean().iloc[-1]
-                        
-                        # Dynamic Threshold: 2.0 * ATR
-                        atr_pct = (atr / current_price) * 100
-                        t_buy = max(2.0 * atr_pct, 1.5)
-                        t_sell = min(-2.0 * atr_pct, -1.5)
-                        
-                        if price_change_pct >= t_buy:
-                            label = "BUY"
-                        else:
-                            label = "HOLD"
-                    except Exception as e:
-                        # Fallback to 3% if ATR fails
-                        label = "BUY" if price_change_pct >= 3 else "HOLD"
+                    # In Quant Mode Phase 5, Target is 2% Alpha Edge over SPY unconditionally
+                    alpha_threshold = 2.0
+                    if alpha >= alpha_threshold:
+                        label = "BUY"
+                    else:
+                        label = "HOLD"
                 
                 stock_data = {
                     'symbol': symbol,
